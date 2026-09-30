@@ -46,15 +46,39 @@ type commandRunner interface {
 
 type execRunner struct{}
 
+// waitDelay bounds how long a hook waits for inherited output pipes to close
+// after the hook process itself is gone. Hook output goes through
+// io.MultiWriter, so os/exec uses pipes and Wait blocks until every holder
+// closes them: a hook that backgrounds a process, or a --hook-timeout that
+// kills only the direct child, left `genv apply` blocked indefinitely.
+var waitDelay = 2 * time.Second
+
 func (execRunner) Run(ctx context.Context, args []string, env []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.WaitDelay = waitDelay
 	if len(env) > 0 {
 		cmd.Env = append(os.Environ(), env...)
 	}
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	return cmd.Run()
+	err := cmd.Run()
+	return waitDelayOutcome(err, cmd)
+}
+
+// waitDelayOutcome normalises exec.ErrWaitDelay. When WaitDelay fires, the
+// command has already exited but a backgrounded grandchild still holds the
+// inherited pipe; the command's own exit status is the real result, so a
+// successful hook that happens to background something must not be reported
+// as failed. A real non-zero exit and a context deadline keep their error.
+func waitDelayOutcome(err error, cmd *exec.Cmd) error {
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		return err
+	}
+	if cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		return nil
+	}
+	return err
 }
 
 // RunOptions configures one hook phase without changing the command string.
@@ -338,12 +362,14 @@ func hookDesc(h schema.Hook) string {
 
 func expandPath(raw string) (string, error) {
 	path := raw
-	if strings.HasPrefix(path, "~") {
+	// Only "~", "~/" and "~\" are home-relative; "~name" is another user's
+	// home and must not resolve to $HOME concatenated with "name".
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("expand home: %w", err)
 		}
-		path = filepath.Join(home, strings.TrimPrefix(path, "~"))
+		path = filepath.Join(home, path[1:])
 	}
 	return os.Expand(path, os.Getenv), nil
 }

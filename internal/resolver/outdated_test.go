@@ -75,8 +75,11 @@ func TestFilterOutdated_KeepsOnlyOutdated(t *testing.T) {
 	if got := keptIDs(kept); !slices.Equal(got, []string{"wget"}) {
 		t.Fatalf("kept = %v, want [wget]", got)
 	}
-	if len(warnings) != 1 || !strings.Contains(warnings[0], "outdated timing: brew") {
-		t.Fatalf("warnings = %v, want one brew timing line", warnings)
+	// A successful query produces no warning. The scheduled worker logged
+	// "outdated timing" for every manager on every run, which buried the
+	// warnings that matter (query failures and timeouts).
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none for a successful query", warnings)
 	}
 }
 

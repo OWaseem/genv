@@ -218,6 +218,13 @@ func RunCommand(ctx context.Context, args []string, stdin io.Reader, stdout, std
 	return runSubcmd(ctx, args, stdin, stdout, stderr)
 }
 
+// subprocessWaitDelay bounds how long a spawn waits for inherited output
+// pipes to close after the process itself is gone. Without it, a hook or
+// manager that backgrounds a process (or a timeout that kills only the direct
+// child) keeps the pipe open and Wait blocks until every holder exits — which
+// wedged the hourly worker until its job deadline. Mirrors adapter.probeWaitDelay.
+var subprocessWaitDelay = 2 * time.Second
+
 func runSubcmd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	if len(args) == 0 || args[0] == "" {
 		return fmt.Errorf("empty command")
@@ -232,6 +239,7 @@ func runSubcmd(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 	}
 	defer cancel()
 	cmd := exec.CommandContext(runCtx, args[0], args[1:]...)
+	cmd.WaitDelay = subprocessWaitDelay
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -244,6 +252,12 @@ func runSubcmd(ctx context.Context, args []string, stdin io.Reader, stdout, stde
 	}
 	err := cmd.Run()
 	slog.Debug("done", "cmd", args[0], "duration", time.Since(start), "err", err)
+	// ErrWaitDelay means the command already exited but a backgrounded
+	// grandchild still held the inherited pipe. The command's own exit status
+	// is the real result.
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		return nil
+	}
 	return err
 }
 
@@ -396,9 +410,10 @@ func FilterOutdated(packages []genvfile.LockedPackage) (kept []genvfile.LockedPa
 			keep[name] = nil // query failed or timed out: keep all conservatively
 			continue
 		}
-		// Timing is logged as a warning so scheduled updates.log and CLI stderr
-		// can distinguish a real slow query from a silent timeout fallback.
-		warnings = append(warnings, fmt.Sprintf("outdated timing: %s took %s (%d hits)", name, elapsed, len(outdated)))
+		// Timing is debug detail, not a user-facing warning: the scheduled
+		// worker logged it for every manager on every successful query, and a
+		// genuine slowness or failure is already reported above.
+		slog.Debug("outdated query", "manager", name, "elapsed", elapsed, "hits", len(outdated))
 		set := make(map[string]bool, len(outdated))
 		for pkgName := range outdated {
 			set[pkgName] = true
@@ -976,7 +991,19 @@ func ExecuteApply(ctx context.Context, result ReconcileResult, stdin io.Reader, 
 				continue
 			}
 		}
-		if err := runSubcmd(ctx, a.Cmd, stdin, stdout, stderr); err != nil {
+		// Unattended runs never prompt. sudo is made non-interactive, and a
+		// command that would still need elevation fails closed: ApplyExecution
+		// has no Skipped channel (unlike UpgradeExecution), and running the
+		// command anyway would block on a prompt nobody can answer.
+		argv := a.Cmd
+		if executionOptions.Unattended {
+			argv = withNoninteractiveSudo(argv)
+			if skipUnattendedElevation(true, argv) {
+				out.Errors = append(out.Errors, fmt.Errorf("install %q (via %s): %s", a.Pkg.ID, a.Manager, unattendedElevationReason))
+				continue
+			}
+		}
+		if err := runSubcmd(ctx, argv, stdin, stdout, stderr); err != nil {
 			out.Errors = append(out.Errors, fmt.Errorf("install %q (via %s): %w", a.Pkg.ID, a.Manager, err))
 		} else {
 			lp := genvfile.LockedPackage{
