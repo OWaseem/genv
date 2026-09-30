@@ -2,8 +2,10 @@ package files
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -100,12 +102,14 @@ func TestApplyLink_RelativeSymlinkResolvingToSourceIsSkipped(t *testing.T) {
 	if len(res.Updated) != 0 {
 		t.Errorf("Updated = %v, want none", res.Updated)
 	}
-	// The link text must not have been rewritten.
+	// The link text must not have been rewritten. ToSlash because Windows
+	// normalizes the forward slashes in the link text to backslashes when the
+	// symlink is created, which is not genv rewriting anything.
 	cur, err := os.Readlink(target)
 	if err != nil {
 		t.Fatalf("readlink: %v", err)
 	}
-	if cur != "../repo/simple.txt" {
+	if filepath.ToSlash(cur) != "../repo/simple.txt" {
 		t.Errorf("link was rewritten to %q", cur)
 	}
 }
@@ -198,6 +202,9 @@ func TestCreateSymlinkAt_FailureLeavesLiveFileInPlace(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce directory permission bits for the owner")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: read-only directory is not enforced")
 	}
@@ -235,6 +242,9 @@ func TestRenderTemplate_ForcedOverwriteKeepsTargetOnWriteFailure(t *testing.T) {
 		t.Fatalf("chmod: %v", err)
 	}
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce directory permission bits for the owner")
+	}
 	if os.Geteuid() == 0 {
 		t.Skip("running as root: read-only directory is not enforced")
 	}
@@ -279,5 +289,50 @@ func TestRenderTemplate_NoLeftoverTmpFiles(t *testing.T) {
 	got, err := os.ReadFile(dst)
 	if err != nil || string(got) != "rendered" {
 		t.Errorf("target = %q err=%v, want rendered", got, err)
+	}
+}
+
+// The same guarantee as TestCreateSymlinkAt_FailureLeavesLiveFileInPlace,
+// driven by a stubbed symlink instead of a read-only directory so it runs on
+// Windows too (where directory permission bits do not stop the owner writing).
+// The point of #205 is that the fallible step happens before anything is moved,
+// so a failure must never leave the target missing.
+func TestCreateSymlinkAt_SymlinkFailureLeavesLiveFileInPlace(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+
+	target := filepath.Join(home, "live.txt")
+	if err := os.WriteFile(target, []byte("live content"), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	source := filepath.Join(home, "source.txt")
+	if err := os.WriteFile(source, []byte("source"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	orig := symlink
+	symlink = func(string, string) error { return errors.New("stubbed symlink failure") }
+	t.Cleanup(func() { symlink = orig })
+
+	if _, err := createSymlinkAt(source, target, true); err == nil {
+		t.Fatal("createSymlinkAt error = nil, want the stubbed failure")
+	}
+
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("live file is gone: %v", err)
+	}
+	if string(got) != "live content" {
+		t.Fatalf("live file = %q, want it untouched", got)
+	}
+	// Nothing may be left behind by the staging directory.
+	entries, err := os.ReadDir(home)
+	if err != nil {
+		t.Fatalf("readdir: %v", err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".genv-link-") {
+			t.Errorf("staging directory %q was left behind", e.Name())
+		}
 	}
 }

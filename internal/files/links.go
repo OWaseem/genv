@@ -14,7 +14,12 @@ import (
 // symlink creates a symlink like os.Symlink, but on Windows augments a
 // failure with an actionable privilege hint. The original error is
 // preserved for errors.Is / errors.As.
-func symlink(source, target string) error {
+//
+// It is a var so tests can force the failure that Windows cannot produce on
+// demand: a read-only directory stops writes for everyone but the owner on
+// POSIX, while Windows ignores those permission bits, so the
+// failure-keeps-the-live-file path is otherwise untested there.
+var symlink = func(source, target string) error {
 	return windowsSymlinkHint(runtime.GOOS, os.Symlink(source, target))
 }
 

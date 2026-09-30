@@ -3777,15 +3777,34 @@ func TestBuildEditorCmd(t *testing.T) {
 			if err != nil {
 				t.Fatalf("buildEditorCmd(%q, %q): unexpected error: %v", tc.editor, tc.file, err)
 			}
-			if filepath.Base(cmd.Path) != tc.wantPath {
+			// A qualified editor path is never executed as typed. It is
+			// resolved through PATH to the allowlisted binary, so argv[0] is
+			// that resolved path. On POSIX the two coincide, which is why the
+			// table could assert the typed string until Windows was exercised.
+			gotBase := filepath.Base(cmd.Path)
+			if runtime.GOOS == "windows" {
+				gotBase = strings.TrimSuffix(gotBase, ".exe")
+			}
+			if gotBase != tc.wantPath {
 				t.Errorf("buildEditorCmd path: got %q, want base %q", cmd.Path, tc.wantPath)
 			}
-			if len(cmd.Args) != len(tc.wantArgs) {
-				t.Errorf("buildEditorCmd args length: got %d, want %d (args: %v, want: %v)", len(cmd.Args), len(tc.wantArgs), cmd.Args, tc.wantArgs)
+			wantArgs := append([]string(nil), tc.wantArgs...)
+			if first := strings.Fields(tc.editor); len(first) > 0 && first[0] != filepath.Base(first[0]) {
+				// Only meaningful when the allowlisted binary is actually
+				// installed; this table covers flag parsing and the allowlist,
+				// not PATH contents.
+				if resolved, err := exec.LookPath(filepath.Base(first[0])); err == nil {
+					wantArgs[0] = resolved
+				} else {
+					wantArgs[0] = cmd.Args[0]
+				}
+			}
+			if len(cmd.Args) != len(wantArgs) {
+				t.Errorf("buildEditorCmd args length: got %d, want %d (args: %v, want: %v)", len(cmd.Args), len(wantArgs), cmd.Args, wantArgs)
 			} else {
 				for i := range cmd.Args {
-					if cmd.Args[i] != tc.wantArgs[i] {
-						t.Errorf("buildEditorCmd args[%d]: got %q, want %q", i, cmd.Args[i], tc.wantArgs[i])
+					if cmd.Args[i] != wantArgs[i] {
+						t.Errorf("buildEditorCmd args[%d]: got %q, want %q", i, cmd.Args[i], wantArgs[i])
 					}
 				}
 			}

@@ -2257,9 +2257,13 @@ func validateApplySourceRoot(sourceRoot string) error {
 }
 
 func expandCLIPath(path string) string {
-	if strings.HasPrefix(path, "~") {
+	// Only "~", "~/" and "~\" are home-relative. "~name" is a different
+	// user's home and must not resolve to $HOME concatenated with "name"
+	// (Fixes #208). filepath.Join also keeps the separator native, where
+	// string concatenation produced "C:\Users\me/dotfiles" on Windows.
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
 		if home, err := os.UserHomeDir(); err == nil {
-			path = home + path[1:]
+			path = filepath.Join(home, path[1:])
 		}
 	}
 	return os.Expand(path, os.Getenv)

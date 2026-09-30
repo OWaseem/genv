@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -46,23 +47,29 @@ func TestBuildEditorCmd_QualifiedPathIsNotAllowlistedByBaseName(t *testing.T) {
 // binary on PATH rather than to the path the user typed.
 func TestBuildEditorCmd_QualifiedPathResolvesToPATHBinary(t *testing.T) {
 	pathDir := t.TempDir()
-	legit := filepath.Join(pathDir, "code")
-	if err := os.WriteFile(legit, []byte("#!/bin/sh\n"), 0o755); err != nil {
+	// LookPath only finds a bare name through PATHEXT on Windows, so the
+	// stand-in needs the native extension there.
+	onPath := filepath.Join(pathDir, "code")
+	if runtime.GOOS == "windows" {
+		onPath += ".exe"
+	}
+	if err := os.WriteFile(onPath, []byte("#!/bin/sh\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", pathDir)
 
+	// Typed with a full path, so the base name is the only allowlist match.
 	typed := filepath.Join(t.TempDir(), "code")
 	if err := os.WriteFile(typed, []byte("#!/bin/sh\necho pwned\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 
-	cmd, err := buildEditorCmd(typed, "/tmp/spec.json")
+	cmd, err := buildEditorCmd(typed, "spec.json")
 	if err != nil {
 		t.Fatalf("buildEditorCmd(%q) error = %v", typed, err)
 	}
-	if cmd.Path != legit {
-		t.Fatalf("cmd.Path = %q, want the PATH-resolved %q", cmd.Path, legit)
+	if cmd.Path != onPath {
+		t.Fatalf("cmd.Path = %q, want the PATH-resolved %q", cmd.Path, onPath)
 	}
 }
 
@@ -246,5 +253,38 @@ func TestApplyJSON_DryRunNeedsNoYes(t *testing.T) {
 	})
 	if strings.Contains(stdout, "wet-run requires --yes") {
 		t.Fatalf("dry run should not demand --yes: %s", stdout)
+	}
+}
+
+// "~name" is a different user's home, not a path under $HOME. genv must not
+// turn it into $HOME + "name" (#208). This is the CLI-side expansion, which
+// feeds repo.url and --source-root; internal/files and internal/schema carry
+// their own copy of this rule and were already correct.
+func TestExpandCLIPath_HomeRelativeFormsOnly(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home) // os.UserHomeDir on Windows
+
+	for _, tc := range []struct{ in, want string }{
+		{"~", home},
+		{"~/dotfiles", filepath.Join(home, "dotfiles")},
+		// The remainder is joined verbatim and Cleaned, so on Windows "~\x"
+		// yields a native backslash path and on POSIX a filename that really
+		// does contain a backslash.
+		{`~\dotfiles`, filepath.Join(home, `\dotfiles`)},
+		// Unchanged: a different user's home, and an ordinary relative path.
+		{"~other/dotfiles", "~other/dotfiles"},
+		{"relative/path", "relative/path"},
+	} {
+		if got := expandCLIPath(tc.in); got != tc.want {
+			t.Errorf("expandCLIPath(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+
+	// A variable is still expanded, and the result must be a native path on
+	// every platform: string concatenation used to yield "C:\Users\me/dotfiles".
+	t.Setenv("GENV_TEST_DIR", filepath.Join(home, "dotfiles"))
+	if got, want := expandCLIPath("$GENV_TEST_DIR/x"), filepath.Join(home, "dotfiles", "x"); got != want {
+		t.Errorf("expandCLIPath($VAR) = %q, want %q", got, want)
 	}
 }
