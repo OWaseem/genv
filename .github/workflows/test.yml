@@ -46,10 +46,10 @@ jobs:
           cache: false
 
       - name: Build
-        run: go build ./...
+        run: go build "./..."
 
       - name: Vet
-        run: go vet ./...
+        run: go vet "./..."
 
       - name: Format check
         # shell: bash so the same command works on the Windows runner, whose
@@ -63,8 +63,12 @@ jobs:
             exit 1
           fi
 
+      # Quoted deliberately. The Windows runner's default shell is PowerShell,
+      # which rewrote an unquoted "-coverprofile=coverage.out ./..." into a
+      # package named ".out" and failed the step with a setup error — after
+      # every real test had already passed. Go expands "./..." itself.
       - name: Unit tests
-        run: go test -race -timeout 15m -coverprofile=coverage.out ./...
+        run: go test -race -timeout 15m "-coverprofile=coverage.out" "./..."
 
       - name: Upload coverage
         uses: actions/upload-artifact@v4
@@ -103,4 +107,4 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         env:
           GOTOOLCHAIN: auto
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest "./..."
