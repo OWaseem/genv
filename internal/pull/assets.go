@@ -16,7 +16,9 @@ import (
 
 // BundleAssetSources returns the safe relative file asset sources referenced by
 // a genv spec. Schema v8 specs collect assets from defaults and every target;
-// earlier specs use the top-level files block.
+// earlier specs use the top-level files block. Hook scripts declared with
+// `file` are included: they live next to the spec and a pulled spec without
+// them loses its hooks.
 func BundleAssetSources(f *schema.GenvFile) []string {
 	if f == nil {
 		return nil
@@ -33,10 +35,18 @@ func BundleAssetSources(f *schema.GenvFile) []string {
 			addBundleAssetSource(seen, tmpl.Source)
 		}
 	}
+	addHooks := func(hooks *schema.HooksConfig) {
+		for _, phase := range allHookPhases(hooks) {
+			for _, h := range phase {
+				addBundleAssetSource(seen, h.File)
+			}
+		}
+	}
 
 	if schema.IsPortableVersion(f.SchemaVersion) {
 		if f.Defaults != nil {
 			addFiles(f.Defaults.Files)
+			addHooks(f.Defaults.Hooks)
 		}
 		targets := make([]string, 0, len(f.Targets))
 		for target := range f.Targets {
@@ -46,10 +56,12 @@ func BundleAssetSources(f *schema.GenvFile) []string {
 		for _, target := range targets {
 			if f.Targets[target] != nil {
 				addFiles(f.Targets[target].Files)
+				addHooks(f.Targets[target].Hooks)
 			}
 		}
 	} else {
 		addFiles(f.Files)
+		addHooks(f.Hooks)
 	}
 
 	out := make([]string, 0, len(seen))
@@ -58,6 +70,18 @@ func BundleAssetSources(f *schema.GenvFile) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func allHookPhases(hooks *schema.HooksConfig) [][]schema.Hook {
+	if hooks == nil {
+		return nil
+	}
+	return [][]schema.Hook{
+		hooks.PreApply, hooks.PostApply,
+		hooks.PreAdd, hooks.PostAdd,
+		hooks.PreRemove, hooks.PostRemove,
+		hooks.PreUpgrade, hooks.PostUpgrade,
+	}
 }
 
 // CopyBundleAssets copies safe relative files.links/templates sources from
@@ -105,6 +129,12 @@ func isAbsoluteAssetSource(source string) bool {
 	if strings.HasPrefix(slash, "//") {
 		return true
 	}
+	// "~" and "~/..." are home-relative, not repo-relative: apply expands them
+	// before reading, so they name a file outside the cache and must not be
+	// bundled. "~name" is another user's home and is likewise not repo-local.
+	if source == "~" || strings.HasPrefix(source, "~/") || strings.HasPrefix(source, `~\`) {
+		return true
+	}
 	return len(slash) >= 2 && isASCIIAlpha(slash[0]) && slash[1] == ':'
 }
 
@@ -128,6 +158,9 @@ func isASCIIAlpha(b byte) bool {
 func copyBundleAsset(cacheDir, destDir, rel string) error {
 	src := filepath.Join(cacheDir, filepath.FromSlash(rel))
 	dst := filepath.Join(destDir, filepath.FromSlash(rel))
+	if err := requireNoSymlinkComponents(cacheDir, src, rel); err != nil {
+		return err
+	}
 	info, err := os.Lstat(src)
 	if err != nil {
 		return fmt.Errorf("copying bundle asset %s: %w", rel, err)
@@ -139,6 +172,35 @@ func copyBundleAsset(cacheDir, destDir, rel string) error {
 		return copyBundleDir(src, dst, rel)
 	}
 	return copyBundleFile(src, dst, info.Mode().Perm())
+}
+
+// requireNoSymlinkComponents walks every path element from root to src. Only
+// checking the final path missed an intermediate symlink: with "a" pointing
+// outside the cache, the source "a/id_ed25519" passed the final Lstat and the
+// copy still read from outside the cache.
+func requireNoSymlinkComponents(cacheDir, src, rel string) error {
+	relCheck, err := filepath.Rel(cacheDir, src)
+	if err != nil {
+		return fmt.Errorf("copying bundle asset %s: %w", rel, err)
+	}
+	if relCheck == ".." || strings.HasPrefix(relCheck, ".."+string(filepath.Separator)) {
+		return fmt.Errorf("copying bundle asset %s: escapes the cache directory", rel)
+	}
+	current := filepath.Clean(cacheDir)
+	for _, part := range strings.Split(filepath.ToSlash(relCheck), "/") {
+		if part == "" || part == "." {
+			continue
+		}
+		current = filepath.Join(current, part)
+		info, err := os.Lstat(current)
+		if err != nil {
+			return fmt.Errorf("copying bundle asset %s: %w", rel, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("copying bundle asset %s: symlinks are not allowed in the path", rel)
+		}
+	}
+	return nil
 }
 
 func copyBundleDir(srcRoot, dstRoot, relRoot string) error {

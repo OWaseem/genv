@@ -50,6 +50,10 @@ func runHookPhase(ctx context.Context, req hookPhaseRun) []string {
 		stdin = os.Stdin
 	}
 	exec := hooks.NewExecutor(req.Stdout, req.Stderr)
+	// Resolve a relative hook `file` against the spec directory, which is
+	// where export and pull place bundled hook scripts. Empty keeps the old
+	// working-directory-relative behavior.
+	exec.SourceRoot = req.Context.SpecDir
 	opts := hooks.RunOptions{
 		Host:    req.Context.Host,
 		DryRun:  req.Context.DryRun,

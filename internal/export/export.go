@@ -43,7 +43,7 @@ func BuildWithOptions(f *schema.GenvFile, targetID string, outDir string, opts O
 		return nil, err
 	}
 
-	report := buildReport(effective.Packages, effective.Files, effective.Services, targetID)
+	report := buildReport(effective.Packages, effective.Files, effective.Services, effective.Hooks, targetID)
 	if opts.Verify != nil {
 		report = append(report, verifyReportItems(opts.Verify(effective.Packages))...)
 	}
@@ -56,6 +56,9 @@ func BuildWithOptions(f *schema.GenvFile, targetID string, outDir string, opts O
 		return report.sorted(), err
 	}
 	if err := rewriteAndCopyExternalKeyAssets(bundle.Packages, opts.BaseDir, outDir); err != nil {
+		return report.sorted(), err
+	}
+	if err := rewriteAndCopyHookAssets(bundle.Hooks, opts.BaseDir, outDir); err != nil {
 		return report.sorted(), err
 	}
 
@@ -124,7 +127,7 @@ func rewriteAndCopyExternalKeyAssets(packages []schema.Package, baseDir, outDir 
 		}
 		for j := range packages[i].External.Verify {
 			keyFile := packages[i].External.Verify[j].PublicKeyFile
-			if keyFile == "" || isAbsolutePath(keyFile) {
+			if keyFile == "" || isExternalSourcePath(keyFile) {
 				continue
 			}
 			rel, err := copyAsset(baseDir, outDir, keyFile, "external-key", keyIndex)
@@ -133,6 +136,51 @@ func rewriteAndCopyExternalKeyAssets(packages []schema.Package, baseDir, outDir 
 			}
 			packages[i].External.Verify[j].PublicKeyFile = rel
 			keyIndex++
+		}
+	}
+	return nil
+}
+
+// hookPhases lists every lifecycle hook phase, in the order the bundle stores
+// them, paired with a pointer to the phase's slice.
+func hookPhases(hooks *schema.HooksConfig) []struct {
+	name  string
+	hooks *[]schema.Hook
+} {
+	if hooks == nil {
+		return nil
+	}
+	return []struct {
+		name  string
+		hooks *[]schema.Hook
+	}{
+		{"preApply", &hooks.PreApply},
+		{"postApply", &hooks.PostApply},
+		{"preAdd", &hooks.PreAdd},
+		{"postAdd", &hooks.PostAdd},
+		{"preRemove", &hooks.PreRemove},
+		{"postRemove", &hooks.PostRemove},
+		{"preUpgrade", &hooks.PreUpgrade},
+		{"postUpgrade", &hooks.PostUpgrade},
+	}
+}
+
+// rewriteAndCopyHookAssets bundles hook scripts declared with `file`. Without
+// this an exported or pulled spec lost its hooks: apply expands a relative
+// hook file against the working directory (or the scheduler's cwd), so a
+// snapshot applied elsewhere looked for a script that was never copied.
+func rewriteAndCopyHookAssets(hooks *schema.HooksConfig, baseDir, outDir string) error {
+	for _, phase := range hookPhases(hooks) {
+		for i := range *phase.hooks {
+			file := (*phase.hooks)[i].File
+			if file == "" || isExternalSourcePath(file) {
+				continue
+			}
+			rel, err := copyAsset(baseDir, outDir, file, "hook", i)
+			if err != nil {
+				return err
+			}
+			(*phase.hooks)[i].File = rel
 		}
 	}
 	return nil
@@ -202,7 +250,7 @@ func normalizeBundle(bundle *schema.TargetBundle) *schema.TargetBundle {
 	return bundle
 }
 
-func buildReport(packages []schema.Package, files *schema.FilesConfig, services map[string]schema.Service, targetID string) Report {
+func buildReport(packages []schema.Package, files *schema.FilesConfig, services map[string]schema.Service, hooks *schema.HooksConfig, targetID string) Report {
 	var report Report
 	allowed := managerAllowlist(targetID)
 	for _, pkg := range packages {
@@ -218,22 +266,29 @@ func buildReport(packages []schema.Package, files *schema.FilesConfig, services 
 	}
 	if files != nil {
 		for i, link := range files.Links {
-			if isAbsolutePath(link.Source) {
-				report = append(report, absoluteSourceItem(fmt.Sprintf("files.links[%d].source", i), link.Source))
+			if isExternalSourcePath(link.Source) {
+				report = append(report, unbundlableSourceItem(fmt.Sprintf("files.links[%d].source", i), link.Source))
 			}
 		}
 		for i, tpl := range files.Templates {
-			if isAbsolutePath(tpl.Source) {
-				report = append(report, absoluteSourceItem(fmt.Sprintf("files.templates[%d].source", i), tpl.Source))
+			if isExternalSourcePath(tpl.Source) {
+				report = append(report, unbundlableSourceItem(fmt.Sprintf("files.templates[%d].source", i), tpl.Source))
+			}
+		}
+	}
+	for _, phase := range hookPhases(hooks) {
+		for i, h := range *phase.hooks {
+			if h.File != "" && isExternalSourcePath(h.File) {
+				report = append(report, unbundlableSourceItem(fmt.Sprintf("hooks.%s[%d].file", phase.name, i), h.File))
 			}
 		}
 	}
 	for name, svc := range services {
-		if svc.DeclaresLaunchd() && isAbsolutePath(svc.Launchd.Plist) {
-			report = append(report, absoluteSourceItem("services."+name+".launchd.plist", svc.Launchd.Plist))
+		if svc.DeclaresLaunchd() && isExternalSourcePath(svc.Launchd.Plist) {
+			report = append(report, unbundlableSourceItem("services."+name+".launchd.plist", svc.Launchd.Plist))
 		}
-		if svc.DeclaresSystemd() && isAbsolutePath(svc.Systemd.Unit) {
-			report = append(report, absoluteSourceItem("services."+name+".systemd.unit", svc.Systemd.Unit))
+		if svc.DeclaresSystemd() && isExternalSourcePath(svc.Systemd.Unit) {
+			report = append(report, unbundlableSourceItem("services."+name+".systemd.unit", svc.Systemd.Unit))
 		}
 	}
 	return report
@@ -259,11 +314,15 @@ func verifyReportItems(results []verify.Result) Report {
 	return report
 }
 
-func absoluteSourceItem(field, source string) ReportItem {
+// unbundlableSourceItem reports a source genv cannot copy into the bundle.
+// It is the same finding as before for absolute paths, widened to cover
+// home-relative and $VAR sources, which apply expands before reading and
+// which therefore never name a file under the spec directory.
+func unbundlableSourceItem(field, source string) ReportItem {
 	return ReportItem{
 		Class:   ClassError,
 		Code:    "absolute-source",
-		Message: fmt.Sprintf("%s is absolute and cannot be bundled: %s", field, source),
+		Message: fmt.Sprintf("%s cannot be bundled: %s", field, source),
 	}
 }
 
@@ -336,7 +395,7 @@ func rewriteAndCopyFileAssets(files *schema.FilesConfig, baseDir, outDir string)
 	}
 	for i := range files.Links {
 		source := files.Links[i].Source
-		if source == "" || isAbsolutePath(source) {
+		if source == "" || isExternalSourcePath(source) {
 			continue
 		}
 		rel, err := copyAsset(baseDir, outDir, source, "link", i)
@@ -347,7 +406,7 @@ func rewriteAndCopyFileAssets(files *schema.FilesConfig, baseDir, outDir string)
 	}
 	for i := range files.Templates {
 		source := files.Templates[i].Source
-		if source == "" || isAbsolutePath(source) {
+		if source == "" || isExternalSourcePath(source) {
 			continue
 		}
 		rel, err := copyAsset(baseDir, outDir, source, "template", i)
@@ -373,7 +432,7 @@ func rewriteAndCopyServiceAssets(services map[string]*schema.Service, baseDir, o
 		if svc == nil {
 			continue
 		}
-		if svc.DeclaresLaunchd() && svc.Launchd.Plist != "" && !isAbsolutePath(svc.Launchd.Plist) {
+		if svc.DeclaresLaunchd() && svc.Launchd.Plist != "" && !isExternalSourcePath(svc.Launchd.Plist) {
 			rel, err := copyAsset(baseDir, outDir, svc.Launchd.Plist, "launchd", i)
 			if err != nil {
 				return err
@@ -382,7 +441,7 @@ func rewriteAndCopyServiceAssets(services map[string]*schema.Service, baseDir, o
 			copied.Plist = rel
 			svc.Launchd = &copied
 		}
-		if svc.DeclaresSystemd() && svc.Systemd.Unit != "" && !isAbsolutePath(svc.Systemd.Unit) {
+		if svc.DeclaresSystemd() && svc.Systemd.Unit != "" && !isExternalSourcePath(svc.Systemd.Unit) {
 			rel, err := copyAsset(baseDir, outDir, svc.Systemd.Unit, "systemd", i)
 			if err != nil {
 				return err
@@ -411,6 +470,22 @@ func isAbsolutePath(path string) bool {
 	return false
 }
 
+// isExternalSourcePath reports whether a source names a file genv cannot copy
+// into the bundle. Absolute paths obviously qualify. So do home-relative
+// paths: apply expands "~" before reading, so "~/dotfiles/zshrc" is a real file
+// outside the spec directory rather than the relative name it looks like, and
+// joining it under baseDir used to fail the copy outright. Sources containing
+// a $VAR reference are expanded the same way at apply time.
+func isExternalSourcePath(path string) bool {
+	if isAbsolutePath(path) {
+		return true
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+		return true
+	}
+	return strings.Contains(path, "$")
+}
+
 func isASCIIAlpha(b byte) bool {
 	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
 }
@@ -420,12 +495,34 @@ func copyAsset(baseDir, outDir, source, kind string, index int) (string, error) 
 	if baseDir != "" {
 		sourcePath = filepath.Join(baseDir, source)
 	}
+	// Renaming the destination does not help if the read already left the spec
+	// directory: "../.ssh/id_ed25519" would still be copied in. Containment is
+	// checked on the path that is actually opened, matching the rule
+	// internal/files.resolveSource and internal/pull already apply.
+	if baseDir != "" {
+		if err := requireWithinBase(baseDir, sourcePath); err != nil {
+			return "", fmt.Errorf("copying export asset %s: %w", source, err)
+		}
+	}
 	destRel := assetDestination(source, kind, index)
 	destPath := filepath.Join(outDir, filepath.FromSlash(destRel))
 	if err := copyPath(sourcePath, destPath); err != nil {
 		return "", fmt.Errorf("copying export asset %s to %s: %w", sourcePath, destPath, err)
 	}
 	return destRel, nil
+}
+
+// requireWithinBase refuses a source that resolves outside baseDir.
+func requireWithinBase(baseDir, sourcePath string) error {
+	base := filepath.Clean(baseDir)
+	rel, err := filepath.Rel(base, sourcePath)
+	if err != nil {
+		return fmt.Errorf("source %s escapes the spec directory %s", sourcePath, base)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("source %s escapes the spec directory %s", sourcePath, base)
+	}
+	return nil
 }
 
 func assetDestination(source, kind string, index int) string {
@@ -440,10 +537,17 @@ func assetDestination(source, kind string, index int) string {
 	return filepath.ToSlash(filepath.Join("files", filepath.FromSlash(clean)))
 }
 
+// copyPath copies a file or directory tree. It uses Lstat so a symlink is
+// refused rather than followed: pull and apply already refuse symlinked
+// assets, and following one would quietly pull in a file outside the spec
+// directory.
 func copyPath(src, dst string) error {
-	info, err := os.Stat(src)
+	info, err := os.Lstat(src)
 	if err != nil {
 		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("symlinks are not allowed")
 	}
 	if info.IsDir() {
 		return copyDir(src, dst)
@@ -455,6 +559,13 @@ func copyDir(src, dst string) error {
 	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return err
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			rel, relErr := filepath.Rel(src, path)
+			if relErr != nil {
+				return relErr
+			}
+			return fmt.Errorf("symlinks are not allowed: %s", filepath.ToSlash(rel))
 		}
 		rel, err := filepath.Rel(src, path)
 		if err != nil {

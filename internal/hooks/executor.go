@@ -38,6 +38,11 @@ type Executor struct {
 	// runtime.GOOS (set by NewExecutor); tests override it to exercise the
 	// per-OS shell selection without spawning real subprocesses.
 	goos string
+
+	// SourceRoot is the spec directory. A relative hook `file` path resolves
+	// against it, so bundled hook scripts work regardless of the working
+	// directory — including under the scheduled updates worker.
+	SourceRoot string
 }
 
 type commandRunner interface {
@@ -327,14 +332,9 @@ func formatHookDuration(d time.Duration) string {
 
 func (e *Executor) hookArgs(h schema.Hook) ([]string, error) {
 	if h.File != "" {
-		path, err := expandPath(h.File)
+		path, err := e.resolveHookFile(h.File)
 		if err != nil {
 			return nil, err
-		}
-		if info, err := os.Stat(path); err != nil {
-			return nil, fmt.Errorf("hook script %s: %w", path, err)
-		} else if info.IsDir() {
-			return nil, fmt.Errorf("hook script %s is a directory", path)
 		}
 		args := scriptRunnerFor(e.goos)
 		return append(args, path), nil
@@ -358,6 +358,30 @@ func hookDesc(h schema.Hook) string {
 		return "file " + h.File
 	}
 	return fmt.Sprintf("%q", h.Command)
+}
+
+// resolveHookFile locates a hook script. A relative path resolves against the
+// spec directory, which is where `genv export` and `genv pull` place bundled
+// hook scripts. Previously it was expanded with home and $VAR only and then
+// stat'd relative to the working directory, so a pulled spec looked for its
+// hook next to whatever cwd the scheduler happened to use.
+func (e *Executor) resolveHookFile(file string) (string, error) {
+	path := file
+	if path != "" && !filepath.IsAbs(path) && !strings.HasPrefix(path, "~") {
+		path = filepath.Join(e.SourceRoot, filepath.FromSlash(path))
+	}
+	path, err := expandPath(path)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("hook script %s: %w", path, err)
+	}
+	if info.IsDir() {
+		return "", fmt.Errorf("hook script %s is a directory", path)
+	}
+	return path, nil
 }
 
 func expandPath(raw string) (string, error) {

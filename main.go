@@ -2370,6 +2370,7 @@ func runUpgradeHooks(ctx context.Context, f *schema.GenvFile, opts upgradeHookOp
 		return nil
 	}
 	exec := hooks.NewExecutor(os.Stdout, os.Stderr)
+	exec.SourceRoot = sourceRootForSpec(opts.SpecFile, nil)
 	runOpts := hooks.RunOptions{
 		Host:    opts.Host,
 		DryRun:  opts.DryRun,
@@ -4714,6 +4715,7 @@ func runUpgradeHooksJSON(ctx context.Context, f *schema.GenvFile, opts upgradeHo
 		return nil
 	}
 	exec := hooks.NewExecutor(os.Stderr, os.Stderr)
+	exec.SourceRoot = filepath.Dir(absHookPath(opts.SpecFile))
 	runOpts := hooks.RunOptions{
 		Host:    opts.Host,
 		Env:     upgradeHookEnv(opts),
