@@ -175,14 +175,15 @@ func TestInjectSourceLine_AddsOnce(t *testing.T) {
 		t.Error("expected fragment path in rc file")
 	}
 
-	// Second injection — should not duplicate.
+	// Second injection — should not duplicate. Count the block marker rather
+	// than the path: a guarded source line names the fragment twice, once in
+	// the readability test and once in the dot-source.
 	if err := InjectSourceLine(rc, frag); err != nil {
 		t.Fatalf("InjectSourceLine (2nd): %v", err)
 	}
 	data2, _ := os.ReadFile(rc)
-	count := strings.Count(string(data2), frag)
-	if count != 1 {
-		t.Errorf("expected fragment referenced once, found %d times", count)
+	if count := strings.Count(string(data2), envBlockMarker); count != 1 {
+		t.Errorf("expected one genv env block, found %d", count)
 	}
 }
 

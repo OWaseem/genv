@@ -238,17 +238,37 @@ func hasPowerShellFragmentContent(cfg *schema.ShellConfig) bool {
 
 // InjectProfileLine ensures fragmentPath is dot-sourced exactly once in profilePath
 // inside a marked block for kind ("env" or "shell").
+//
+// The dot-source is guarded with Test-Path for the same reason the POSIX one
+// is guarded with `[ -r ]`: the fragment is rendered output, so it is
+// legitimately absent before the first apply, and an unguarded dot-source of a
+// missing file throws on every PowerShell prompt start (#217).
+//
+// An existing block is rewritten rather than left alone, so a profile carrying
+// another host's fragment path is corrected in place instead of accumulating
+// a second block.
 func InjectProfileLine(profilePath, fragmentPath, kind string) error {
 	begin := fmt.Sprintf("# BEGIN genv %s", kind)
 	end := fmt.Sprintf("# END genv %s", kind)
-	dot := ". " + psSingleQuote(fragmentPath)
+	dot := psSourceLine(fragmentPath)
 
 	data, err := os.ReadFile(profilePath)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("reading %s: %w", profilePath, err)
 	}
 	content := string(data)
-	if strings.Contains(content, fragmentPath) || strings.Contains(content, begin) {
+
+	updated := content
+	switch {
+	case strings.Contains(content, begin) && strings.Contains(content, end):
+		updated = replaceBetween(content, begin, end, dot)
+	case strings.Contains(content, begin):
+		// A begin marker with no end: leave it alone rather than risk
+		// corrupting a profile genv did not finish writing.
+	default:
+		updated = content + "\n" + begin + "\n" + dot + "\n" + end + "\n"
+	}
+	if updated == content {
 		return nil
 	}
 
@@ -256,15 +276,62 @@ func InjectProfileLine(profilePath, fragmentPath, kind string) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating directory %s: %w", dir, err)
 	}
+	return os.WriteFile(profilePath, []byte(updated), 0o644)
+}
 
-	f, err := os.OpenFile(profilePath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", profilePath, err)
+// psSourceLine renders a guarded, profile-portable dot-source for fragmentPath.
+// A fragment under the user profile is written $env:USERPROFILE-relative so one
+// committed profile is correct on every Windows host.
+func psSourceLine(fragmentPath string) string {
+	rel, ok := userRelativePath(fragmentPath)
+	if !ok {
+		q := psSingleQuote(fragmentPath)
+		return "if (Test-Path -LiteralPath " + q + ") { . " + q + " }"
 	}
-	defer func() { _ = f.Close() }()
+	p := `"$env:USERPROFILE\` + rel + `"`
+	return "if (Test-Path -LiteralPath " + p + ") { . " + p + " }"
+}
 
-	_, err = fmt.Fprintf(f, "\n%s\n%s\n%s\n", begin, dot, end)
-	return err
+// userRelativePath returns fragmentPath relative to the user's home directory
+// in slash form, and whether it lies underneath it at all.
+func userRelativePath(fragmentPath string) (string, bool) {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		return "", false
+	}
+	rel, err := filepath.Rel(filepath.Clean(home), filepath.Clean(fragmentPath))
+	if err != nil {
+		return "", false
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// replaceBetween returns content with the region from the first line equal to
+// begin through the first following line equal to end replaced by body.
+func replaceBetween(content, begin, end, body string) string {
+	lines := strings.Split(content, "\n")
+	start, stop := -1, -1
+	for i, l := range lines {
+		if start < 0 && strings.TrimSpace(l) == begin {
+			start = i
+			continue
+		}
+		if start >= 0 && strings.TrimSpace(l) == end {
+			stop = i
+			break
+		}
+	}
+	if start < 0 || stop < start {
+		return content
+	}
+	out := make([]string, 0, len(lines)+1)
+	out = append(out, lines[:start]...)
+	out = append(out, begin, body, end)
+	out = append(out, lines[stop+1:]...)
+	return strings.Join(out, "\n")
 }
 
 // psSingleQuote wraps v in PowerShell single quotes (' → ”).

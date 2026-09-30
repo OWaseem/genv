@@ -102,8 +102,14 @@ func TestPowerShellBackend_ApplyShell(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(pdata), frag) {
-		t.Fatalf("profile missing fragment:\n%s", pdata)
+	// The dot-source is guarded and $env:USERPROFILE-relative so one committed
+	// profile is correct on every Windows host, and a missing fragment does
+	// not throw on every prompt start (#217).
+	if !strings.Contains(string(pdata), "Test-Path -LiteralPath") {
+		t.Fatalf("profile source line is not guarded:\n%s", pdata)
+	}
+	if !strings.Contains(string(pdata), "$env:USERPROFILE") {
+		t.Fatalf("profile source line is not USERPROFILE-relative:\n%s", pdata)
 	}
 
 	// Empty / non-PS content removes fragment and skips inject.

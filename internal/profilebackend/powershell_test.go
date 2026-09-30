@@ -125,7 +125,13 @@ func TestPowerShellBackend_ApplyEnvUsesProfile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(data), frag) {
-		t.Fatalf("profile missing fragment path:\n%s", data)
+	// Guarded and $env:USERPROFILE-relative: the fragment is rendered output
+	// and is legitimately absent before the first apply, and one committed
+	// profile has to be correct on every host (#217).
+	if !strings.Contains(string(data), "Test-Path -LiteralPath") {
+		t.Fatalf("profile source line is not guarded:\n%s", data)
+	}
+	if !strings.Contains(string(data), "$env:USERPROFILE") {
+		t.Fatalf("profile source line is not USERPROFILE-relative:\n%s", data)
 	}
 }

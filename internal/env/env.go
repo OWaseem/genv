@@ -70,20 +70,67 @@ func WriteFragment(path string, vars map[string]schema.EnvVar) error {
 	return nil
 }
 
-// InjectSourceLine ensures that fragmentPath is sourced exactly once in rcPath.
-// The source line is appended only if no line in rcPath already contains
-// fragmentPath as a substring. If rcPath does not exist it is created.
-func InjectSourceLine(rcPath, fragmentPath string) error {
-	sourceLine := ". " + shellQuote(fragmentPath)
+// envBlockMarker introduces the genv-managed source line in an rc file. The
+// wording is load-bearing: InjectSourceLine recognises it to find a block to
+// replace, and blocks written by older genv versions use this same marker, so
+// they are upgraded in place rather than duplicated.
+const envBlockMarker = "# genv env"
 
-	// Read existing contents to check for duplicate.
+// sourceLine renders the guarded dot-source line for fragmentPath.
+//
+// Two properties matter, both from #217:
+//
+//   - Guarded. The fragment is rendered output, not a tracked file, so it is
+//     legitimately absent on a fresh clone and on any host that has not
+//     applied since the last render. Sourcing it unguarded printed
+//     "No such file or directory" from every non-interactive shell start until
+//     someone ran `genv apply`. The guard is an `if`, not `[ -r x ] && . x`:
+//     the `&&` form leaves a false exit status when the fragment is missing,
+//     which is itself a problem for the non-interactive shells this fixes,
+//     since it breaks any later `&&` chain and can trip `set -e`.
+//   - $HOME-relative. A single committed rc template has to be correct on
+//     every host. An absolute path baked in from one machine is wrong on all
+//     the others.
+//
+// A fragment outside the home directory (a custom --state-dir) cannot be
+// expressed as $HOME-relative, so it keeps its absolute path but is still
+// guarded.
+func sourceLine(fragmentPath string) string {
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		if rel, ok := homeRelative(home, fragmentPath); ok {
+			p := `"$HOME/` + rel + `"`
+			return "if [ -r " + p + " ]; then . " + p + "; fi"
+		}
+	}
+	q := shellQuote(fragmentPath)
+	return "if [ -r " + q + " ]; then . " + q + "; fi"
+}
+
+// homeRelative returns fragmentPath relative to home, in slash form, when it
+// lies underneath it. Both sides are resolved first so a symlinked or
+// non-clean path still compares equal.
+func homeRelative(home, fragmentPath string) (string, bool) {
+	cleanHome := filepath.Clean(home)
+	cleanFrag := filepath.Clean(fragmentPath)
+	rel, err := filepath.Rel(cleanHome, cleanFrag)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
+}
+
+// InjectSourceLine ensures that fragmentPath is sourced exactly once in rcPath.
+//
+// An existing genv block is replaced rather than appended to. Recognition is
+// by marker, not by path: a committed rc template carrying one host's absolute
+// path never matched on another host, so genv appended a second block on first
+// apply and the file stayed permanently dirty (#217).
+func InjectSourceLine(rcPath, fragmentPath string) error {
+	line := sourceLine(fragmentPath)
+
 	data, err := os.ReadFile(rcPath)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("reading %s: %w", rcPath, err)
-	}
-	if strings.Contains(string(data), sourceLine) || strings.Contains(string(data), fragmentPath) {
-		// Already sourced.
-		return nil
 	}
 
 	dir := filepath.Dir(rcPath)
@@ -91,14 +138,44 @@ func InjectSourceLine(rcPath, fragmentPath string) error {
 		return fmt.Errorf("creating directory %s: %w", dir, err)
 	}
 
-	f, err := os.OpenFile(rcPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return fmt.Errorf("opening %s: %w", rcPath, err)
+	updated := replaceOrAppendBlock(string(data), envBlockMarker, line, filepath.Base(fragmentPath))
+	if updated == string(data) {
+		return nil
 	}
-	defer func() { _ = f.Close() }()
+	return os.WriteFile(rcPath, []byte(updated), 0o644)
+}
 
-	_, err = fmt.Fprintf(f, "\n# genv env\n%s\n", sourceLine)
-	return err
+// replaceOrAppendBlock rewrites the block introduced by marker so it holds
+// sourceLine, appending a fresh block when the file has none. fragmentBase is
+// the fragment's file name, used to find the end of a legacy block whose
+// source line is a bare ". /path" rather than the guarded form.
+//
+// Content outside the block is preserved verbatim, including the blank line
+// genv inserted before the block.
+func replaceOrAppendBlock(content, marker, sourceLine, fragmentBase string) string {
+	lines := strings.Split(content, "\n")
+	start := -1
+	for i, l := range lines {
+		if strings.TrimSpace(l) == marker {
+			start = i
+			break
+		}
+	}
+	if start < 0 {
+		return content + "\n" + marker + "\n" + sourceLine + "\n"
+	}
+
+	// The block is the marker plus the source line beneath it. Walk forward
+	// over that one line; anything after it belongs to the user.
+	end := start + 1
+	if end < len(lines) && strings.Contains(lines[end], fragmentBase) {
+		end++
+	}
+	out := make([]string, 0, len(lines)+2)
+	out = append(out, lines[:start]...)
+	out = append(out, marker, sourceLine)
+	out = append(out, lines[end:]...)
+	return strings.Join(out, "\n")
 }
 
 // RcFiles returns the list of shell rc files to inject the source line into.

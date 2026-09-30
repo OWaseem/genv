@@ -1743,6 +1743,23 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 
 	if toInstall == 0 && toRemove == 0 && envChanges == 0 && shellChanges == 0 && serviceChanges == 0 && fileChanges == 0 {
 		if !opts.DryRun {
+			// Reconcile the env and shell fragments even when the lock says
+			// nothing changed. The fragments and the rc source lines are
+			// rendered output, so they are legitimately missing on a fresh
+			// clone, and a committed rc template carries whichever host
+			// rendered it last. Skipping this path left both stale: the lock
+			// reported the variable as applied while env.sh did not exist,
+			// and a shared rc file kept another host's absolute path forever
+			// (#217). Both calls are idempotent and write nothing when the
+			// content already matches.
+			if _, _, err := applyEnvVars(f, lf, false, opts.resolvedStateDir); err != nil {
+				fprintf(os.Stderr, "genv: applying env fragment: %v\n", err)
+				return exitIO
+			}
+			if _, _, err := applyShellCfg(f, lf, false, opts.resolvedStateDir); err != nil {
+				fprintf(os.Stderr, "genv: applying shell fragment: %v\n", err)
+				return exitIO
+			}
 			if !opts.NoHooks {
 				hostName := hostForCommand(opts.Host)
 				hookErrs := runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "pre-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes}.withFiles(opts.File, lockPath), opts.HookTimeout, false)
