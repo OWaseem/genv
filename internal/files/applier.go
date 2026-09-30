@@ -152,12 +152,12 @@ func applyTemplate(ctx context.Context, tmpl schema.FileTemplate, hostName strin
 		return nil
 	}
 
-	if opts.DryRun {
-		res.Updated = append(res.Updated, target)
-		return nil
-	}
 	if !opts.Force && !tmpl.Backup {
 		res.Mismatched = append(res.Mismatched, target)
+		return nil
+	}
+	if opts.DryRun {
+		res.Updated = append(res.Updated, target)
 		return nil
 	}
 

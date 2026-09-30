@@ -47,11 +47,8 @@ func Adopt(source, target string, opts AdoptOptions) (*AdoptResult, error) {
 		if opts.DryRun {
 			return res, nil
 		}
-		if err := ensureParentDir(target); err != nil {
+		if _, err := createSymlinkAt(source, target, false); err != nil {
 			return nil, err
-		}
-		if err := symlink(source, target); err != nil {
-			return nil, fmt.Errorf("link %s: %w", target, err)
 		}
 		return res, nil
 	}
@@ -61,7 +58,7 @@ func Adopt(source, target string, opts AdoptOptions) (*AdoptResult, error) {
 		if err != nil {
 			return nil, fmt.Errorf("adopt %s: readlink: %w", target, err)
 		}
-		if cur == source {
+		if linkResolvesTo(target, cur, source) {
 			return res, nil
 		}
 		return nil, fmt.Errorf("adopt %s: target is a symlink to %s, not a regular file", target, cur)
@@ -87,17 +84,16 @@ func Adopt(source, target string, opts AdoptOptions) (*AdoptResult, error) {
 			return nil, fmt.Errorf("adopt seed %s: %w", source, err)
 		}
 	}
-	actualBackup, err := backupExistingTo(target)
+	// createSymlinkAt moves the live file aside only after the symlink exists,
+	// so a symlink failure leaves the original file untouched.
+	actualBackup, err := createSymlinkAt(source, target, true)
 	if err != nil {
+		if actualBackup != "" {
+			return nil, fmt.Errorf("%w (backup kept at %s)", err, actualBackup)
+		}
 		return nil, err
 	}
 	res.BackupPath = actualBackup
-	if err := ensureParentDir(target); err != nil {
-		return nil, err
-	}
-	if err := symlink(source, target); err != nil {
-		return nil, fmt.Errorf("link %s: %w", target, err)
-	}
 	return res, nil
 }
 

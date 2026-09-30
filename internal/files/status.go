@@ -205,7 +205,7 @@ func statusLinkAt(target, source, mode string) (StatusEntry, error) {
 	if err != nil {
 		return entry, fmt.Errorf("link %s: readlink: %w", target, err)
 	}
-	if cur == source {
+	if linkResolvesTo(target, cur, source) {
 		entry.Kind = "ok"
 	} else {
 		entry.Kind = "mismatch"

@@ -46,15 +46,45 @@ func resolveSource(sourceRoot, source string) (string, error) {
 	return joined, nil
 }
 
+// expandPath expands a leading ~ to the home directory, then $VAR references.
+// Only "~", "~/..." and "~\..." expand: "~name" is another user's home and
+// must not silently resolve to a path beside ours.
 func expandPath(s string) (string, error) {
-	if strings.HasPrefix(s, "~") {
+	if s == "~" || strings.HasPrefix(s, "~/") || strings.HasPrefix(s, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
-		s = home + s[1:]
+		s = filepath.Join(home, s[1:])
 	}
 	return os.Expand(s, os.Getenv), nil
+}
+
+// linkResolvesTo reports whether the symlink at target already points at
+// source. readlink may return an absolute path, a path relative to the link's
+// directory, or a path with redundant separators — all of which name the same
+// file. Falls back to an inode comparison so a link whose text differs but
+// resolves to the same file is still recognised.
+func linkResolvesTo(target, readlink, source string) bool {
+	if readlink == source {
+		return true
+	}
+	resolved := readlink
+	if !filepath.IsAbs(resolved) {
+		resolved = filepath.Join(filepath.Dir(target), resolved)
+	}
+	if filepath.Clean(resolved) == filepath.Clean(source) {
+		return true
+	}
+	targetInfo, err := os.Stat(target)
+	if err != nil {
+		return false
+	}
+	sourceInfo, err := os.Stat(source)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(targetInfo, sourceInfo)
 }
 
 func ensureParentDir(target string) error {

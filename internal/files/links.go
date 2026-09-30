@@ -123,11 +123,8 @@ func applyLinkAt(target, source string, managed, backup, replace bool, opts Appl
 			res.Created = append(res.Created, target)
 			return nil
 		}
-		if err := ensureParentDir(target); err != nil {
+		if _, err := createSymlinkAt(source, target, false); err != nil {
 			return err
-		}
-		if err := symlink(source, target); err != nil {
-			return fmt.Errorf("link %s: %w", target, err)
 		}
 		res.Created = append(res.Created, target)
 		return nil
@@ -138,7 +135,7 @@ func applyLinkAt(target, source string, managed, backup, replace bool, opts Appl
 		if err != nil {
 			return fmt.Errorf("link %s: readlink: %w", target, err)
 		}
-		if cur == source {
+		if linkResolvesTo(target, cur, source) {
 			res.Skipped = append(res.Skipped, target)
 			return nil
 		}
@@ -166,35 +163,19 @@ func applyLinkAt(target, source string, managed, backup, replace bool, opts Appl
 }
 
 func replaceLinkAt(target, source string, backup bool, opts ApplyOptions, res *ApplyResult) error {
-	if opts.DryRun {
-		res.Updated = append(res.Updated, target)
-		return nil
-	}
-	if err := ensureParentDir(target); err != nil {
-		return err
-	}
 	info, err := os.Lstat(target)
 	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("link %s: %w", target, err)
 	}
-	if err == nil {
-		if info.IsDir() {
-			if !backup {
-				return fmt.Errorf("link %s: refusing to replace directory without --backup", target)
-			}
-			if err := backupExisting(target); err != nil {
-				return err
-			}
-		} else if backup {
-			if err := backupExisting(target); err != nil {
-				return err
-			}
-		} else if err := os.Remove(target); err != nil {
-			return fmt.Errorf("link %s: remove existing: %w", target, err)
-		}
+	if err == nil && info.IsDir() && !backup {
+		return fmt.Errorf("link %s: refusing to replace directory without --backup", target)
 	}
-	if err := symlink(source, target); err != nil {
-		return fmt.Errorf("link %s: %w", target, err)
+	if opts.DryRun {
+		res.Updated = append(res.Updated, target)
+		return nil
+	}
+	if _, err := createSymlinkAt(source, target, backup); err != nil {
+		return err
 	}
 	res.Updated = append(res.Updated, target)
 	return nil

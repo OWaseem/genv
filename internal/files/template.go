@@ -110,16 +110,13 @@ func RenderTemplate(srcPath, dstPath string, host string, opts RenderOptions) er
 		return nil
 	}
 
+	// The replacement is a rename over the target, so a failed write leaves the
+	// previous file in place instead of an empty path.
 	if opts.Backup {
-		if err := backupExisting(dstPath); err != nil {
+		if _, err := backupExistingTo(dstPath); err != nil {
 			return err
 		}
-	} else {
-		if err := os.Remove(dstPath); err != nil {
-			return fmt.Errorf("remove target %s: %w", dstPath, err)
-		}
 	}
-
 	if err := atomicWrite(dstPath, []byte(rendered), mode); err != nil {
 		return fmt.Errorf("write target %s: %w", dstPath, err)
 	}
@@ -174,16 +171,33 @@ func renderWithContext(input string, ctx templateContext) string {
 	return out
 }
 
+// atomicWrite replaces path with data in one rename. The temp file is created
+// in the destination directory with a unique name so concurrent writers cannot
+// clobber each other's staging file, and the target is never unlinked first.
 func atomicWrite(path string, data []byte, mode os.FileMode) error {
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, mode); err != nil {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if err := tmp.Chmod(mode); err != nil {
+		_ = tmp.Close()
 		return err
 	}
-	return nil
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
 }
 
 func currentUser() (string, error) {

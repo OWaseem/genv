@@ -11,20 +11,77 @@ import (
 )
 
 func TestApplyDir_DryRunReportsFileReplacement(t *testing.T) {
-	target := filepath.Join(t.TempDir(), "target")
-	if err := os.WriteFile(target, []byte("file"), 0o644); err != nil {
+	// A dry run must agree with the real apply: without Force the entry is a
+	// mismatch, and the plan must not advertise an update the apply refuses.
+	t.Run("without force reports mismatch", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "target")
+		if err := os.WriteFile(target, []byte("file"), 0o644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		res := &ApplyResult{}
+
+		if err := applyDir(context.Background(), schema.FileDir{Target: target}, ApplyOptions{DryRun: true}, res); err != nil {
+			t.Fatalf("applyDir dry run: %v", err)
+		}
+		if len(res.Mismatched) != 1 || res.Mismatched[0] != target {
+			t.Errorf("Mismatched = %v, want [%s]", res.Mismatched, target)
+		}
+		if len(res.Updated) != 0 {
+			t.Errorf("Updated = %v, want none", res.Updated)
+		}
+		if info, err := os.Stat(target); err != nil || info.IsDir() {
+			t.Errorf("dry run changed target: info=%v err=%v", info, err)
+		}
+	})
+
+	t.Run("with force reports update", func(t *testing.T) {
+		target := filepath.Join(t.TempDir(), "target")
+		if err := os.WriteFile(target, []byte("file"), 0o644); err != nil {
+			t.Fatalf("write target: %v", err)
+		}
+		res := &ApplyResult{}
+
+		if err := applyDir(context.Background(), schema.FileDir{Target: target}, ApplyOptions{DryRun: true, Force: true}, res); err != nil {
+			t.Fatalf("applyDir dry run: %v", err)
+		}
+		if len(res.Updated) != 1 || res.Updated[0] != target {
+			t.Errorf("Updated = %v, want [%s]", res.Updated, target)
+		}
+		if len(res.Mismatched) != 0 {
+			t.Errorf("Mismatched = %v, want none", res.Mismatched)
+		}
+		if info, err := os.Stat(target); err != nil || info.IsDir() {
+			t.Errorf("dry run changed target: info=%v err=%v", info, err)
+		}
+	})
+}
+
+func TestApplyTemplate_DryRunMismatchWithoutForce(t *testing.T) {
+	home := t.TempDir()
+	setTestHome(t, home)
+	src := filepath.Join(home, "src.tmpl")
+	if err := os.WriteFile(src, []byte("rendered"), 0o644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	target := filepath.Join(home, "target")
+	if err := os.WriteFile(target, []byte("stale"), 0o644); err != nil {
 		t.Fatalf("write target: %v", err)
 	}
-	res := &ApplyResult{}
+	cfg := &schema.FilesConfig{Templates: []schema.FileTemplate{{Source: src, Target: target}}}
 
-	if err := applyDir(context.Background(), schema.FileDir{Target: target}, ApplyOptions{DryRun: true}, res); err != nil {
-		t.Fatalf("applyDir dry run: %v", err)
+	res, err := Apply(context.Background(), cfg, "any", ApplyOptions{DryRun: true})
+	if err == nil {
+		t.Fatal("Apply dry run error = nil, want mismatch summary")
 	}
-	if len(res.Updated) != 1 || res.Updated[0] != target {
-		t.Errorf("Updated = %v, want [%s]", res.Updated, target)
+	if len(res.Mismatched) != 1 || res.Mismatched[0] != target {
+		t.Fatalf("Mismatched = %v, want [%s]", res.Mismatched, target)
 	}
-	if info, err := os.Stat(target); err != nil || info.IsDir() {
-		t.Errorf("dry run changed target: info=%v err=%v", info, err)
+	if len(res.Updated) != 0 {
+		t.Errorf("Updated = %v, want none", res.Updated)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil || string(got) != "stale" {
+		t.Errorf("dry run changed target: %q err=%v", got, err)
 	}
 }
 

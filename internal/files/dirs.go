@@ -51,12 +51,12 @@ func applyDir(ctx context.Context, d schema.FileDir, opts ApplyOptions, res *App
 		return nil
 	}
 
-	if opts.DryRun {
-		res.Updated = append(res.Updated, target)
-		return nil
-	}
 	if !opts.Force {
 		res.Mismatched = append(res.Mismatched, target)
+		return nil
+	}
+	if opts.DryRun {
+		res.Updated = append(res.Updated, target)
 		return nil
 	}
 
