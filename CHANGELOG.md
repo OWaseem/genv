@@ -4,6 +4,55 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v4.5.3 - 2026-09-30
+
+Correctness follow-up to v4.5.2, which was tagged with a red Windows CI job.
+The v4.5.2 binaries were functionally sound apart from the `~name` path
+expansion noted below.
+
+### Fixed
+
+- `expandCLIPath` still expanded any `~` prefix, so `~name` resolved to
+  `$HOME` + `name` on the CLI path even though `internal/files` and
+  `internal/schema` had been fixed. `~name` is a different user's home and must
+  be left alone. This was the only part of #208 still outstanding, and it
+  reached the v4.5.2 binaries (#208).
+- The same function built paths by string concatenation, producing
+  `C:\Users\me/dotfiles` on Windows. It now uses `filepath.Join`, matching the
+  other two copies of the rule.
+- `TestBuildEditorCmd` asserted that `argv[0]` is the editor path as typed. That
+  was only true before the #209 fix, where a qualified path is executed as the
+  allowlisted binary resolved through PATH. The table now asserts the executed
+  binary and its base name (#209).
+- Tests that assumed POSIX behaviour now hold on every platform: Windows
+  rewrites `/` to `\` in symlink text at creation, and does not enforce
+  directory permission bits for the owner, so the two permission-based failure
+  tests skip there. A new test stubs `symlink` so the "live file survives a
+  failed install" guarantee is still covered on Windows (#205).
+
+### CI
+
+- Unit tests now run on **every supported platform**: ubuntu, macOS and
+  Windows. macOS had never been exercised in CI at all, despite being the
+  platform genv is most opinionated about (launchd, homebrew, codesign,
+  symlink privileges, the PowerShell backend).
+- The release workflow now runs a `preflight` job that calls the same
+  reusable test workflow before GoReleaser. A tag push no longer publishes
+  whatever state the tree happens to be in — which is how v4.5.2 shipped with
+  failing tests.
+- Added `.gitattributes` so checkouts use LF everywhere. Without it the
+  Windows runner checked out CRLF and `gofmt -l` reported all 368 Go files as
+  unformatted, a false failure that said nothing about formatting. The old
+  Windows job had no format step, so this was invisible.
+- Go arguments are quoted in the workflow because the Windows runner's default
+  shell is PowerShell, which rewrote `-coverprofile=coverage.out ./...` into a
+  package named `.out` and failed the step after every real test had passed.
+- Coverage is uploaded per platform. Totals differ meaningfully and the Linux
+  number cannot see Windows- or macOS-only source: **80.8%** on Linux,
+  **80.7%** on macOS, **78.8%** on Windows. The coverage floor stays on the
+  Linux runner, where it was tuned; a cross-platform 80% floor would fail on
+  Windows.
+
 ## v4.5.2 - 2026-09-30
 
 All issues #195–#211.
