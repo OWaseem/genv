@@ -191,16 +191,19 @@ func fprintf(w io.Writer, format string, a ...any) { _, _ = fmt.Fprintf(w, forma
 func fPrintln(w io.Writer, a ...any)               { _, _ = fmt.Fprintln(w, a...) }
 func fprint(w io.Writer, a ...any)                 { _, _ = fmt.Fprint(w, a...) }
 
-// confirmReader is the buffered stdin shared by every prompt in a run.
-// Building a new bufio.Reader per prompt meant the first prompt consumed the
-// whole of a piped "y\ny\n" buffer and the second read saw EOF, answering
-// "no" to a question the operator had already answered.
-var confirmReader = bufio.NewReader(os.Stdin)
+// confirmReader is the buffered stdin shared by every prompt in a run, so a
+// piped "y\ny\n" is not swallowed by the first prompt and read as EOF by the
+// second. It is created on first use rather than at init so that it wraps
+// whatever os.Stdin is at that moment.
+var confirmReader *bufio.Reader
 
 // confirm writes prompt to stdout and reads a y/Y response from stdin.
 // Returns true if the user confirmed.
 func confirm(prompt string) bool {
 	fprint(os.Stdout, prompt)
+	if confirmReader == nil {
+		confirmReader = bufio.NewReader(os.Stdin)
+	}
 	answer, _ := confirmReader.ReadString('\n')
 	answer = strings.TrimSpace(answer)
 	return answer == "y" || answer == "Y"
@@ -2199,8 +2202,15 @@ func sourceRootForSpec(file string, f *schema.GenvFile) string {
 func localRepoPath(rawURL string) (string, bool) {
 	expanded := expandCLIPath(rawURL)
 	switch {
-	case strings.HasPrefix(expanded, "file://"):
-		return expanded, true
+	case strings.HasPrefix(strings.ToLower(expanded), "file://"):
+		// Strip the scheme so the result is a path this machine can actually
+		// open. file://host/path is not a local file we can read; only the
+		// empty-host form is accepted.
+		rest := expanded[len("file://"):]
+		if strings.HasPrefix(rest, "/") {
+			return rest, true
+		}
+		return "", false
 	case strings.HasPrefix(strings.ToLower(rawURL), "https://"),
 		strings.HasPrefix(strings.ToLower(rawURL), "ssh://"),
 		strings.HasPrefix(rawURL, "git@"):

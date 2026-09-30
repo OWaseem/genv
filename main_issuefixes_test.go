@@ -113,10 +113,13 @@ func TestSourceRootForSpec_LocalRepoURLIsTheRoot(t *testing.T) {
 	}{
 		{url: "~/dotfiles", want: filepath.Join(home, "dotfiles")},
 		{url: filepath.Join(home, "dotfiles"), want: filepath.Join(home, "dotfiles")},
-		{url: "file:///srv/dotfiles", want: "file:///srv/dotfiles"},
+		{url: "file:///srv/dotfiles", want: "/srv/dotfiles"},
+		// file://host/path names another machine, not a local file.
+		{url: "file://host/srv/dotfiles", want: filepath.Join(specPath, "..")},
 	} {
 		f := &schema.GenvFile{Repo: &schema.Repo{URL: tc.url}}
-		if got := sourceRootForSpec(specPath, f); got != tc.want {
+		got := sourceRootForSpec(specPath, f)
+		if got != tc.want {
 			t.Errorf("sourceRootForSpec(%q) = %q, want %q", tc.url, got, tc.want)
 		}
 	}
