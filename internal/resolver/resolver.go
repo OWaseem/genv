@@ -566,6 +566,35 @@ func packageDrifted(pkg schema.Package, lp genvfile.LockedPackage) bool {
 	return versionDrifted(pkg, lp)
 }
 
+// missingDespiteLock reports whether a lock entry asserts an install that the
+// manager contradicts.
+//
+// A lock entry with no InstalledVersion is not evidence that anything was
+// installed — it is what a failed install leaves behind, because the manager
+// never produced a version to record. Such an entry used to be believed
+// forever: versionDrifted had nothing to compare, so the package was never
+// re-queued, and it was written back into Unchanged on every later apply.
+// The state could not recover even after the package became installable.
+//
+// The manager's own inventory is the tie-breaker, and only when it was
+// actually read: LiveSet.reports distinguishes "this manager says the package
+// is absent" from "we never managed to ask", so an unavailable manager does
+// not trigger a pointless reinstall (#213).
+func missingDespiteLock(pkg schema.Package, lp genvfile.LockedPackage, live LiveSet) bool {
+	if pkg.External != nil || lp.Manager == "" || lp.PkgName == "" {
+		return false
+	}
+	if lp.InstalledVersion != "" {
+		// A recorded version is a real observation; absence is not a version
+		// comparison, so leave this to versionDrifted and the spec constraint.
+		return false
+	}
+	if !live.reports(lp.Manager) {
+		return false
+	}
+	return !live.has(lp.Manager, lp.PkgName)
+}
+
 // ReconcileResult holds the delta between the desired state (genv.json) and the
 // previously applied state (genv.lock.json). ToInstall are packages added to the
 // spec since the last apply; ToRemove are packages that were removed from it.
@@ -581,6 +610,18 @@ type ReconcileResult struct {
 // Names are matched case-insensitively. A nil LiveSet means lock-only
 // (do not probe the live system).
 type LiveSet map[string]map[string]bool
+
+// reports reports whether manager was successfully inventoried. It separates
+// "this manager says the package is absent" from "we never managed to ask",
+// which has to mean different things before a missing package can be treated
+// as evidence.
+func (s LiveSet) reports(manager string) bool {
+	if s == nil || manager == "" {
+		return false
+	}
+	_, ok := s[manager]
+	return ok
+}
 
 func (s LiveSet) has(manager, pkgName string) bool {
 	if s == nil || manager == "" || pkgName == "" {
@@ -769,7 +810,7 @@ func ReconcileWith(desired []schema.Package, managed []genvfile.LockedPackage, a
 		// Package is already in the lock. Check version constraint: if the lock
 		// recorded an InstalledVersion and it no longer satisfies the spec
 		// constraint, queue for reinstallation.
-		if packageDrifted(pkg, lp) {
+		if packageDrifted(pkg, lp) || missingDespiteLock(pkg, lp, live) {
 			toInstall = append(toInstall, resolveOnGOOS(pkg, available, runtime.GOOS))
 		}
 	}
@@ -795,7 +836,7 @@ func ReconcileWith(desired []schema.Package, managed []genvfile.LockedPackage, a
 			continue
 		}
 		// In desired — skip packages queued for reinstall; they must not appear in Unchanged.
-		if packageDrifted(specByID[lp.ID], lp) {
+		if packageDrifted(specByID[lp.ID], lp) || missingDespiteLock(specByID[lp.ID], lp, live) {
 			continue
 		}
 		unchanged = append(unchanged, lp)

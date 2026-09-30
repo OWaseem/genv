@@ -1895,11 +1895,15 @@ func TestStatusCmd_DistinguishesUnknownVersionFromNoConstraint(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("status: got %d, want %d\n%s", code, exitOK, out)
 	}
-	if !regexp.MustCompile(`ok\s+git\s+\S+\s+\*`).MatchString(out) {
-		t.Errorf("unconstrained git without installed version should show *: %q", out)
+	// A version-less entry is reported as "unknown" rather than "ok": the
+	// entry's presence is not evidence of an install, which is the state a
+	// failed install leaves behind (#213). The version column keeps its own
+	// "*" versus "?" meaning.
+	if !regexp.MustCompile(`unknown\s+git\s+\S+\s+\*`).MatchString(out) {
+		t.Errorf("unconstrained git without installed version should be unknown with *: %q", out)
 	}
-	if !regexp.MustCompile(`ok\s+vim\s+\S+\s+\?`).MatchString(out) {
-		t.Errorf("constrained vim without installed version should show ?: %q", out)
+	if !regexp.MustCompile(`unknown\s+vim\s+\S+\s+\?`).MatchString(out) {
+		t.Errorf("constrained vim without installed version should be unknown with ?: %q", out)
 	}
 	if !regexp.MustCompile(`ok\s+ripgrep\s+\S+\s+14\.1\.0`).MatchString(out) {
 		t.Errorf("ripgrep should show recorded installed version: %q", out)

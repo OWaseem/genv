@@ -35,6 +35,14 @@ const (
 	// StatusExtra means the package is in the lock but not in the spec —
 	// it was removed from the spec without being uninstalled (run 'genv apply').
 	StatusExtra StatusKind = "extra"
+
+	// StatusUnknown means the package is in both the spec and the lock, but
+	// the lock records no installed version, so genv cannot claim it is
+	// installed. This is what a failed install leaves behind: the entry is
+	// present, but no version was ever produced, and treating the entry's
+	// presence as proof made the state unrecoverable — the check that would
+	// have re-checked it was gated on the very thing that was missing (#213).
+	StatusUnknown StatusKind = "unknown"
 )
 
 // StatusEntry is one row in the status report.
@@ -47,10 +55,11 @@ type StatusEntry struct {
 	InstalledVersion string // recorded version from lock, may be empty
 }
 
-// DisplayVersion is the human-readable version column for an OK status row.
+// DisplayVersion is the human-readable version column for a status row.
 // A recorded install version wins. "*" means no spec constraint (and no
 // recorded install version). "?" means a constraint exists but the lock has
-// no installed version.
+// no installed version. The StatusUnknown kind is the signal that genv cannot
+// confirm an install; the column keeps its own distinct meaning.
 func (e StatusEntry) DisplayVersion() string {
 	if e.InstalledVersion != "" {
 		return e.InstalledVersion
@@ -209,7 +218,10 @@ func StatusWithLive(f *schema.GenvFile, lf *genvfile.LockFile, live map[string]m
 			continue
 		}
 		kind := StatusOK
-		if lp.InstalledVersion != "" && !version.Satisfies(pkg.Version, lp.InstalledVersion) {
+		if lp.InstalledVersion == "" {
+			// A lock entry with no version is not evidence of an install.
+			kind = StatusUnknown
+		} else if !version.Satisfies(pkg.Version, lp.InstalledVersion) {
 			kind = StatusDrift
 		}
 		entries = append(entries, StatusEntry{

@@ -3723,6 +3723,12 @@ func statusCmd(args []string) int {
 		case commands.StatusMissing:
 			note := "(in spec, not in lock — run 'genv apply')"
 			fprintf(tw, "  missing\t%s\t%s\t%s\n", e.ID, mgr, note)
+		case commands.StatusUnknown:
+			// The lock has an entry but no recorded version, which is what a
+			// failed install leaves behind. Say so rather than implying the
+			// package is installed (#213).
+			note := "(in lock with no recorded version — apply will re-check)"
+			fprintf(tw, "  unknown\t%s\t%s\t%s %s\n", e.ID, mgr, e.DisplayVersion(), note)
 		case commands.StatusExtra:
 			note := "(in lock, not in spec — run 'genv apply' or 'genv disown')"
 			fprintf(tw, "  extra\t%s\t%s\t%s\n", e.ID, mgr, note)
