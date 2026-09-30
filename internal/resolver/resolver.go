@@ -449,6 +449,7 @@ func ExecuteUpgrade(ctx context.Context, plan []UpgradeAction, stdin io.Reader, 
 			installed, err := (externalpkg.Engine{
 				Host: externalpkg.CurrentHost(), Mode: executionOptions.ExternalMode,
 				Acknowledge: executionOptions.AcknowledgeExternal, Stdin: stdin, Output: stderr,
+				SourceRoot: executionOptions.SourceRoot,
 			}).Install(ctx, *a.External)
 			if err != nil {
 				if errors.Is(err, externalpkg.ErrUnattendedElevation) {
@@ -863,6 +864,9 @@ type ApplyExecutionOptions struct {
 	// Unattended is set by the scheduled updates worker. It never prompts for
 	// elevation; commands that would need admin are skipped or fail closed.
 	Unattended bool
+	// SourceRoot is the spec directory, used to resolve relative external
+	// publicKeyFile paths (including keys bundled by `genv export`).
+	SourceRoot string
 }
 
 // ExecuteApply runs all removals then all installs from a ReconcileResult.
@@ -941,6 +945,7 @@ func ExecuteApply(ctx context.Context, result ReconcileResult, stdin io.Reader, 
 			installed, err := (externalpkg.Engine{
 				Host: externalpkg.CurrentHost(), Mode: executionOptions.ExternalMode,
 				Acknowledge: executionOptions.AcknowledgeExternal, Stdin: stdin, Output: stderr,
+				SourceRoot: executionOptions.SourceRoot,
 			}).Install(ctx, a.Pkg)
 			if err != nil {
 				out.Errors = append(out.Errors, fmt.Errorf("install %q (via external): %w", a.Pkg.ID, err))

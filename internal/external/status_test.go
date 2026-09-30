@@ -67,14 +67,14 @@ func TestExpandDestinationHomeRelative(t *testing.T) {
 }
 
 func TestLocalKeyReadsInlineAndFile(t *testing.T) {
-	if got, err := localKey("inline", ""); err != nil || string(got) != "inline" {
+	if got, err := (Engine{}).localKey("inline", ""); err != nil || string(got) != "inline" {
 		t.Fatalf("inline key = %q %v", got, err)
 	}
 	path := filepath.Join(t.TempDir(), "key")
 	if err := os.WriteFile(path, []byte("file-key"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	got, err := localKey("", path)
+	got, err := (Engine{}).localKey("", path)
 	if err != nil || string(got) != "file-key" {
 		t.Fatalf("file key = %q %v", got, err)
 	}

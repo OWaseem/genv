@@ -163,7 +163,7 @@ func updatesRunOnceBody(ctx context.Context, logger *slog.Logger, f *schema.Genv
 		return exitOK
 	}
 	diagnostics := newUpdatesDiagnosticWriter(updatesDiagnosticLimit)
-	runResult := updatesRunUpgrade(ctx, upgrade.UpgradeRunOptions{Plan: plan, Lock: lf, LockPath: lockPath, Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: diagnostics, ExternalMode: externalpkg.ExecutionUnattended, Unattended: true})
+	runResult := updatesRunUpgrade(ctx, upgrade.UpgradeRunOptions{Plan: plan, Lock: lf, LockPath: lockPath, Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: diagnostics, ExternalMode: externalpkg.ExecutionUnattended, Unattended: true, SourceRoot: sourceRootForSpec(file, f)})
 	matchedErrors := make([]bool, len(runResult.Errors))
 	for _, failure := range runResult.Failures {
 		sanitizedIDs := make([]string, len(failure.IDs))

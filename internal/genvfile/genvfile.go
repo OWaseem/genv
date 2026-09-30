@@ -193,9 +193,24 @@ func writeValidated(path string, data []byte) error {
 		return fmt.Errorf("creating directory %s: %w", dir, err)
 	}
 
-	tmp := path + ".tmp"
-	tmpF, err := os.Create(tmp)
+	// 0600, matching the lock and the private fragments. A spec can hold env
+	// values marked sensitive, so it must never land world-readable, and a
+	// rewrite must not loosen a mode the user set by hand.
+	mode := os.FileMode(0o600)
+	if info, err := os.Stat(path); err == nil && info.Mode().Perm()&0o077 != 0 {
+		// Spec already exists and is readable by group/other: that is a
+		// pre-existing, deliberate choice, so leave its mode alone.
+		mode = info.Mode().Perm()
+	}
+
+	tmpF, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
 	if err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	tmp := tmpF.Name()
+	if err := tmpF.Chmod(mode); err != nil {
+		_ = tmpF.Close()
+		_ = os.Remove(tmp)
 		return fmt.Errorf("writing %s: %w", tmp, err)
 	}
 	if _, err := tmpF.Write(data); err != nil {

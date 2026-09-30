@@ -1546,7 +1546,7 @@ func runApplyJSON(ctx context.Context, opts applyOptions, lockPath string, f *sc
 			return writeJSON(os.Stdout, output.Envelope{Version: output.SchemaVersion, Command: "apply", OK: false, Data: output.ApplyResult{FailedHooks: preErrs}, Errors: preErrs})
 		}
 	}
-	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr, resolver.ApplyExecutionOptions{ExternalMode: externalpkg.ExecutionAssumeYes})
+	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr, resolver.ApplyExecutionOptions{ExternalMode: externalpkg.ExecutionAssumeYes, SourceRoot: applySourceRoot(opts, f)})
 	errs := errStrings(execResult.Errors)
 
 	var envApplied, envRemoved, shellApplied, shellRemoved []string
@@ -1737,6 +1737,7 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 		AcknowledgeExternal: func(message string) bool {
 			return confirm(message + " [y/N] ")
 		},
+		SourceRoot: applySourceRoot(opts, f),
 	})
 
 	var svcErrs []error
@@ -4369,6 +4370,7 @@ func upgradeCmd(args []string) int {
 			Stderr:              os.Stderr,
 			ExternalMode:        mode,
 			AcknowledgeExternal: func(message string) bool { return confirm(message + " [y/N] ") },
+			SourceRoot:          sourceRootForSpec(*file, f),
 		})
 	}
 
@@ -4627,6 +4629,7 @@ func upgradeJSON(dryRun, yes bool, hostName, specFile, lockPath string, hookTime
 			Stdout:       os.Stderr,
 			Stderr:       os.Stderr,
 			ExternalMode: externalpkg.ExecutionAssumeYes,
+			SourceRoot:   sourceRootForSpec(specFile, f),
 		})
 	}
 	batches := make([]output.UpgradeBatch, 0, len(plan))

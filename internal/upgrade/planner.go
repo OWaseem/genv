@@ -52,6 +52,9 @@ type UpgradeRunOptions struct {
 	ExternalMode        externalpkg.ExecutionMode
 	AcknowledgeExternal func(message string) bool
 	Unattended          bool
+	// SourceRoot is the spec directory, used to resolve relative external
+	// publicKeyFile paths (including keys bundled by `genv export`).
+	SourceRoot string
 }
 
 type UpgradeRunResult struct {
@@ -251,6 +254,7 @@ func BuildUpgradePlan(opts UpgradeOptions) (UpgradePlan, error) {
 func RunUpgrade(ctx context.Context, opts UpgradeRunOptions) UpgradeRunResult {
 	execResult := resolver.ExecuteUpgrade(ctx, opts.Plan.Actions, opts.Stdin, opts.Stdout, opts.Stderr, resolver.ApplyExecutionOptions{
 		ExternalMode: opts.ExternalMode, AcknowledgeExternal: opts.AcknowledgeExternal, Unattended: opts.Unattended,
+		SourceRoot: opts.SourceRoot,
 	})
 	applyUpgradedVersions(opts.Lock, execResult.Upgraded)
 

@@ -44,7 +44,7 @@ func (c Command) Available() bool {
 	if strings.TrimSpace(tmpl) == "" {
 		tmpl = c.def.Install
 	}
-	argv, err := splitCommand(expandTemplate(tmpl, "id"))
+	argv, err := splitCommandTemplate(tmpl, "id")
 	if err != nil || len(argv) == 0 {
 		return false
 	}
@@ -93,7 +93,7 @@ func (c Command) ListInstalled() ([]string, error) {
 
 func (c Command) QueryVersion(pkgName string) (string, error) {
 	if strings.TrimSpace(c.def.Version) != "" {
-		argv, err := splitCommand(expandTemplate(c.def.Version, pkgName))
+		argv, err := splitCommandTemplate(c.def.Version, pkgName)
 		if err != nil || len(argv) == 0 {
 			return "", err
 		}
@@ -148,7 +148,7 @@ func (c commandWithOutdated) ListOutdated(pkgNames []string) (map[string]string,
 }
 
 func (c Command) listEntries(tmpl string) ([]string, map[string]string, error) {
-	argv, err := splitCommand(expandTemplate(tmpl, "id"))
+	argv, err := splitCommandTemplate(tmpl, "id")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -174,11 +174,40 @@ func classifyListErr(err error) error {
 }
 
 func planCommand(tmpl, pkgName string) []string {
-	argv, err := splitCommand(expandTemplate(tmpl, pkgName))
+	argv, err := splitCommandTemplate(tmpl, pkgName)
 	if err != nil {
 		return nil
 	}
 	return argv
+}
+
+// splitCommandTemplate tokenizes an argv template and then substitutes the
+// package id.
+//
+// Splitting first is the point. Expanding "{{id}}" into the template string
+// first meant an id containing whitespace or shell metacharacters — which
+// ValidPackageName permits (";", "|", quotes, "$", backticks) — leaked into
+// neighboring tokens, and for a template like `sh -c "tool install {{id}}"`
+// into the shell string itself.
+//
+// A token that is exactly "{{id}}" or "{{name}}" becomes the id as one argv
+// element whatever it contains. A token that embeds the placeholder keeps its
+// surrounding text (e.g. "--id={{id}}").
+func splitCommandTemplate(tmpl, id string) ([]string, error) {
+	tokens, err := splitCommand(tmpl)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(tokens))
+	for _, tok := range tokens {
+		switch tok {
+		case "{{id}}", "{{name}}":
+			out = append(out, id)
+		default:
+			out = append(out, expandTemplate(tok, id))
+		}
+	}
+	return out, nil
 }
 
 func expandTemplate(tmpl, id string) string {

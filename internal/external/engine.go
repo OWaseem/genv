@@ -27,6 +27,10 @@ type Engine struct {
 	Stdin       io.Reader
 	Output      io.Writer
 	Home        string
+	// SourceRoot is the spec directory. A relative publicKeyFile resolves
+	// against it, which is what makes a key that `genv export` bundled under
+	// files/ usable on the machine that applies the exported snapshot.
+	SourceRoot string
 }
 
 // Installed is the verified result of one external installation.
@@ -278,7 +282,7 @@ func (e Engine) verifyArtifact(ctx context.Context, recipe *schema.ExternalRecip
 			if err != nil {
 				return "", err
 			}
-			publicKey, err := localKey(verification.PublicKey, verification.PublicKeyFile)
+			publicKey, err := e.localKey(verification.PublicKey, verification.PublicKeyFile)
 			if err != nil {
 				return "", err
 			}
@@ -296,7 +300,7 @@ func (e Engine) verifyArtifact(ctx context.Context, recipe *schema.ExternalRecip
 			if err != nil {
 				return "", err
 			}
-			publicKey, err := localKey(verification.PublicKey, verification.PublicKeyFile)
+			publicKey, err := e.localKey(verification.PublicKey, verification.PublicKeyFile)
 			if err != nil {
 				return "", err
 			}
@@ -352,11 +356,31 @@ func (e Engine) verificationMaterial(ctx context.Context, recipe *schema.Externa
 	return os.ReadFile(downloaded.Path)
 }
 
-func localKey(inline, path string) ([]byte, error) {
+// localKey returns the verification public key, preferring an inline value.
+// A relative publicKeyFile resolves against the engine's SourceRoot (the spec
+// directory) so a key that `genv export` copied next to the snapshot — and
+// rewrote to a bundle-relative path — can actually be read back. Absolute and
+// home-relative paths are expanded as before.
+func (e Engine) localKey(inline, path string) ([]byte, error) {
 	if inline != "" {
 		return []byte(inline), nil
 	}
-	expanded, err := expandDestination(path)
+	resolved := path
+	if resolved != "" && !filepath.IsAbs(resolved) && !strings.HasPrefix(resolved, "~") {
+		root := e.SourceRoot
+		if root == "" {
+			home := e.Home
+			if home == "" {
+				var err error
+				if home, err = os.UserHomeDir(); err != nil {
+					return nil, fmt.Errorf("resolve home directory: %w", err)
+				}
+			}
+			root = home
+		}
+		resolved = filepath.Join(root, filepath.FromSlash(resolved))
+	}
+	expanded, err := expandDestination(resolved)
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +490,16 @@ func detectVersion(ctx context.Context, detect schema.ExternalDetect) (string, e
 }
 
 func expandDestination(path string) (string, error) {
-	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+	// "~" alone is the home directory itself: slicing path[2:] on a one-byte
+	// string used to panic.
+	switch {
+	case path == "~":
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve home directory: %w", err)
+		}
+		return filepath.Clean(home), nil
+	case strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`):
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", fmt.Errorf("resolve home directory: %w", err)
