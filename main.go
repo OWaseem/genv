@@ -191,11 +191,17 @@ func fprintf(w io.Writer, format string, a ...any) { _, _ = fmt.Fprintf(w, forma
 func fPrintln(w io.Writer, a ...any)               { _, _ = fmt.Fprintln(w, a...) }
 func fprint(w io.Writer, a ...any)                 { _, _ = fmt.Fprint(w, a...) }
 
+// confirmReader is the buffered stdin shared by every prompt in a run.
+// Building a new bufio.Reader per prompt meant the first prompt consumed the
+// whole of a piped "y\ny\n" buffer and the second read saw EOF, answering
+// "no" to a question the operator had already answered.
+var confirmReader = bufio.NewReader(os.Stdin)
+
 // confirm writes prompt to stdout and reads a y/Y response from stdin.
 // Returns true if the user confirmed.
 func confirm(prompt string) bool {
 	fprint(os.Stdout, prompt)
-	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	answer, _ := confirmReader.ReadString('\n')
 	answer = strings.TrimSpace(answer)
 	return answer == "y" || answer == "Y"
 }
@@ -500,7 +506,17 @@ func stampLockTarget(lf *genvfile.LockFile, targetID string) {
 	lf.GOOS = runtime.GOOS
 }
 
+// appendLockEntry reads the lock at lockPath, appends lp, and writes it back.
+// The read-modify-write runs under LockMutation and re-reads inside the lock,
+// so a concurrent apply, upgrade, or the scheduled worker cannot have its lock
+// snapshot overwritten by this append.
 func appendLockEntry(lockPath string, lp genvfile.LockedPackage, targetID string) int {
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
 		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
@@ -1151,6 +1167,14 @@ func adoptFilesCmd(file, lockFile, stateDir, hostFlag, targetFlag string, jsonOu
 	}
 
 	lockPath := lockPathForState(file, stateDir, lockFile)
+	// Read-modify-write under LockMutation: an apply or the scheduled worker
+	// running concurrently must not lose its entries to this write.
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
 		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
@@ -1215,6 +1239,16 @@ func disownCmd(args []string) int {
 	}
 
 	lockPath := lockPathForSpec(*file, *lockFile)
+	// A disown during the hourly worker run used to be lost: the worker holds
+	// LockMutation across its whole upgrade and then writes the snapshot it
+	// read at the start, so the removal was undone and the next apply
+	// uninstalled the package again.
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
 		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
@@ -1361,7 +1395,7 @@ func applyCmd(args []string) int {
 	fs.BoolVar(&opts.Strict, "strict", false, "exit with an error if any package cannot be resolved")
 	fs.BoolVar(&opts.Yes, "yes", false, "skip the confirmation prompt (for CI and scripts)")
 	fs.BoolVar(&opts.Quiet, "quiet", false, "suppress plan output (useful in scripts)")
-	fs.BoolVar(&opts.JSONOut, "json", false, "emit machine-readable JSON to stdout instead of human-readable text")
+	fs.BoolVar(&opts.JSONOut, "json", false, "emit machine-readable JSON to stdout instead of human-readable text (wet-run requires --yes)")
 	fs.DurationVar(&opts.Timeout, "timeout", 10*time.Minute, "per-subprocess timeout, e.g. 5m or 30s (0 means no timeout; default 10m)")
 	fs.DurationVar(&opts.HookTimeout, "hook-timeout", 0, "per-hook timeout, e.g. 5m or 30s (0 means no timeout)")
 	fs.BoolVar(&opts.NoHooks, "no-hooks", false, "skip lifecycle hooks without skipping apply")
@@ -1519,23 +1553,28 @@ func runApplyJSON(ctx context.Context, opts applyOptions, lockPath string, f *sc
 	planData := buildPlanResult(f, lf, result)
 	state := applyStatePaths(opts.resolvedStateDir, lockPath)
 	planData.State = &state
-	if opts.DryRun {
-		filePlan, filePlanErr := applyFiles(ctx, opts, f, lf)
+	if opts.DryRun || !opts.Yes {
+		// Plan only: when --yes is absent this must not touch the filesystem
+		// either, so the files pass is forced into dry-run.
+		planOpts := opts
+		planOpts.DryRun = true
+		filePlan, filePlanErr := applyFiles(ctx, planOpts, f, lf)
 		planData.Files = filePlanEntries(filePlan)
+		var errs []string
 		if filePlanErr != nil {
-			return writeJSON(os.Stdout, output.Envelope{
-				Version: output.SchemaVersion,
-				Command: "apply",
-				OK:      false,
-				Data:    planData,
-				Errors:  []string{filePlanErr.Error()},
-			})
+			errs = append(errs, filePlanErr.Error())
+		}
+		// Only refuse when there is actually something to consent to, matching
+		// `genv upgrade --json`: an already-applied spec still reports OK.
+		if !opts.DryRun && applyHasPendingWork(f, lf, result, filePlan) {
+			errs = append(errs, "wet-run requires --yes (pass --dry-run to plan only)")
 		}
 		return writeJSON(os.Stdout, output.Envelope{
 			Version: output.SchemaVersion,
 			Command: "apply",
-			OK:      true,
+			OK:      len(errs) == 0,
 			Data:    planData,
+			Errors:  errs,
 		})
 	}
 
@@ -1546,7 +1585,13 @@ func runApplyJSON(ctx context.Context, opts applyOptions, lockPath string, f *sc
 			return writeJSON(os.Stdout, output.Envelope{Version: output.SchemaVersion, Command: "apply", OK: false, Data: output.ApplyResult{FailedHooks: preErrs}, Errors: preErrs})
 		}
 	}
-	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr, resolver.ApplyExecutionOptions{ExternalMode: externalpkg.ExecutionAssumeYes, SourceRoot: applySourceRoot(opts, f)})
+	// External installs get the same consent the hooks see, rather than a
+	// hard-coded assume-yes.
+	externalMode := externalpkg.ExecutionInteractive
+	if opts.Yes {
+		externalMode = externalpkg.ExecutionAssumeYes
+	}
+	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr, resolver.ApplyExecutionOptions{ExternalMode: externalMode, SourceRoot: applySourceRoot(opts, f)})
 	errs := errStrings(execResult.Errors)
 
 	var envApplied, envRemoved, shellApplied, shellRemoved []string
@@ -1628,6 +1673,36 @@ func runApplyJSON(ctx context.Context, opts applyOptions, lockPath string, f *sc
 	})
 }
 
+// applyHasPendingWork reports whether an apply would change anything. The
+// JSON gate uses it so a wet run without --yes is refused only when there is
+// something to consent to; an already-applied spec still reports OK, matching
+// `genv upgrade --json`. filePlan is the dry-run file result the caller
+// already computed.
+func applyHasPendingWork(f *schema.GenvFile, lf *genvfile.LockFile, result resolver.ReconcileResult, filePlan *files.ApplyResult) bool {
+	if len(result.ToInstall) > 0 || len(result.ToRemove) > 0 {
+		return true
+	}
+	for _, e := range genvenv.EnvStatus(f.Env, lf.Env) {
+		if e.Kind != genvenv.EnvStatusOK {
+			return true
+		}
+	}
+	for _, e := range shellcfg.ShellStatus(f.Shell, lf.Shell) {
+		if e.Kind != shellcfg.ShellStatusOK {
+			return true
+		}
+	}
+	for _, e := range service.ServiceStatus(f.Services, lf.Services, false, "") {
+		if e.Kind != service.ServiceStatusOK {
+			return true
+		}
+	}
+	if filePlan != nil && len(filePlan.Created)+len(filePlan.Updated)+len(filePlan.Mismatched) > 0 {
+		return true
+	}
+	return false
+}
+
 func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *schema.GenvFile, lf *genvfile.LockFile, result resolver.ReconcileResult) int {
 	printReconcileWarnings(result)
 	planOut := io.Writer(os.Stdout)
@@ -1664,15 +1739,15 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 	}
 
 	if toInstall == 0 && toRemove == 0 && envChanges == 0 && shellChanges == 0 && serviceChanges == 0 && fileChanges == 0 {
-		if !opts.Quiet {
-			fPrintln(os.Stdout, "already up to date.")
-		}
 		if !opts.DryRun {
 			if !opts.NoHooks {
 				hostName := hostForCommand(opts.Host)
 				hookErrs := runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "pre-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes}.withFiles(opts.File, lockPath), opts.HookTimeout, false)
 				hookErrs = append(hookErrs, runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "post-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes}.withFiles(opts.File, lockPath), opts.HookTimeout, false)...)
 				if len(hookErrs) > 0 {
+					// Report hooks before claiming success: a hook error exits
+					// non-zero, and "already up to date." above it would have
+					// been contradicted by the exit code.
 					for _, e := range hookErrs {
 						fprintf(os.Stderr, "genv apply: %s\n", e)
 					}
@@ -1684,6 +1759,9 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 				fprintf(os.Stderr, "genv: writing lock: %v\n", err)
 				return exitIO
 			}
+		}
+		if !opts.Quiet {
+			fPrintln(os.Stdout, "already up to date.")
 		}
 		return exitOK
 	}
@@ -2098,11 +2176,50 @@ func errStrings(errs []error) []string {
 	return s
 }
 
+// sourceRootForSpec returns the directory relative files.links/templates and
+// service assets resolve against.
+//
+// A local repo.url (~/, absolute, or file://) is usable as a source root
+// because it names a real directory on this machine. A remote one is not:
+// `genv pull` copies bundled assets next to the local spec, and
+// filepath.Clean turns "https://github.com/org/repo" into the relative path
+// "https:/github.com/org/repo". For those, the spec directory is the root.
+// --source-root still wins (see applySourceRoot).
 func sourceRootForSpec(file string, f *schema.GenvFile) string {
 	if f != nil && f.Repo != nil && f.Repo.URL != "" {
-		return expandCLIPath(f.Repo.URL)
+		if local, ok := localRepoPath(f.Repo.URL); ok {
+			return local
+		}
 	}
 	return filepath.Dir(file)
+}
+
+// localRepoPath returns the on-disk path a repo.url names, and whether the
+// URL is local at all. Remote schemes (https://, ssh://, git@) return false.
+func localRepoPath(rawURL string) (string, bool) {
+	expanded := expandCLIPath(rawURL)
+	switch {
+	case strings.HasPrefix(expanded, "file://"):
+		return expanded, true
+	case strings.HasPrefix(strings.ToLower(rawURL), "https://"),
+		strings.HasPrefix(strings.ToLower(rawURL), "ssh://"),
+		strings.HasPrefix(rawURL, "git@"):
+		return "", false
+	case filepath.IsAbs(expanded) || isWindowsAbsPathString(expanded):
+		return expanded, true
+	default:
+		return "", false
+	}
+}
+
+// isWindowsAbsPathString reports whether s looks like a Windows drive path
+// regardless of the host GOOS, so a Linux box evaluating a Windows repo.url
+// still classifies it as absolute.
+func isWindowsAbsPathString(s string) bool {
+	if len(s) < 3 || !((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z')) {
+		return false
+	}
+	return s[1] == ':' && (s[2] == '\\' || s[2] == '/')
 }
 
 // applySourceRoot is the files.links/templates and service template root for apply.
@@ -3178,7 +3295,21 @@ func scanCmd(args []string) int {
 		}
 	}
 
+	// Take the lock before touching the lock file so the appended entries are
+	// based on the latest file rather than the snapshot read above: an apply
+	// that finished in between would otherwise be erased by this write.
 	var added int
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
+	lf, err = genvfile.ReadLock(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+		return exitIO
+	}
 	for _, c := range candidates {
 		prefer := ""
 		if adapter.SpecName(c.manager) {
@@ -3699,6 +3830,12 @@ func cleanCmd(args []string) int {
 
 // buildEditorCmd parses the editor string, validates the executable against a
 // whitelist of safe editors, and returns an exec.Cmd ready to run.
+//
+// The allowlist applies to the binary that actually executes, not to its base
+// name. Checking filepath.Base let EDITOR=/tmp/evil/code pass because the base
+// was "code", then ran /tmp/evil/code — the same for vi, vim, nano and emacs.
+// A path with a directory component is therefore resolved through PATH from
+// its base name, or refused outright.
 func buildEditorCmd(editor, file string) (*exec.Cmd, error) {
 	fields := strings.Fields(editor)
 	if len(fields) == 0 {
@@ -3711,6 +3848,18 @@ func buildEditorCmd(editor, file string) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("editor %q is not allowed; must be one of: vi, vim, nano, emacs, code", bin)
 	}
 
+	// A qualified path is only honored when it resolves to the allowlisted
+	// binary on PATH, so "code" and "/opt/homebrew/bin/code" both work but
+	// "/tmp/evil/code" does not become an execution path for a base-name match.
+	execBin := base
+	if bin != base {
+		resolved, err := exec.LookPath(base)
+		if err != nil {
+			return nil, fmt.Errorf("editor %q is not allowed; must be one of: vi, vim, nano, emacs, code", bin)
+		}
+		execBin = resolved
+	}
+
 	for _, arg := range fields[1:] {
 		if !safeFlags[arg] {
 			return nil, fmt.Errorf("editor flag %q is not allowed; only safe flags are permitted", arg)
@@ -3718,7 +3867,7 @@ func buildEditorCmd(editor, file string) (*exec.Cmd, error) {
 	}
 
 	args := append(fields[1:], file)
-	return exec.Command(bin, args...), nil
+	return exec.Command(execBin, args...), nil
 }
 
 func parseCommandWords(input string) ([]string, error) {

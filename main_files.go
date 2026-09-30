@@ -107,6 +107,14 @@ func filesAdoptCmd(args []string) int {
 	}
 
 	lockPath := lockPathForSpec(*file, *lockFile)
+	// Read-modify-write under LockMutation, re-reading inside the lock so a
+	// concurrent apply is not clobbered by this write.
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv files adopt: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
 		fprintf(os.Stderr, "genv: reading lock: %v\n", err)

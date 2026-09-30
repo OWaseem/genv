@@ -204,6 +204,10 @@ func pullCacheDir() (string, error) {
 // updateRepoCache ensures cacheDir contains the requested ref of url.
 // It clones on first use and fetches/updates on subsequent runs.
 func updateRepoCache(cacheDir, url, ref string) error {
+	// ValidRepoURL accepts "~/..." but git does not expand a leading tilde, so
+	// the clone was handed a literal path it could not resolve. Expand before
+	// git sees it. Remote URLs are returned unchanged.
+	url = expandCLIPath(url)
 	if _, err := os.Stat(cacheDir); os.IsNotExist(err) {
 		if err := os.MkdirAll(filepath.Dir(cacheDir), 0o700); err != nil {
 			return fmt.Errorf("creating cache directory: %w", err)
