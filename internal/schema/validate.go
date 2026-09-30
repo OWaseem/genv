@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
@@ -640,6 +641,12 @@ func validateShellConfig(f *GenvFile, shell *ShellConfig, fieldPrefix string) []
 	aliasShells := make(map[string]string, len(shell.Aliases))
 	for k, v := range shell.Aliases {
 		aliasShells[k] = v.Shell
+		if containsAliasBreakout(v.Value) {
+			errs = append(errs, ValidationError{
+				Field:   fmt.Sprintf("%s.aliases.%s", fieldPrefix, k),
+				Message: "alias value must not contain braces or newlines",
+			})
+		}
 	}
 	errs = append(errs, validateShellEntries(aliasShells, fieldPrefix+".aliases", "alias")...)
 
@@ -697,6 +704,12 @@ func validateTargetShellConfig(f *GenvFile, shell *TargetShellConfig, fieldPrefi
 			continue
 		}
 		aliasShells[k] = v.Shell
+		if containsAliasBreakout(v.Value) {
+			errs = append(errs, ValidationError{
+				Field:   fmt.Sprintf("%s.aliases.%s", fieldPrefix, k),
+				Message: "alias value must not contain braces or newlines",
+			})
+		}
 	}
 	errs = append(errs, validateShellEntries(aliasShells, fieldPrefix+".aliases", "alias")...)
 
@@ -942,12 +955,14 @@ func validateServiceCommand(fieldPrefix, name, field string, args []string) []Va
 // home directory, and $VAR/${VAR} are replaced with os.Getenv values. It is a
 // best-effort helper; callers validate the result rather than the raw string.
 func expandPath(s string) (string, error) {
-	if strings.HasPrefix(s, "~") {
+	// Only "~", "~/" and "~\" are home-relative. "~name" is a different
+	// user's home and must not resolve to $HOME concatenated with "name".
+	if s == "~" || strings.HasPrefix(s, "~/") || strings.HasPrefix(s, `~\`) {
 		home, err := os.UserHomeDir()
 		if err != nil {
 			return "", err
 		}
-		s = home + s[1:]
+		s = filepath.Join(home, s[1:])
 	}
 	return os.Expand(s, os.Getenv), nil
 }
@@ -1086,6 +1101,12 @@ func validateHookPhase(fieldPrefix, phase string, hooks []Hook) []ValidationErro
 		}
 		if strings.ContainsAny(h.File, "\r\n") {
 			errs = append(errs, ValidationError{Field: field + ".file", Message: "file must not contain newlines"})
+		}
+		if strings.ContainsAny(h.Command, "\r\n") {
+			// Hooks run through sh -c, PowerShell -Command, or cmd /C on
+			// Windows. A newline lets one command smuggle a second one past
+			// what the author wrote, so it is refused like file and argv.
+			errs = append(errs, ValidationError{Field: field + ".command", Message: "command must not contain newlines"})
 		}
 	}
 	return errs
@@ -1572,8 +1593,23 @@ func validateNoHookHosts(hooks *HooksConfig, fieldPrefix string, positions map[s
 	return errs
 }
 
+// containsAliasBreakout reports whether an alias value could escape the
+// wrapper genv generates around it.
+//
+// POSIX aliases are single-quoted, so only the closing brace matters for the
+// PowerShell form, which is emitted as `function <name> { <value> }`. A value
+// of "} true" would close the function and run "true" when the fragment is
+// sourced. Braces are refused for both targets so a spec stays portable.
+func containsAliasBreakout(s string) bool {
+	return strings.ContainsAny(s, "{}\r\n")
+}
+
+// containsShellMeta reports whether s holds a character that would let it
+// escape the generated wrapper. The alias/function bodies genv writes are
+// wrapped in a shell function, so an unbalanced brace is as dangerous as a
+// command separator: "} true" would close the function and run "true".
 func containsShellMeta(s string) bool {
-	return strings.ContainsAny(s, "\r\n;&|`$<>()")
+	return strings.ContainsAny(s, "\r\n;&|`$<>(){}")
 }
 
 func validShellIdent(name string) bool {

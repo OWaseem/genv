@@ -181,6 +181,10 @@ func WriteShellPS1(path string, cfg *schema.ShellConfig) error {
 		sb.WriteString("\n# aliases\n")
 		for _, name := range aliases {
 			a := cfg.Aliases[name]
+			// A PowerShell alias is a function whose body is the command to
+			// run, so the value is deliberately unquoted. Validation rejects
+			// the characters that could close the wrapper (see
+			// schema.containsAliasBreakout).
 			_, _ = fmt.Fprintf(&sb, "function %s { %s }\n", name, a.Value)
 		}
 	}
