@@ -211,9 +211,15 @@ Legacy **v1–v7** specs still load. Convert with `genv migrate`. Field-by-field
 
 Convenience commands (`add` / `remove` / `adopt` / `disown` / `scan`) update the spec and usually the live system in one step. `genv add` installs first and only persists the spec after a successful install (unresolved or failed installs exit `4` and leave the spec unchanged; use `adopt` to track without installing). On v8 they write into `targets.<active>` (`--target` or `$GENV_TARGET` / classification).
 
+Human `apply` prompts unless `--yes`. Because a JSON caller cannot answer a prompt, `genv apply --json` is **plan-only** unless `--yes` is passed (or `--dry-run` to plan explicitly); a wet run without `--yes` returns the plan with `wet-run requires --yes` and changes nothing. Hooks receive the same consent through `GENV_YES`. An already-applied spec still reports `ok`, matching `genv upgrade --json`.
+
+`genv.json` itself is written `0600` (like the lock and the private fragments) because a spec can hold `env` values marked `sensitive`. A spec you have deliberately made group/other-readable keeps that mode.
+
+Managed links are compared by resolved path, so a relative link pointing at the same file as an absolute `source` counts as correct. Relative file sources and hook `file` paths resolve against the spec directory (`--source-root` overrides), which is where `genv pull` and `genv export` place bundled assets.
+
 `genv scan` adopts **user-facing** installs by default: Homebrew `brew leaves` plus casks (not the full formula tree), Ruby gems that are not default or bundled with the interpreter, and pip-user packages that are not dependencies of other user-site packages (minus installer/stdlib-like noise such as `certifi` / `setuptools`). npm/pnpm/yarn already list top-level globals only (and scan never proposes `npm` itself). uv proposes tool names from `uv tool list` headers, not `-` entrypoint bullets. rustup toolchains are not proposed. Pass `--all` or `--deps` to adopt every `ListInstalled` name, including Homebrew libraries and language stdlib. Scan still never proposes `-`, `npm` via npm, or `toolchain:*`. Preview with `--dry-run`; text mode prompts unless `--yes` is set.
 
-`genv pull` fetches `genv.json` **and** relative `files` assets from `repo.url`. It never overwrites the lock or secrets.
+`genv pull` fetches `genv.json` **and** relative `files` assets plus hook scripts from `repo.url`. It never overwrites the lock or secrets. Only relative sources are bundled: a source that is absolute, `~/…`, or contains a `$VAR` is reported rather than copied, and symlinks are refused.
 
 ---
 

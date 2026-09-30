@@ -4,6 +4,122 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v4.5.2 - 2026-09-30
+
+All issues #195–#211.
+
+### Security
+
+- `genv.json` is written through a unique temp file in the target directory at
+  `0600`, matching the lock and the private fragments. It was created with
+  `os.Create`, landing at `0644` under a normal umask, so a spec holding
+  `env` values marked `sensitive` was world-readable, and a manual
+  `chmod 600` was silently cleared by the next `add` / `remove` / `env set`.
+  An existing group/other-readable mode is preserved as a deliberate choice
+  (Fixes #201).
+- Shell function bodies and alias values can no longer escape the fragment genv
+  generates. `}` was missing from the metacharacter denylist, so a body of
+  `} true` closed the generated function and ran `true` when the fragment was
+  sourced. Alias values were not checked at all (Fixes #199).
+- Hook `command` may no longer contain newlines. Hooks run through `sh -c`,
+  PowerShell `-Command`, or `cmd /C`, so a newline smuggled a second command
+  past what the author wrote. Hook `file` and service argv already refused them
+  (#211 follow-up 6).
+- `genv export` refuses a relative source that resolves outside the spec
+  directory (`../../.ssh/id_ed25519`) and rejects symlinks instead of copying
+  what they point at. `genv pull` now checks every path component, not just the
+  final one, so an intermediate symlink out of the cache no longer slips through
+  (Fixes #195, #211 follow-up 3).
+- `genv edit` no longer allowlists on the editor's basename and then executes
+  the original string: `EDITOR=/tmp/evil/code` matched `code` and ran
+  `/tmp/evil/code`. A qualified path resolves through `PATH` from its base name
+  and executes that, so `/usr/bin/vim` keeps working but a path off `PATH` is
+  refused (Fixes #209).
+- Spec-defined command adapters substitute `{{id}}` per token instead of
+  before splitting the argv template. `ValidPackageName` permits `;`, `|`,
+  quotes and `$`, so an id could spill into neighbouring tokens and, for a
+  `sh -c "…"` template, into the shell string (Fixes #200).
+
+### Fixed
+
+- `genv apply --json` without `--yes` is plan-only. It skipped confirmation and
+  called `ExecuteApply` with a hard-coded assume-yes while hooks still saw
+  `GENV_YES=false`, so packages, env, shell, services and files mutated with no
+  consent. `ExternalMode` now follows `--yes`, and the gate fires only when
+  there is pending work so an already-applied spec still reports `ok`, matching
+  `genv upgrade --json` (Fixes #196).
+- Every lock read-modify-write holds `LockMutation` and re-reads inside the
+  lock: `add`, `adopt`, `adopt --files`, `disown`, `scan`, and `files adopt`.
+  The scheduled worker holds the lock across its whole upgrade and writes the
+  snapshot it read at the start, which erased a `disown` landing in between — so
+  the next apply uninstalled a package the spec no longer listed (Fixes #202).
+- Hook and package subprocesses cannot hang after the child exits. `WaitDelay`
+  is now set for hooks and manager runs: a hook that backgrounds a process, or a
+  timeout that kills only the direct child, left `genv apply` blocked, and an
+  hourly worker run could sit until its job deadline without updating the lock.
+  `ErrWaitDelay` is normalised so a successful command is not reported as failed
+  just because a grandchild still held the pipe (Fixes #197).
+- Managed links compare resolved paths and fall back to `os.SameFile`, so a
+  relative link naming the same file as an absolute source is skipped instead of
+  reported as a mismatch by apply, status and adopt (Fixes #207).
+- `files adopt` and forced relink stage the symlink under a unique sibling name
+  and rename it into place. They previously moved the live file aside first, so
+  an `os.Symlink` failure (Windows without Developer Mode) left neither the old
+  file nor a link; the error now names the backup (Fixes #205).
+- Paths starting with `~name` no longer expand under the home directory. `~name`
+  is another user's home and was resolving to `$HOME` concatenated with the
+  name (for example `/Users/karimfoo`). Now only `~`, `~/…` and `~\…` expand,
+  in `files`, `schema`, `hooks` and external destinations (Fixes #208).
+- `genv export` bundles hook scripts, and a relative hook `file` resolves
+  against the spec directory. Export copied link, template, service and key
+  assets but not hooks, and apply stat'd a relative hook file against the
+  working directory, so a pulled spec lost its hooks under the scheduler
+  (Fixes #210).
+- `genv export` reports `~/…` and `$VAR` sources as unbundlable instead of
+  joining them under the spec directory and failing the copy, and a relative
+  external `publicKeyFile` now resolves against the spec directory so a key the
+  export bundled can actually be read on apply (Fixes #210).
+- systemd `ExecStart` / `ExecStop` / `ExecReload` arguments and `Environment=`
+  values escape `%` as `%%`. systemd expands specifiers inside quoted values, so
+  a `date +%s` argument was rewritten before the process saw it. launchd and
+  plist rendering are unchanged (Fixes #204).
+- Windows Update no longer reports a generic PowerShell failure as a WUA
+  result. With `$ErrorActionPreference = 'Stop'`, a COM failure exits 1, which
+  was reported as `WUA ResultCode 1 (InProgress)` with an elevation hint, and
+  exit 5 read as `Aborted`. The script now exits `100 + ResultCode` for any
+  code it deliberately reports, and only those offsets are translated
+  (Fixes #206).
+- Service unit, plist and scheduled-task names no longer collide. Service names
+  are spec map keys and may contain a separator (`apps/web`), so `a/x` and `b/x`
+  both became `genv-x` and removing one deleted the other. Sanitized names that
+  changed get a short digest of the original appended so distinct names stay
+  distinct (#211 follow-up 4).
+- An external destination of exactly `~` resolves to the home directory instead
+  of panicking on a one-byte slice (#203).
+- A dry run checks the mismatch condition before reporting `Updated`, so the
+  plan matches what apply actually does instead of advertising an update the
+  apply refuses (#211 follow-up 1).
+- Forced template overwrite renames over the target instead of unlinking it
+  first, and the staging file gets a unique name in the destination directory,
+  so a failed write leaves the previous file in place (#211 follow-up 5).
+- `ExecuteApply` honors `ApplyExecutionOptions.Unattended`: sudo is made
+  non-interactive and the run fails closed rather than blocking on an
+  elevation prompt nobody can answer (#211 follow-up 7).
+- A successful outdated query no longer appends `outdated timing: …` to
+  warnings. The scheduled worker logged it for every manager on every run,
+  burying query failures and timeouts (#211 follow-up 9).
+- A remote `repo.url` is no longer the file source root. `filepath.Clean` turned
+  `https://github.com/org/repo` into the relative path
+  `https:/github.com/org/repo`. Only `~/`, absolute and `file://` URLs are
+  treated as a local source root; `--source-root` still wins (Fixes #198).
+- `genv pull` expands a leading `~` in `repo.url` before `git clone`; git does
+  not expand it and `ValidRepoURL` accepts it (#211 follow-up 2).
+- Confirmation prompts share one buffered stdin reader. A fresh reader per
+  prompt meant a piped `y\ny\n` was consumed by the first prompt and the second
+  saw EOF, answering "no" to a question already answered (#211 follow-up 8).
+- `already up to date.` is printed after hooks run, so a hook error no longer
+  contradicts the line above it (#211 follow-up 10).
+
 ## v4.5.1 - 2026-09-24
 
 ### Fixed

@@ -112,7 +112,9 @@ launchd (macOS), or Task Scheduler / `schtasks` (Windows).
 
 Phases: `preApply` / `postApply`, `preAdd` / `postAdd`, `preRemove` / `postRemove`, `preUpgrade` / `postUpgrade` (v5 also had `preUpgrade` / `postApply` / `postUpgrade`).
 
-Each hook is `{ "command": "..." }` or `{ "file": "..." }` (exactly one), optional `name`, optional `continueOnError`, optional `host` on v1–v7.
+Each hook is `{ "command": "..." }` or `{ "file": "..." }` (exactly one), optional `name`, optional `continueOnError`, optional `host` on v1–v7. `file` and `command` must not contain newlines — hooks run through `sh -c`, PowerShell `-Command`, or `cmd /C`, so a newline would smuggle a second command past what the author wrote.
+
+A relative `file` resolves against the spec directory (`--source-root` overrides), which is where `genv pull` and `genv export` place bundled hook scripts, so hooks work regardless of the working directory — including under the scheduled updates worker. `~/…` and `$VAR` prefixes are expanded; `~name` is another user's home and is **not** expanded.
 
 Context env: `GENV_EVENT`, `GENV_PHASE`, `GENV_HOST`, `GENV_PROFILE`, `GENV_SPEC_FILE`, `GENV_SPEC_DIR`, `GENV_LOCK_FILE`, `GENV_YES`, `GENV_INSTALLED`, `GENV_REMOVED`, `GENV_UPGRADED`, `GENV_FAILED`, `GENV_SKIPPED`.
 
@@ -167,6 +169,13 @@ Relative template paths resolve against the spec directory (or `repo.url` when s
 - v3: `shell` with `aliases`, `functions`, `source`
 - v2: `env` map of `{ value, sensitive? }`
 - v1: `packages[]` with `id`, optional `version`, `prefer`, `managers`
+
+Shell alias values and function bodies are wrapped in a generated function
+(`function <name> { <value> }` for PowerShell, single-quoted for POSIX), so they
+must be plain text: braces, `;`, `|`, `&`, backticks, `$`, `<`, `>`, `(`, `)`
+and newlines are rejected at validation rather than allowed to close the
+wrapper. PowerShell has no POSIX `alias` builtin, so an alias value is the
+command its function body runs.
 
 ## Manager resolution
 
