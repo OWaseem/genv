@@ -4,90 +4,10 @@ on:
   push:
   pull_request:
 
-# Superseded runs (a new push to the same branch/PR) are cancelled instead of
-# queueing duplicate full runs.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
-
-permissions:
-  contents: read
-
 jobs:
+  # Build, vet, format and unit tests on every supported platform, plus the
+  # coverage floor, cold-start bench gate and govulncheck. Defined in a
+  # reusable workflow so the Release gate runs exactly these checks rather
+  # than a hand-copied subset.
   test:
-    name: Test
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Format check
-        run: |
-          files=$(gofmt -l .)
-          if [ -n "$files" ]; then
-            echo "The following files are not formatted (run 'make fmt'):"
-            echo "$files"
-            exit 1
-          fi
-
-      - name: Unit tests
-        run: go test -race -coverprofile=coverage.out ./...
-
-      - name: Coverage summary
-        run: go tool cover -func=coverage.out
-
-      - name: Coverage floor
-        run: make cover-gate
-        env:
-          COVER_MIN: "80"
-
-      - name: Cold-start bench gate
-        run: make bench-gate
-        env:
-          # Shared GitHub runners are slower than local machines (~250ms observed
-          # for BenchmarkDetect). Keep a regression gate with headroom for noise.
-          BENCH_MAX_MS: "400"
-
-      - name: govulncheck
-        # setup-go sets GOTOOLCHAIN=local for the 1.24.3 module. Current
-        # govulncheck (v1.6+) requires Go 1.25 to *build*; allow this step
-        # only to download that toolchain. The rest of CI stays on go.mod.
-        env:
-          GOTOOLCHAIN: auto
-        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
-
-  test-windows:
-    name: Test (Windows)
-    runs-on: windows-latest
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version-file: go.mod
-          cache: false
-
-      - name: Build
-        run: go build ./...
-
-      - name: Vet
-        run: go vet ./...
-
-      - name: Unit tests
-        run: go test -timeout 8m ./...
+    uses: ./.github/workflows/test.yml

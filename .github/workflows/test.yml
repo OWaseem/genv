@@ -1,0 +1,106 @@
+name: test
+
+# Reusable all-platform test workflow.
+#
+# genv supports Linux, macOS and native Windows, and large parts of it are
+# platform-specific: launchd, homebrew, codesign, symlink privileges, the
+# PowerShell profile backend, Windows file locking. Unit tests that only run
+# on Linux therefore prove very little about the binaries users actually get.
+#
+# v4.5.2 shipped with a red "Test (Windows)" job because the release workflow
+# was triggered by a tag push and never consulted CI. Both gaps are addressed
+# here: every supported platform runs build, vet, format and the test suite,
+# and Release calls this workflow as a gate before GoReleaser runs.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One platform failing must not cancel the others: we want the full
+      # picture, and a Windows-only break should still be reported when
+      # macOS also fails.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Format check
+        # shell: bash so the same command works on the Windows runner, whose
+        # default shell is PowerShell.
+        shell: bash
+        run: |
+          files=$(gofmt -l .)
+          if [ -n "$files" ]; then
+            echo "The following files are not formatted (run 'make fmt'):"
+            echo "$files"
+            exit 1
+          fi
+
+      - name: Unit tests
+        run: go test -race -timeout 15m -coverprofile=coverage.out ./...
+
+      - name: Upload coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.os }}
+          path: coverage.out
+          if-no-files-found: error
+
+      # The remaining gates are environment-sensitive and tuned for the Linux
+      # runner, so they run once. Coverage is still uploaded per platform above
+      # because the totals differ: Windows- and macOS-only source is
+      # unreachable from the Linux run, which is exactly what a single number
+      # hides.
+      - name: Coverage summary
+        if: matrix.os == 'ubuntu-latest'
+        run: go tool cover -func=coverage.out
+
+      - name: Coverage floor
+        if: matrix.os == 'ubuntu-latest'
+        run: make cover-gate
+        env:
+          COVER_MIN: "80"
+
+      - name: Cold-start bench gate
+        if: matrix.os == 'ubuntu-latest'
+        run: make bench-gate
+        env:
+          # Shared GitHub runners are slower than local machines (~250ms observed
+          # for BenchmarkDetect). Keep a regression gate with headroom for noise.
+          BENCH_MAX_MS: "400"
+
+      - name: govulncheck
+        # setup-go sets GOTOOLCHAIN=local for the go.mod toolchain. Current
+        # govulncheck (v1.6+) requires Go 1.25 to *build*; allow this step
+        # only to download that toolchain. The rest of CI stays on go.mod.
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          GOTOOLCHAIN: auto
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

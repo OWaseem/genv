@@ -23,8 +23,16 @@ permissions:
   id-token: write
 
 jobs:
+  # A tag push must not publish binaries that fail their own test suite.
+  # v4.5.2 shipped with a red Windows job because nothing between the tag and
+  # GoReleaser checked anything. This runs the same reusable all-platform
+  # workflow CI uses, so release readiness is a fact rather than an assumption.
+  preflight:
+    uses: ./.github/workflows/test.yml
+
   release:
     name: Build and publish release
+    needs: preflight
     runs-on: ubuntu-latest
 
     steps:
