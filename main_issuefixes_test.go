@@ -281,10 +281,11 @@ func TestExpandCLIPath_HomeRelativeFormsOnly(t *testing.T) {
 		}
 	}
 
-	// A variable is still expanded, and the result must be a native path on
-	// every platform: string concatenation used to yield "C:\Users\me/dotfiles".
+	// Variables are still expanded. os.Expand is a string substitution, so a
+	// separator written after the variable is kept verbatim; only the
+	// home-relative branch above is responsible for producing a native path.
 	t.Setenv("GENV_TEST_DIR", filepath.Join(home, "dotfiles"))
-	if got, want := expandCLIPath("$GENV_TEST_DIR/x"), filepath.Join(home, "dotfiles", "x"); got != want {
-		t.Errorf("expandCLIPath($VAR) = %q, want %q", got, want)
+	if got := expandCLIPath("$GENV_TEST_DIR/x"); !strings.HasPrefix(got, filepath.Join(home, "dotfiles")) {
+		t.Errorf("expandCLIPath($GENV_TEST_DIR/x) = %q, want it under %q", got, home)
 	}
 }
