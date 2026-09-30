@@ -35,12 +35,7 @@ var schtasksRun = func(ctx context.Context, args ...string) ([]byte, error) {
 }
 
 func schtasksTaskName(name string) string {
-	name = strings.ReplaceAll(name, "\\", "/")
-	name = filepath.Base(name)
-	if name == "." || name == "/" || name == "" {
-		name = "default"
-	}
-	return "genv-" + name
+	return "genv-" + serviceUnitSlug(name)
 }
 
 func schtasksArtifactDir() (string, error) {

@@ -468,35 +468,51 @@ func TestHomeDirRejectsEmptyHome(t *testing.T) {
 }
 
 func TestSanitizeUnitName(t *testing.T) {
-	cases := []struct {
-		name string
-		want string
-	}{
-		{"normal", "normal"},
-		{"../../foo", "foo"},
-		{"foo/bar\\baz", "baz"},
-		{"C:\\windows\\path", "path"},
+	// A name that needs no sanitizing keeps its exact readable form.
+	for _, name := range []string{"normal", "web-server", "my_service", "svc01"} {
+		if got := systemdUnitName(name); got != "genv-"+name+".service" {
+			t.Errorf("systemdUnitName(%q) = %q", name, got)
+		}
+		if got := launchdPlistName(name); got != "genv."+name+".plist" {
+			t.Errorf("launchdPlistName(%q) = %q", name, got)
+		}
+		if got := schtasksTaskName(name); got != "genv-"+name {
+			t.Errorf("schtasksTaskName(%q) = %q", name, got)
+		}
 	}
 
-	for _, tc := range cases {
-		// systemd unit
-		gotSystemd := systemdUnitName(tc.name)
-		wantSystemd := "genv-" + tc.want + ".service"
-		if gotSystemd != wantSystemd {
-			t.Errorf("systemdUnitName(%q) = %q, want %q", tc.name, gotSystemd, wantSystemd)
+	// Names needing sanitization stay safe for a filename: no path separator
+	// survives, and no ".." sequence is produced.
+	for _, name := range []string{"../../foo", "foo/bar\\baz", `C:\\windows\\path`, "a b", "..", "", "/"} {
+		for _, got := range []string{systemdUnitName(name), launchdPlistName(name), schtasksTaskName(name)} {
+			if strings.ContainsAny(got, `/\\`) {
+				t.Errorf("name %q produced %q, want no path separator", name, got)
+			}
+			if strings.Contains(got, "..") {
+				t.Errorf("name %q produced %q, want no \"..\" sequence", name, got)
+			}
 		}
+	}
+}
 
-		// launchd plist
-		gotLaunchd := launchdPlistName(tc.name)
-		wantLaunchd := "genv." + tc.want + ".plist"
-		if gotLaunchd != wantLaunchd {
-			t.Errorf("launchdPlistName(%q) = %q, want %q", tc.name, gotLaunchd, wantLaunchd)
-		}
-
-		gotSchtasks := schtasksTaskName(tc.name)
-		wantSchtasks := "genv-" + tc.want
-		if gotSchtasks != wantSchtasks {
-			t.Errorf("schtasksTaskName(%q) = %q, want %q", tc.name, gotSchtasks, wantSchtasks)
+// filepath.Base made "a/x" and "b/x" both "genv-x", so removing one service
+// deleted the other.
+func TestServiceNamesDoNotCollide(t *testing.T) {
+	names := []string{"a/x", "b/x", "a-x", "apps/web", "apps/db", "normal"}
+	for _, n := range names {
+		for _, m := range names {
+			if n == m {
+				continue
+			}
+			if systemdUnitName(n) == systemdUnitName(m) {
+				t.Errorf("systemdUnitName collision: %q and %q both %q", n, m, systemdUnitName(n))
+			}
+			if launchdPlistName(n) == launchdPlistName(m) {
+				t.Errorf("launchdPlistName collision: %q and %q both %q", n, m, launchdPlistName(n))
+			}
+			if schtasksTaskName(n) == schtasksTaskName(m) {
+				t.Errorf("schtasksTaskName collision: %q and %q both %q", n, m, schtasksTaskName(n))
+			}
 		}
 	}
 }

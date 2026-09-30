@@ -18,22 +18,12 @@ import (
 
 // systemdUnitName returns the systemd unit name for a genv-managed service.
 func systemdUnitName(name string) string {
-	name = strings.ReplaceAll(name, "\\", "/")
-	name = filepath.Base(name)
-	if name == "." || name == "/" {
-		name = "default"
-	}
-	return "genv-" + name + ".service"
+	return "genv-" + serviceUnitSlug(name) + ".service"
 }
 
 // launchdPlistName returns the launchd plist filename for a genv-managed service.
 func launchdPlistName(name string) string {
-	name = strings.ReplaceAll(name, "\\", "/")
-	name = filepath.Base(name)
-	if name == "." || name == "/" {
-		name = "default"
-	}
-	return "genv." + name + ".plist"
+	return "genv." + serviceUnitSlug(name) + ".plist"
 }
 
 // SystemdLogsHint returns the journalctl command users should run to view logs for name.
@@ -311,13 +301,23 @@ func renderSystemdCommand(args []string) string {
 	return strings.Join(quoted, " ")
 }
 
+// systemdQuoteArg quotes a single ExecStart/ExecStop argument. systemd expands
+// % specifiers inside quoted values too, and "%%" is the escape, so a literal
+// % (e.g. a `date +%s` format) must be doubled or systemd rewrites it before
+// the process sees it.
 func systemdQuoteArg(arg string) string {
 	if arg == "" {
 		return `""`
 	}
 	arg = strings.ReplaceAll(arg, `\`, `\\`)
 	arg = strings.ReplaceAll(arg, `"`, `\"`)
+	arg = escapeSystemdSpecifiers(arg)
 	return `"` + arg + `"`
+}
+
+// escapeSystemdSpecifiers doubles "%" so systemd passes it through literally.
+func escapeSystemdSpecifiers(s string) string {
+	return strings.ReplaceAll(s, "%", "%%")
 }
 
 func stripLineBreaks(s string) string {

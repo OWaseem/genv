@@ -77,13 +77,23 @@ var windowsUpdateResultNames = map[int]string{
 	5: "Aborted",
 }
 
+// windowsUpdateResultExitBase is the base for exit codes the embedded script
+// chooses to report a WUA OperationResultCode with. $ErrorActionPreference =
+// 'Stop' makes PowerShell exit 1 on any uncaught COM error (access denied,
+// WUA service disabled), which used to be reported as "WUA ResultCode 1
+// (InProgress)" with an elevation hint. Offsetting the script's own codes by
+// this base lets Go tell "the script decided the result was 1" apart from
+// "PowerShell fell over", so only the former is translated as a ResultCode.
+const windowsUpdateResultExitBase = 100
+
 // windowsUpdateElevationHint is appended to Windows system-step failures.
 const windowsUpdateElevationHint = "try an elevated PowerShell session or open Settings → Windows Update"
 
-// wrapWindowsUpdateError rewrites opaque WUA exit codes (notably 4) into
-// readable errors. SucceededWithErrors (3) is soft success: the PowerShell
-// script exits 0 unless a per-update result is Failed; if exit 3 still
-// reaches Go, treat it as success so messaging stays consistent.
+// wrapWindowsUpdateError rewrites opaque WUA exit codes into readable errors.
+// The script reports a chosen ResultCode as windowsUpdateResultExitBase+code;
+// any other non-zero exit is an unexpected PowerShell failure and is left
+// alone, because translating it would invent a WUA status that was never
+// reported. SucceededWithErrors (3) is soft success.
 func wrapWindowsUpdateError(err error) error {
 	if err == nil {
 		return nil
@@ -92,9 +102,16 @@ func wrapWindowsUpdateError(err error) error {
 	if !ok {
 		return err
 	}
+	if code < windowsUpdateResultExitBase {
+		// Not a ResultCode the script chose: a PowerShell exception (exit 1),
+		// an explicit failure, or anything else. Report it as a script failure
+		// so it is not mistaken for an in-progress or aborted update.
+		return fmt.Errorf("windows update: PowerShell exited %d (%v); %s", code, err, windowsUpdateElevationHint)
+	}
+	code -= windowsUpdateResultExitBase
 	name, known := windowsUpdateResultNames[code]
 	if !known {
-		return err
+		return fmt.Errorf("windows update: PowerShell exited %d (%v); %s", code+windowsUpdateResultExitBase, err, windowsUpdateElevationHint)
 	}
 	if code == 3 {
 		// Soft success / warning path; script should already have warned.
@@ -128,7 +145,12 @@ func exitCodeFromError(err error) (int, bool) {
 // built-in Windows Update Agent COM API. It needs no extra modules (not
 // PSWindowsUpdate, not winget — winget upgrades packages, not the OS).
 // genv does not auto-elevate; callers often need an elevated session.
+//
+// Every deliberate exit that reports a WUA OperationResultCode is offset by
+// 100 so Go can distinguish it from an uncaught PowerShell exception, which
+// (with $ErrorActionPreference = 'Stop') exits 1.
 const windowsUpdateInstallScript = `$ErrorActionPreference = 'Stop'
+$ResultExitBase = 100
 function Get-WuaResultName([int]$Code) {
   switch ($Code) {
     0 { 'NotStarted' }
@@ -156,7 +178,7 @@ $downloadCode = [int]$download.ResultCode
 if ($downloadCode -ne 2 -and $downloadCode -ne 3) {
   $downloadName = Get-WuaResultName $downloadCode
   Write-Output ("Windows Update download ResultCode={0} ({1}). Try an elevated PowerShell session or Settings → Windows Update." -f $downloadCode, $downloadName)
-  exit $downloadCode
+  exit ($ResultExitBase + $downloadCode)
 }
 if ($downloadCode -eq 3) {
   Write-Output 'Windows Update download completed with SucceededWithErrors (ResultCode=3); continuing to install.'
@@ -185,6 +207,6 @@ if ($code -eq 3 -and $failed.Count -eq 0) {
   exit 0
 }
 Write-Output ("Windows Update install ResultCode={0} ({1}). Try an elevated PowerShell session or Settings → Windows Update." -f $code, $name)
-if ($failed.Count -gt 0) { exit 4 }
-exit $code
+if ($failed.Count -gt 0) { exit ($ResultExitBase + 4) }
+exit ($ResultExitBase + $code)
 `
