@@ -10,6 +10,16 @@ import (
 	"github.com/ks1686/genv/internal/schema"
 )
 
+// applyTestTarget is the target the apply tests below resolve against.
+//
+// They pass --host ci, which is not a known target, so apply falls back to
+// host classification: "macos" on a developer Mac, "ubuntu" on the Linux
+// runner. A spec hardcoding targets.macos therefore matched locally and failed
+// in CI with "no matching targets.ubuntu". GENV_TARGET outranks classification,
+// so pinning it lets the spec name a target that resolves identically on every
+// host. "ubuntu" is a known target on all of them.
+const applyTestTarget = "ubuntu"
+
 // filepath.Base let EDITOR=/tmp/evil/code pass the allowlist and then execute
 // /tmp/evil/code, because the base name matched. With the directory off PATH
 // the editor must be refused.
@@ -163,12 +173,13 @@ func TestConfirm_SharedReaderConsumesPipedAnswers(t *testing.T) {
 func TestApplyJSON_WetRunRequiresYes(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	t.Setenv("GENV_TARGET", applyTestTarget)
 	specPath := filepath.Join(dir, "genv.json")
 	lockPath := filepath.Join(dir, "genv.lock.json")
 	// An env var with no lock entry is pending work, so the gate must fire.
 	spec := `{"schemaVersion":"8","packages":[],` +
 		`"defaults":{"env":{"GENV_TEST_VAR":{"value":"1"}}},` +
-		`"targets":{"macos":{}}}`
+		`"targets":{"` + applyTestTarget + `":{}}}`
 	if err := os.WriteFile(specPath, []byte(spec), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -193,11 +204,12 @@ func TestApplyJSON_WetRunRequiresYes(t *testing.T) {
 func TestApplyJSON_WetRunWithYesMutates(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	t.Setenv("GENV_TARGET", applyTestTarget)
 	specPath := filepath.Join(dir, "genv.json")
 	lockPath := filepath.Join(dir, "genv.lock.json")
 	spec := `{"schemaVersion":"8","packages":[],` +
 		`"defaults":{"env":{"GENV_TEST_VAR":{"value":"1"}}},` +
-		`"targets":{"macos":{}}}`
+		`"targets":{"` + applyTestTarget + `":{}}}`
 	if err := os.WriteFile(specPath, []byte(spec), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -220,9 +232,10 @@ func TestApplyJSON_WetRunWithYesMutates(t *testing.T) {
 func TestApplyJSON_DryRunNeedsNoYes(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(dir, "xdg"))
+	t.Setenv("GENV_TARGET", applyTestTarget)
 	specPath := filepath.Join(dir, "genv.json")
 	lockPath := filepath.Join(dir, "genv.lock.json")
-	if err := os.WriteFile(specPath, []byte(`{"schemaVersion":"8","packages":[],"defaults":{},"targets":{"macos":{}}}`), 0o644); err != nil {
+	if err := os.WriteFile(specPath, []byte(`{"schemaVersion":"8","packages":[],"defaults":{},"targets":{"`+applyTestTarget+`":{}}}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
