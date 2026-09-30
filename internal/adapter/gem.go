@@ -61,22 +61,60 @@ func (g Gem) ListInstalled() ([]string, error) {
 	return names, nil
 }
 
-// ListForScan returns user-installed gems, skipping Ruby default gems
-// (marked `default:` in `gem list`) and gems that ship bundled with the
-// interpreter (rake, rdoc, …). ListInstalled stays complete for apply.
+// ListForScan returns user-installed gems, skipping the gems that ship with
+// Ruby rather than being chosen by the user. ListInstalled stays complete for
+// apply, status and upgrade.
 func (g Gem) ListForScan() ([]string, error) {
 	entries, err := g.listEntries()
 	if err != nil {
 		return nil, err
 	}
+	defaults := gemDefaultGems()
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.defaultGem || rubyBundledGem[entry.name] {
+		if defaults[entry.name] || rubyBundledGem[entry.name] {
 			continue
 		}
 		names = append(names, entry.name)
 	}
 	return names, nil
+}
+
+// gemDefaultGems returns the gem names the running Ruby treats as default.
+//
+// This cannot be derived from `gem list --local` text. RubyGems prints the
+// `default:` marker only when a gem has a second, non-default version also
+// installed, so the output looks like this on RubyGems 4.0.20:
+//
+//	abbrev (0.1.2)                      default gem, no marker
+//	bundler (default: 4.0.20, 4.0.18)   marked only because two versions exist
+//
+// Inferring "is a default gem" from that marker therefore drops every default
+// gem that has a single version installed, which is exactly the abbrev,
+// base64, benchmark, bigdecimal and csv that the default scan proposed.
+// Asking RubyGems for the set is version-proof instead (#216).
+//
+// It is a var so tests can supply a known set.
+//
+// Known limitation, RubyGems 4: gems that Ruby used to ship as default gems
+// (csv, base64, bigdecimal, benchmark, abbrev) are no longer reported by
+// default_stubs there, and RubyGems 4 removed `bundled_gem?`. They land in
+// the same gem home as a user install, so nothing in RubyGems distinguishes
+// them — on a Ruby 4 host the default scan still proposes them. That is a
+// Ruby limitation, not a filter that can be tightened without hardcoding a
+// per-release list.
+var gemDefaultGems = func() map[string]bool {
+	out, err := runProbe("ruby", "-e", `require "rubygems"; puts Gem::Specification.default_stubs.map(&:name)`)
+	if err != nil {
+		return nil
+	}
+	set := make(map[string]bool)
+	for line := range strings.SplitSeq(string(out), "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			set[name] = true
+		}
+	}
+	return set
 }
 
 func (g Gem) QueryVersion(pkgName string) (string, error) {

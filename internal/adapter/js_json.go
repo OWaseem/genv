@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -29,9 +30,25 @@ func runJSONPackageList(cmd string, args ...string) ([]jsPackageEntry, error) {
 	return entries, nil
 }
 
+// parseJSListJSON reads `npm ls -g --json` output, which is an object keyed by
+// "name"/"dependencies". Older output wrapped that object in a one-element
+// array, so both shapes are accepted.
+//
+// The object shape is recognised by the JSON itself, not by whether a
+// dependencies map happened to be present. An object with no `dependencies`
+// key — npm emits one alongside "problems" when the tree is unsatisfiable —
+// is a valid, empty listing. Treating its absence as "not the object shape"
+// fell through to the array unmarshal and reported
+// "cannot unmarshal object into Go value of type []adapter.jsListPackage",
+// which reads as a parse failure when nothing was wrong, and made scan
+// silently propose zero npm packages (#215).
 func parseJSListJSON(data []byte) ([]jsPackageEntry, error) {
-	var root jsListPackage
-	if err := json.Unmarshal(data, &root); err == nil && root.Dependencies != nil {
+	trimmed := bytes.TrimLeft(data, " \t\r\n")
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		var root jsListPackage
+		if err := json.Unmarshal(data, &root); err != nil {
+			return nil, err
+		}
 		return jsEntriesFromDependencies(root.Dependencies), nil
 	}
 

@@ -100,6 +100,10 @@ type ScanResult struct {
 	Skipped  int      `json:"skipped"`
 	DryRun   bool     `json:"dryRun,omitempty"`
 	Packages []string `json:"packages,omitempty"`
+	// Unreadable names the managers whose inventory could not be read. It is
+	// reported even when the rest of the scan succeeds, so a partial inventory
+	// is not mistaken for a complete one.
+	Unreadable []string `json:"unreadableManagers,omitempty"`
 }
 
 // ApplyResult is the Data payload for `genv apply --json` (non-dry-run).

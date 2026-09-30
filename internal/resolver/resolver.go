@@ -608,6 +608,13 @@ var DefaultLiveListTimeout = 30 * time.Second
 // then, CallTimed returns a timeout error; f keeps running in the background
 // and its eventual result is dropped. Use it to bound calls into adapters,
 // which spawn external package managers that can block indefinitely.
+// ErrInventoryTimeout is returned by CallTimed and RunTimed when a live
+// inventory probe exceeds its per-manager deadline. It is a distinct sentinel
+// so callers can tell an expected transient stall (winget's first-run source
+// sync can hang for minutes) from a manager that genuinely failed to report,
+// without matching on the message text.
+var ErrInventoryTimeout = errors.New("inventory probe timed out")
+
 func CallTimed[T any](f func() (T, error), d time.Duration) (T, error) {
 	if d <= 0 {
 		return f()
@@ -628,7 +635,7 @@ func CallTimed[T any](f func() (T, error), d time.Duration) (T, error) {
 		return r.value, r.err
 	case <-timer.C:
 		var zero T
-		return zero, fmt.Errorf("timed out after %s", d)
+		return zero, fmt.Errorf("%w after %s", ErrInventoryTimeout, d)
 	}
 }
 

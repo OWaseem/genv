@@ -85,6 +85,17 @@ func (Pacman) ListInstalled() ([]string, error) {
 	return runListOutput("pacman", "-Qq")
 }
 
+// ListForScan returns only explicitly installed packages, so `genv scan`
+// proposes what the user chose rather than the whole dependency tree. On the
+// reporter's host the full inventory produced 767 of 771 proposals, mostly
+// libraries like glibc and glib2. --all/--deps keeps ListInstalled's full set,
+// the same split brew leaves provides (#214).
+//
+// paru and yay already list -Qqe directly, since they manage the same database.
+func (Pacman) ListForScan() ([]string, error) {
+	return runListOutput("pacman", "-Qqe")
+}
+
 // ListInstalledVersions returns the installed version of every package in the
 // pacman database. This satisfies the optional VersionLister interface so the
 // resolver can refresh lock versions with one command after a batch upgrade.

@@ -3245,12 +3245,27 @@ func scanCmd(args []string) int {
 	seen := make(map[string]bool)
 	var candidates []scanCandidate
 	var skipped int
+	// Managers whose inventory could not be read. A scan that silently drops a
+	// source reports a complete-looking inventory that is not one: on a host
+	// where npm's global list failed to parse, scan proposed zero npm packages,
+	// printed one line to stderr, and exited 0 (#215).
+	var unreadable []string
+	var unreadableHard []string
 	fullInventory := *includeAll || *includeDeps
 
 	for _, a := range scanAdaptersOnGOOS(available, scanGOOS) {
 		pkgs, versions, err := listScanInventory(a, fullInventory)
 		if err != nil {
 			fprintf(os.Stderr, "genv scan: %s: listing packages: %v\n", a.Name(), err)
+			unreadable = append(unreadable, a.Name())
+			// A per-manager deadline is an expected transient, not a defect:
+			// winget's first-run source sync can stall for minutes on Windows
+			// and the scan must not start failing because of it. Every other
+			// failure means the inventory is genuinely unknown, so it is
+			// reported as an error.
+			if !isScanListTimeout(err) {
+				unreadableHard = append(unreadableHard, a.Name())
+			}
 			continue
 		}
 		for _, pkgName := range pkgs {
@@ -3284,22 +3299,17 @@ func scanCmd(args []string) int {
 			ids[i] = c.id
 		}
 		if *jsonOut {
-			return writeJSON(os.Stdout, output.Envelope{
-				Version: output.SchemaVersion,
-				Command: "scan",
-				OK:      true,
-				Data:    output.ScanResult{Added: len(candidates), Skipped: skipped, DryRun: true, Packages: ids},
-			})
+			return scanEnvelope(output.ScanResult{Added: len(candidates), Skipped: skipped, DryRun: true, Packages: ids, Unreadable: unreadable}, unreadableHard)
 		}
 		if len(candidates) == 0 && skipped == 0 {
 			fPrintln(os.Stdout, "no packages found.")
-			return exitOK
+			return scanExit(unreadable, unreadableHard)
 		}
 		fprintf(os.Stdout, "scan dry-run: would adopt %d package(s), %d already tracked\n", len(candidates), skipped)
 		for _, c := range candidates {
 			fprintf(os.Stdout, "  + %s  via %s\n", c.id, c.manager)
 		}
-		return exitOK
+		return scanExit(unreadable, unreadableHard)
 	}
 
 	if len(candidates) > 0 && !*jsonOut && !*yes {
@@ -3357,23 +3367,54 @@ func scanCmd(args []string) int {
 	}
 
 	if *jsonOut {
-		return writeJSON(os.Stdout, output.Envelope{
-			Version: output.SchemaVersion,
-			Command: "scan",
-			OK:      true,
-			Data:    output.ScanResult{Added: added, Skipped: skipped},
-		})
+		return scanEnvelope(output.ScanResult{
+			Added:      added,
+			Skipped:    skipped,
+			Unreadable: unreadable,
+		}, unreadableHard)
 	}
 
 	if added == 0 && skipped == 0 {
 		fPrintln(os.Stdout, "no packages found.")
-		return exitOK
+		return scanExit(unreadable, unreadableHard)
 	}
 	if isNew && added > 0 {
 		fprintf(os.Stdout, "created %s\n", *file)
 	}
 	fprintf(os.Stdout, "scan complete: %d added, %d already tracked\n", added, skipped)
-	return exitOK
+	return scanExit(unreadable, unreadableHard)
+}
+
+// isScanListTimeout reports whether err is the per-manager inventory deadline
+// rather than a genuine listing failure.
+func isScanListTimeout(err error) bool {
+	return errors.Is(err, resolver.ErrInventoryTimeout)
+}
+
+// scanExit returns the process exit code for a scan that could not read every
+// manager. hard names the failures that were not a deadline, so a transient
+// stall stays a warning while a parse or command failure is reported.
+func scanExit(unreadable, hard []string) int {
+	if len(hard) == 0 {
+		return exitOK
+	}
+	fprintf(os.Stderr, "genv scan: incomplete inventory: could not read %s\n", strings.Join(hard, ", "))
+	return exitLogic
+}
+
+// scanEnvelope writes the scan JSON payload, marking the envelope not-ok and
+// listing the unreadable managers when a source failed.
+func scanEnvelope(data output.ScanResult, hard []string) int {
+	env := output.Envelope{
+		Version: output.SchemaVersion,
+		Command: "scan",
+		OK:      len(hard) == 0,
+		Data:    data,
+	}
+	for _, name := range hard {
+		env.Errors = append(env.Errors, fmt.Sprintf("%s: inventory could not be read", name))
+	}
+	return writeJSON(os.Stdout, env)
 }
 
 // listScanInventory returns the package names (and optional versions) scan
