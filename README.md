@@ -213,7 +213,7 @@ Convenience commands (`add` / `remove` / `adopt` / `disown` / `scan`) update the
 
 Human `apply` prompts unless `--yes`. Because a JSON caller cannot answer a prompt, `genv apply --json` is **plan-only** unless `--yes` is passed (or `--dry-run` to plan explicitly); a wet run without `--yes` returns the plan with `wet-run requires --yes` and changes nothing. Hooks receive the same consent through `GENV_YES`. An already-applied spec still reports `ok`, matching `genv upgrade --json`.
 
-`genv.json` itself is written `0600` (like the lock and the private fragments) because a spec can hold `env` values marked `sensitive`. A spec you have deliberately made group/other-readable keeps that mode.
+`genv.json` itself is written `0600` (like the lock and the private fragments) because a spec can hold `env` values marked `sensitive`. A spec left world-readable by an older genv is tightened to match the lock.
 
 Managed links are compared by resolved path, so a relative link pointing at the same file as an absolute `source` counts as correct. Relative file sources and hook `file` paths resolve against the spec directory (`--source-root` overrides), which is where `genv pull` and `genv export` place bundled assets.
 

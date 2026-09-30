@@ -57,7 +57,7 @@ func TestWrite_DoesNotLoosenExistingPrivateMode(t *testing.T) {
 	}
 }
 
-func TestWrite_PreservesIntentionallyLooseMode(t *testing.T) {
+func TestWrite_TightensLooseExistingMode(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX permission bits")
 	}
@@ -65,6 +65,9 @@ func TestWrite_PreservesIntentionallyLooseMode(t *testing.T) {
 	if err := Write(path, newSpec()); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
+	// A spec left world-readable by an older genv or a careless copy is
+	// tightened, not preserved: the lock is already 0600 and a spec can hold
+	// sensitive env values.
 	if err := os.Chmod(path, 0o644); err != nil {
 		t.Fatalf("chmod: %v", err)
 	}
@@ -75,8 +78,8 @@ func TestWrite_PreservesIntentionallyLooseMode(t *testing.T) {
 	if err != nil {
 		t.Fatalf("stat: %v", err)
 	}
-	if perm := info.Mode().Perm(); perm != 0o644 {
-		t.Fatalf("spec mode = %v, want the pre-existing 0644 left alone", perm)
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("spec mode = %v, want 0600", perm)
 	}
 }
 

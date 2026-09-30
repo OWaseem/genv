@@ -15,7 +15,7 @@ All issues #195–#211.
   `os.Create`, landing at `0644` under a normal umask, so a spec holding
   `env` values marked `sensitive` was world-readable, and a manual
   `chmod 600` was silently cleared by the next `add` / `remove` / `env set`.
-  An existing group/other-readable mode is preserved as a deliberate choice
+  A spec left world-readable by an older genv is tightened, matching the lock
   (Fixes #201).
 - Shell function bodies and alias values can no longer escape the fragment genv
   generates. `}` was missing from the metacharacter denylist, so a body of

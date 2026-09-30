@@ -641,7 +641,7 @@ func validateShellConfig(f *GenvFile, shell *ShellConfig, fieldPrefix string) []
 	aliasShells := make(map[string]string, len(shell.Aliases))
 	for k, v := range shell.Aliases {
 		aliasShells[k] = v.Shell
-		if containsAliasBreakout(v.Value) {
+		if validateAliasValue(v.Shell, v.Value) {
 			errs = append(errs, ValidationError{
 				Field:   fmt.Sprintf("%s.aliases.%s", fieldPrefix, k),
 				Message: "alias value must not contain braces or newlines",
@@ -704,7 +704,7 @@ func validateTargetShellConfig(f *GenvFile, shell *TargetShellConfig, fieldPrefi
 			continue
 		}
 		aliasShells[k] = v.Shell
-		if containsAliasBreakout(v.Value) {
+		if validateAliasValue(v.Shell, v.Value) {
 			errs = append(errs, ValidationError{
 				Field:   fmt.Sprintf("%s.aliases.%s", fieldPrefix, k),
 				Message: "alias value must not contain braces or newlines",
@@ -1593,15 +1593,30 @@ func validateNoHookHosts(hooks *HooksConfig, fieldPrefix string, positions map[s
 	return errs
 }
 
-// containsAliasBreakout reports whether an alias value could escape the
-// wrapper genv generates around it.
+// containsAliasBreakout reports whether an alias value could escape the wrapper
+// genv generates around it.
 //
-// POSIX aliases are single-quoted, so only the closing brace matters for the
-// PowerShell form, which is emitted as `function <name> { <value> }`. A value
-// of "} true" would close the function and run "true" when the fragment is
-// sourced. Braces are refused for both targets so a spec stays portable.
+// This applies only to the PowerShell form. genv writes that as
+// `function <name> { <value> }` with an unquoted value — PowerShell has no
+// POSIX `alias` builtin, so the value *is* the command the function body runs
+// and cannot be quoted. A value of "} true" would close the function and run
+// "true" when the fragment is sourced.
+//
+// POSIX aliases are emitted as `alias <name>='<value>'`, single-quoted with any
+// embedded quote doubled, so braces cannot escape there. Checking them anyway
+// would reject ordinary working aliases such as `for i in {1..10}` and
+// `cd ${ZDOTDIR:-~}`, which is why this is gated on the PowerShell shell value
+// rather than applied to every alias.
 func containsAliasBreakout(s string) bool {
 	return strings.ContainsAny(s, "{}\r\n")
+}
+
+// validateAliasValue rejects an alias value that could break out of the
+// generated wrapper. PowerShell emits the value unquoted inside
+// `function <name> { <value> }`, so braces and newlines are refused there.
+// POSIX emits it single-quoted, which already contains every metacharacter.
+func validateAliasValue(shell, value string) bool {
+	return shell == "powershell" && containsAliasBreakout(value)
 }
 
 // containsShellMeta reports whether s holds a character that would let it

@@ -38,10 +38,23 @@ func TestValidate_AliasValueCannotClosePowerShellWrapper(t *testing.T) {
 	}
 }
 
-func TestValidate_AliasBreakoutRejectedForPosixToo(t *testing.T) {
-	// POSIX aliases are single-quoted, but braces are refused for both targets
-	// so the same spec stays portable and validation is shell-independent.
-	doc := v8Doc(`{"shell":{"aliases":{"evil":{"value":` + quoteJSON("} true") + `,"shell":"bash"}}}}`)
+// POSIX aliases are emitted single-quoted (`alias g='for i in {1..10}'`), so a
+// brace cannot escape the wrapper there. These are ordinary working aliases and
+// must keep validating.
+func TestValidate_PosixAliasBracesStillPass(t *testing.T) {
+	doc := v8Doc(`{"shell":{"aliases":{` +
+		`"zbench":{"value":"for i in {1..10}; do date; done","shell":"bash"},` +
+		`"zdot":{"value":"cd ${ZDOTDIR:-~}","shell":"zsh"},` +
+		`"zshrc":{"value":"${EDITOR:-nvim} \"${ZDOTDIR:-$HOME}\"/.zshrc","shell":"zsh"}` +
+		`}}}`)
+	if errs := validateDoc(t, doc); len(errs) != 0 {
+		t.Fatalf("validation errors = %v, want none for ordinary POSIX aliases", errs)
+	}
+}
+
+// The same value IS rejected for the PowerShell form, where genv cannot quote it.
+func TestValidate_PowerShellAliasBracesRejected(t *testing.T) {
+	doc := v8Doc(`{"shell":{"aliases":{"evil":{"value":"for i in {1..10}","shell":"powershell"}}}}`)
 	errs := validateDoc(t, doc)
 	if !hasErrFieldContaining(errs, "aliases.evil") {
 		t.Fatalf("expected an alias validation error, got %v", errs)

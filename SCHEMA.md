@@ -170,12 +170,16 @@ Relative template paths resolve against the spec directory (or `repo.url` when s
 - v2: `env` map of `{ value, sensitive? }`
 - v1: `packages[]` with `id`, optional `version`, `prefer`, `managers`
 
-Shell alias values and function bodies are wrapped in a generated function
-(`function <name> { <value> }` for PowerShell, single-quoted for POSIX), so they
-must be plain text: braces, `;`, `|`, `&`, backticks, `$`, `<`, `>`, `(`, `)`
-and newlines are rejected at validation rather than allowed to close the
-wrapper. PowerShell has no POSIX `alias` builtin, so an alias value is the
-command its function body runs.
+Shell function bodies are wrapped unquoted in a generated function
+(`name() { … }` / `function <name> { … }`), so a body must be plain text:
+braces, `;`, `|`, `&`, backticks, `$`, `<`, `>`, `(`, `)` and newlines are
+rejected at validation rather than allowed to close the wrapper.
+
+Alias values follow the same rule only for `shell: "powershell"`, because genv
+emits that form unquoted — PowerShell has no POSIX `alias` builtin, so an alias
+value is the command its function body runs. POSIX aliases are emitted
+single-quoted (`alias g='for i in {1..10}'`), which already contains every
+metacharacter, so they are not restricted.
 
 ## Manager resolution
 
