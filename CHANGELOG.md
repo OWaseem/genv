@@ -48,11 +48,13 @@ outside Windows. It is tracked separately.
   `packageDrifted` compares a recorded version and had nothing to compare. The
   package was never re-queued and the entry was written back into `Unchanged`
   on every later apply, so the state could not recover even once the package
-  became installable. `genv status` now reports such entries as `unknown`, and
-  apply re-queues one whose manager reports the package absent. A manager that
-  could not be inventoried leaves its entries alone, and a package that is
-  installed but unversioned stays put (#213).
-- Generated `env.sh` / `shell.sh` fragments were sourced by absolute,
+  became installable. Apply now re-queues a version-less entry whose manager
+  reports the package absent, and `genv status` reports it as `unknown` — but
+  only when a live inventory positively contradicts the lock. A missing version
+  alone is not the trigger: many managers never report a version, and a real
+  install through one of them produces the same version-less entry, so genv waits
+  for the live inventory to disagree. A manager that could not be inventoried,
+  `status --offline`, and a package the manager does list all stay `ok`.- Generated `env.sh` / `shell.sh` fragments were sourced by absolute,
   host-specific path with no existence guard. Because the fragments are
   rendered output rather than tracked files, that path is legitimately absent
   on every fresh clone and on any host that has not applied since the last

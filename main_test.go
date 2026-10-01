@@ -1895,15 +1895,20 @@ func TestStatusCmd_DistinguishesUnknownVersionFromNoConstraint(t *testing.T) {
 	if code != exitOK {
 		t.Fatalf("status: got %d, want %d\n%s", code, exitOK, out)
 	}
-	// A version-less entry is reported as "unknown" rather than "ok": the
-	// entry's presence is not evidence of an install, which is the state a
-	// failed install leaves behind (#213). The version column keeps its own
-	// "*" versus "?" meaning.
-	if !regexp.MustCompile(`unknown\s+git\s+\S+\s+\*`).MatchString(out) {
-		t.Errorf("unconstrained git without installed version should be unknown with *: %q", out)
+	// With --offline there is no live inventory, so there is no evidence that
+	// contradicts the lock and a version-less entry stays "ok" — many
+	// managers never record a version for a package they just installed. The
+	// "unknown" kind is reserved for a live inventory that positively
+	// contradicts the lock (#213).
+	//
+	// What this test is really about is the version column: an unconstrained
+	// package with no recorded version shows "*", and a constrained one shows
+	// "?", so the two are distinguishable.
+	if !regexp.MustCompile(`ok\s+git\s+\S+\s+\*`).MatchString(out) {
+		t.Errorf("unconstrained git without installed version should show *: %q", out)
 	}
-	if !regexp.MustCompile(`unknown\s+vim\s+\S+\s+\?`).MatchString(out) {
-		t.Errorf("constrained vim without installed version should be unknown with ?: %q", out)
+	if !regexp.MustCompile(`ok\s+vim\s+\S+\s+\?`).MatchString(out) {
+		t.Errorf("constrained vim without installed version should show ?: %q", out)
 	}
 	if !regexp.MustCompile(`ok\s+ripgrep\s+\S+\s+14\.1\.0`).MatchString(out) {
 		t.Errorf("ripgrep should show recorded installed version: %q", out)
@@ -4237,7 +4242,16 @@ func TestPull_CopiesRelativeFileAssets(t *testing.T) {
 
 func runGitForTest(t *testing.T, dir string, args ...string) {
 	t.Helper()
-	cmd := exec.Command("git", append([]string{"-c", "core.hooksPath="}, args...)...)
+	// commit.gpgsign / tag.gpgsign are forced off so a developer's global
+	// signing config cannot break these tests: a machine with
+	// commit.gpgsign=true and a keychain-backed key makes every commit in a
+	// temp repo fail with "agent refused operation". CI has no such config,
+	// so this only ever showed up locally.
+	cmd := exec.Command("git", append([]string{
+		"-c", "commit.gpgsign=false",
+		"-c", "tag.gpgsign=false",
+		"-c", "core.hooksPath=",
+	}, args...)...)
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	if err != nil {

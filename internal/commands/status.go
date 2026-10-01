@@ -218,11 +218,19 @@ func StatusWithLive(f *schema.GenvFile, lf *genvfile.LockFile, live map[string]m
 			continue
 		}
 		kind := StatusOK
-		if lp.InstalledVersion == "" {
-			// A lock entry with no version is not evidence of an install.
-			kind = StatusUnknown
-		} else if !version.Satisfies(pkg.Version, lp.InstalledVersion) {
+		switch {
+		case lp.InstalledVersion != "" && !version.Satisfies(pkg.Version, lp.InstalledVersion):
 			kind = StatusDrift
+		case lp.InstalledVersion == "" && liveReportsAbsent(live, lp.Manager, lp.PkgName):
+			// #213: a lock entry with no recorded version is not evidence of
+			// an install — that is the state a failed install leaves behind.
+			// But plenty of managers never report a version, so the missing
+			// version alone is not enough to call a healthy system bad. Only
+			// flag it when the live inventory positively contradicts the
+			// lock: the manager was inventoried and does not list the
+			// package. The same evidence gates the reconciler's re-check, so
+			// status never reports something apply would not act on.
+			kind = StatusUnknown
 		}
 		entries = append(entries, StatusEntry{
 			ID:               pkg.ID,
@@ -277,6 +285,21 @@ func liveMatch(pkg schema.Package, live map[string]map[string]bool) (manager, pk
 		}
 	}
 	return "", "", false
+}
+
+// liveReportsAbsent reports whether the live inventory positively contradicts
+// the lock: the manager was inventoried and does not list the package.
+//
+// A manager that was never inventoried — unavailable, or whose listing failed —
+// yields false, so an unavailable manager can never manufacture a false alarm.
+func liveReportsAbsent(live map[string]map[string]bool, manager, pkgName string) bool {
+	if live == nil || manager == "" || pkgName == "" {
+		return false
+	}
+	if _, inventoried := live[manager]; !inventoried {
+		return false
+	}
+	return !liveHas(live, manager, pkgName)
 }
 
 func liveHas(live map[string]map[string]bool, manager, pkgName string) bool {

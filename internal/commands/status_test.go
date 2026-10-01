@@ -85,10 +85,13 @@ func TestStatus_Drift(t *testing.T) {
 func TestStatus_NoDriftWhenNoInstalledVersion(t *testing.T) {
 	// An old lock entry without InstalledVersion must not be reported as
 	// drift: genv has no version to compare, and calling that drift would be
-	// a false alarm on every upgraded host. It is reported as "unknown"
-	// instead, because the entry's presence is not evidence of an install —
-	// that is precisely the state a failed install leaves behind, and
-	// reporting it as ok made the state unrecoverable (#213).
+	// a false alarm on every upgraded host.
+	//
+	// It is also not "unknown" here, because Status is the lock-only view:
+	// with no live inventory there is no evidence either way, and many
+	// managers never record a version for a package they just installed.
+	// "unknown" is reserved for the case where a live inventory positively
+	// contradicts the lock — see status_unknown_test.go (#213).
 	f := &schema.GenvFile{
 		Packages: []schema.Package{{ID: "git", Version: "2.40.*"}},
 	}
@@ -104,8 +107,8 @@ func TestStatus_NoDriftWhenNoInstalledVersion(t *testing.T) {
 	if entries[0].Kind == StatusDrift {
 		t.Errorf("kind = %q, must not be drift (old lock entries must not drift)", entries[0].Kind)
 	}
-	if entries[0].Kind != StatusUnknown {
-		t.Errorf("kind = %q, want %q", entries[0].Kind, StatusUnknown)
+	if entries[0].Kind != StatusOK {
+		t.Errorf("kind = %q, want %q: no live evidence means no reason to doubt the lock", entries[0].Kind, StatusOK)
 	}
 }
 

@@ -11,7 +11,12 @@ import (
 // a version-less entry left by a failed install reported "ok" for a package the
 // manager had never installed. Reporting it as ok is self-perpetuating: the
 // entry is the only reason the check passes.
-func TestStatus_VersionlessLockEntryIsUnknownNotOK(t *testing.T) {
+//
+// The evidence is the live inventory, not the missing version alone. Plenty of
+// managers never report a version, and a real install through one of those
+// produces exactly the same version-less lock entry — so a missing version on
+// its own would report every such system as broken.
+func TestStatus_VersionlessLockEntryIsUnknownWhenLiveDisagrees(t *testing.T) {
 	f := &schema.GenvFile{Packages: []schema.Package{{
 		ID:       "peaproxy",
 		Managers: map[string]string{"scoop": "peaproxy"},
@@ -19,6 +24,7 @@ func TestStatus_VersionlessLockEntryIsUnknownNotOK(t *testing.T) {
 	lf := &genvfile.LockFile{Packages: []genvfile.LockedPackage{
 		{ID: "peaproxy", Manager: "scoop", PkgName: "peaproxy"},
 	}}
+	// scoop was inventoried and does not list peaproxy.
 	live := map[string]map[string]bool{"scoop": {"jq": true}}
 
 	got := StatusWithLive(f, lf, live)
@@ -26,10 +32,56 @@ func TestStatus_VersionlessLockEntryIsUnknownNotOK(t *testing.T) {
 		t.Fatalf("entries = %d, want 1", len(got))
 	}
 	if got[0].Kind == StatusOK {
-		t.Fatalf("Kind = %q, want not ok: a version-less entry proves nothing", got[0].Kind)
+		t.Fatalf("Kind = %q, want not ok: a version-less entry the live inventory contradicts proves nothing", got[0].Kind)
 	}
 	if got[0].Kind != StatusUnknown {
 		t.Errorf("Kind = %q, want %q", got[0].Kind, StatusUnknown)
+	}
+}
+
+// A successful install through a manager that reports no version produces the
+// same version-less lock entry, and the live inventory does list the package.
+// That is a healthy system and must stay ok — the e2e suite installs real
+// packages through snap, paru, yay and brew and asserts exactly this.
+func TestStatus_VersionlessLockEntryIsOKWhenLiveConfirmsIt(t *testing.T) {
+	f := &schema.GenvFile{Packages: []schema.Package{{
+		ID:       "hello",
+		Managers: map[string]string{"snap": "hello"},
+	}}}
+	lf := &genvfile.LockFile{Packages: []genvfile.LockedPackage{
+		{ID: "hello", Manager: "snap", PkgName: "hello"},
+	}}
+	live := map[string]map[string]bool{"snap": {"hello": true, "core": true}}
+
+	got := StatusWithLive(f, lf, live)
+	if len(got) != 1 || got[0].Kind != StatusOK {
+		t.Fatalf("entry = %+v, want kind ok: the live inventory confirms the install", got)
+	}
+}
+
+// A manager that could not be inventoried must never manufacture the warning:
+// there is no evidence either way, so a version-less entry stays ok. This is
+// also why `genv status --offline` (no live map at all) stays quiet.
+func TestStatus_VersionlessLockEntryIsOKWithoutLiveEvidence(t *testing.T) {
+	f := &schema.GenvFile{Packages: []schema.Package{{
+		ID:       "hello",
+		Managers: map[string]string{"snap": "hello"},
+	}}}
+	lf := &genvfile.LockFile{Packages: []genvfile.LockedPackage{
+		{ID: "hello", Manager: "snap", PkgName: "hello"},
+	}}
+
+	cases := map[string]map[string]map[string]bool{
+		"no live map at all":      nil,
+		"manager not inventoried": map[string]map[string]bool{"brew": {"git": true}},
+	}
+	for name, live := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := StatusWithLive(f, lf, live)
+			if len(got) != 1 || got[0].Kind != StatusOK {
+				t.Fatalf("entry = %+v, want kind ok: no live evidence either way", got)
+			}
+		})
 	}
 }
 
