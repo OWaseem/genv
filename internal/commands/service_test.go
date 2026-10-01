@@ -8,13 +8,26 @@ import (
 	"github.com/ks1686/genv/internal/schema"
 )
 
+func TestServiceAdd_PreservesNewerSchema(t *testing.T) {
+	// Regression: adding a service to a v5/v6 file must not downgrade to v4.
+	for _, v := range []string{schema.Version5, schema.Version6} {
+		f := &schema.GenvFile{SchemaVersion: v}
+		if err := ServiceAdd(f, "svc", []string{"echo", "start"}, nil, nil, nil, "", ""); err != nil {
+			t.Fatalf("ServiceAdd at %s: %v", v, err)
+		}
+		if f.SchemaVersion != v {
+			t.Errorf("ServiceAdd downgraded schemaVersion from %q to %q", v, f.SchemaVersion)
+		}
+	}
+}
+
 func TestServiceCommands(t *testing.T) {
 	f := &schema.GenvFile{
 		SchemaVersion: schema.Version3,
 	}
 
 	// Test ServiceAdd
-	err := ServiceAdd(f, "test-svc", []string{"echo", "start"}, []string{"echo", "stop"}, nil, []string{"true"})
+	err := ServiceAdd(f, "test-svc", []string{"echo", "start"}, []string{"echo", "stop"}, nil, []string{"true"}, "", "")
 	if err != nil {
 		t.Fatalf("ServiceAdd failed: %v", err)
 	}
@@ -34,7 +47,7 @@ func TestServiceCommands(t *testing.T) {
 	}
 
 	// Test ServiceRemove
-	err = ServiceRemove(f, "test-svc")
+	err = ServiceRemove(f, "test-svc", "")
 	if err != nil {
 		t.Fatalf("ServiceRemove failed: %v", err)
 	}
@@ -43,8 +56,28 @@ func TestServiceCommands(t *testing.T) {
 	}
 
 	// Test ServiceRemove not found
-	err = ServiceRemove(f, "missing-svc")
+	err = ServiceRemove(f, "missing-svc", "")
 	if err == nil || !strings.Contains(err.Error(), "service not found") {
 		t.Errorf("expected 'service not found' error, got %v", err)
+	}
+}
+
+func TestServicePut_LaunchdTemplate(t *testing.T) {
+	f := &schema.GenvFile{SchemaVersion: schema.Version8, Targets: map[string]*schema.TargetBundle{
+		"macos": {},
+	}}
+	err := ServicePut(f, "agent", schema.Service{Launchd: &schema.LaunchdSpec{Plist: "agents/foo.plist"}}, "macos")
+	if err != nil {
+		t.Fatalf("ServicePut launchd: %v", err)
+	}
+	got := f.Targets["macos"].Services["agent"]
+	if got == nil || !got.DeclaresLaunchd() || got.Launchd.Plist != "agents/foo.plist" {
+		t.Fatalf("macos agent = %+v", got)
+	}
+	var buf bytes.Buffer
+	listFile := &schema.GenvFile{Services: map[string]schema.Service{"agent": *got}}
+	ServiceList(listFile, &buf)
+	if !strings.Contains(buf.String(), "launchd:agents/foo.plist") {
+		t.Fatalf("list missing launchd cell:\n%s", buf.String())
 	}
 }

@@ -1,6 +1,14 @@
 package adapter
 
-import "strings"
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"time"
+)
 
 // brewBase holds the Available and PlanInstall implementations shared between
 // Brew and Linuxbrew. Both use the same brew binary; only their registry name
@@ -24,6 +32,84 @@ func (brewBase) PlanUpgrade(pkgName string) []string {
 	return []string{"brew", "upgrade", pkgName}
 }
 
+// PlanUpgradeBatch upgrades multiple formulae/casks in one brew invocation.
+func (brewBase) PlanUpgradeBatch(pkgNames []string) []string {
+	args := []string{"brew", "upgrade"}
+	return append(args, pkgNames...)
+}
+
+// PlanRefresh fetches Homebrew's formula/cask index. Brew and Linuxbrew share
+// the same brew binary, so the planner dedupes identical argv to one call.
+func (brewBase) PlanRefresh() []string {
+	return []string{"brew", "update"}
+}
+
+// brewOutdatedEntry mirrors one element of `brew outdated --json=v2`.
+type brewOutdatedEntry struct {
+	Name           string `json:"name"`
+	CurrentVersion string `json:"current_version"`
+}
+
+// ListOutdated reports Homebrew formulae and casks with a newer version
+// available, keyed by name -> latest version, intersected with pkgNames.
+// The upgrade planner runs `brew update` first (PlanRefresh) so this query
+// sees bottles published since the last fetch. --greedy includes
+// auto-updating casks that `brew outdated` otherwise hides.
+func (brewBase) ListOutdated(pkgNames []string) (map[string]string, error) {
+	// Bound brew's HTTPS/trust evaluation so a launchd-session keychain hang
+	// cannot wedge the scheduled updates checker forever.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "brew", "outdated", "--json=v2", "--greedy").Output()
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Formulae []brewOutdatedEntry `json:"formulae"`
+		Casks    []brewOutdatedEntry `json:"casks"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return nil, fmt.Errorf("parse brew outdated: %w", err)
+	}
+	want := make(map[string]bool, len(pkgNames))
+	for _, n := range pkgNames {
+		want[n] = true
+	}
+	outdated := make(map[string]string)
+	for _, group := range [][]brewOutdatedEntry{payload.Formulae, payload.Casks} {
+		for _, e := range group {
+			if len(pkgNames) > 0 && !want[e.Name] {
+				continue
+			}
+			outdated[e.Name] = e.CurrentVersion
+		}
+	}
+	if len(outdated) == 0 {
+		return nil, nil
+	}
+	return outdated, nil
+}
+
+// ListInstalledVersions returns name->version for all installed formulae and
+// casks (formulae only under Linuxbrew) via one `brew list --versions` call.
+// Satisfies the optional VersionLister so the resolver can collect versions
+// in bulk after batch upgrades instead of N QueryVersion calls.
+// Parsing splits only on the first space (SplitN(..., 2)) to robustly
+// preserve multi-token version strings after the separator.
+func (brewBase) ListInstalledVersions() (map[string]string, error) {
+	lines, err := runListOutput("brew", "list", "--versions")
+	if err != nil {
+		return nil, err
+	}
+	versions := make(map[string]string, len(lines))
+	for _, line := range lines {
+		if parts := strings.SplitN(line, " ", 2); len(parts) == 2 {
+			versions[parts[0]] = parts[1]
+		}
+	}
+	return versions, nil
+}
+
 func (brewBase) PlanClean() [][]string {
 	return [][]string{{"brew", "cleanup"}}
 }
@@ -33,7 +119,11 @@ func (brewBase) PlanClean() [][]string {
 // which are skipped. Package names that are not an exact case-insensitive match
 // of a section header are returned.
 func (brewBase) Search(query string) ([]string, error) {
-	lines, err := runListOutput("brew", "search", query)
+	return brewBase{}.SearchContext(context.Background(), query)
+}
+
+func (brewBase) SearchContext(ctx context.Context, query string) ([]string, error) {
+	lines, err := runListOutputContext(ctx, "brew", "search", query)
 	if err != nil || len(lines) == 0 {
 		return lines, err
 	}
@@ -47,6 +137,42 @@ func (brewBase) Search(query string) ([]string, error) {
 		}
 	}
 	return names, nil
+}
+
+// ListNames returns all installable formulae and casks for shell completion.
+func (brewBase) ListNames() ([]string, error) {
+	return brewBase{}.ListNamesContext(context.Background())
+}
+
+func (brewBase) ListNamesContext(ctx context.Context) ([]string, error) {
+	formulae, err := brewCompletionListContext(ctx, "formulae")
+	if err != nil {
+		return nil, err
+	}
+	casks, err := brewCompletionListContext(ctx, "casks")
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(formulae)+len(casks))
+	var names []string
+	for _, name := range append(formulae, casks...) {
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func brewCompletionListContext(ctx context.Context, arg string) ([]string, error) {
+	cmd := exec.CommandContext(ctx, "brew", arg)
+	cmd.Env = append(os.Environ(), "HOMEBREW_COMPLETION=1")
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, err
+	}
+	return trimmedNonEmptyLines(string(out)), nil
 }
 
 // Brew is the adapter for Homebrew (macOS and Linux).
@@ -67,15 +193,30 @@ func (Brew) Query(pkgName string) (bool, error) {
 
 // ListInstalled returns both formulae and casks managed by Homebrew.
 func (Brew) ListInstalled() ([]string, error) {
-	formulae, err := runListOutput("brew", "list", "--formula", "--1")
+	formulae, err := runListOutput("brew", "list", "--formula", "-1")
 	if err != nil {
 		return nil, err
 	}
-	casks, err := runListOutput("brew", "list", "--cask", "--1")
+	casks, err := runListOutput("brew", "list", "--cask", "-1")
 	if err != nil {
 		return nil, err
 	}
 	return append(formulae, casks...), nil
+}
+
+// ListForScan returns formulae that are not dependencies of another installed
+// formula (`brew leaves`) plus every cask. Homebrew libraries pulled in as
+// deps (openssl@3, libpng, …) stay out of default scan.
+func (Brew) ListForScan() ([]string, error) {
+	leaves, err := runListOutput("brew", "leaves")
+	if err != nil {
+		return nil, err
+	}
+	casks, err := runListOutput("brew", "list", "--cask", "-1")
+	if err != nil {
+		return nil, err
+	}
+	return append(leaves, casks...), nil
 }
 
 func (Brew) QueryVersion(pkgName string) (string, error) { return brewQueryVersion(pkgName) }
@@ -95,7 +236,12 @@ func (Linuxbrew) Query(pkgName string) (bool, error) {
 }
 
 func (Linuxbrew) ListInstalled() ([]string, error) {
-	return runListOutput("brew", "list", "--formula", "--1")
+	return runListOutput("brew", "list", "--formula", "-1")
+}
+
+// ListForScan returns Linuxbrew leaves only. Linux Homebrew has no casks.
+func (Linuxbrew) ListForScan() ([]string, error) {
+	return runListOutput("brew", "leaves")
 }
 
 func (Linuxbrew) QueryVersion(pkgName string) (string, error) { return brewQueryVersion(pkgName) }

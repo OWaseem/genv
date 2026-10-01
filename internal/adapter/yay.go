@@ -1,5 +1,10 @@
 package adapter
 
+import (
+	"context"
+	"strings"
+)
+
 // Yay is the adapter for yay (Yet Another Yogurt), an AUR helper for Arch Linux.
 // yay wraps pacman and handles AUR packages; it manages privilege escalation
 // internally so no sudo prefix is needed.
@@ -29,6 +34,17 @@ func (Yay) PlanUpgrade(pkgName string) []string {
 	return []string{"yay", "-S", "--noconfirm", pkgName}
 }
 
+// PlanUpgradeBatch upgrades multiple packages in one yay invocation.
+func (Yay) PlanUpgradeBatch(pkgNames []string) []string {
+	args := []string{"yay", "-S", "--noconfirm"}
+	return append(args, pkgNames...)
+}
+
+// PlanRefresh syncs repos; yay escalates itself (no sudo prefix).
+func (Yay) PlanRefresh() []string {
+	return []string{"yay", "-Sy", "--noconfirm"}
+}
+
 func (Yay) PlanClean() [][]string {
 	return [][]string{{"yay", "-Sc", "--noconfirm"}}
 }
@@ -37,16 +53,47 @@ func (Yay) Query(pkgName string) (bool, error) { return runQuery("yay", "-Qi", p
 
 // Search returns package names from pacman/AUR repos whose name contains query.
 func (Yay) Search(query string) ([]string, error) {
-	lines, err := runListOutput("yay", "-Ss", query)
+	return Yay{}.SearchContext(context.Background(), query)
+}
+
+func (Yay) SearchContext(ctx context.Context, query string) ([]string, error) {
+	lines, err := runListOutputContext(ctx, "yay", "-Ss", query)
 	if err != nil || len(lines) == 0 {
 		return lines, err
 	}
 	return parsePacmanSearch(lines, query), nil
 }
 
+// ListNames returns all installable packages from pacman and AUR repos.
+func (Yay) ListNames() ([]string, error) {
+	return Yay{}.ListNamesContext(context.Background())
+}
+
+func (Yay) ListNamesContext(ctx context.Context) ([]string, error) {
+	return runListOutputContext(ctx, "yay", "-Slq")
+}
+
 // ListInstalled delegates to pacman since yay manages the same pacman DB.
 func (Yay) ListInstalled() ([]string, error) {
 	return runListOutput("pacman", "-Qqe")
+}
+
+// ListInstalledVersions returns installed versions from the pacman database,
+// which paru/yay share. This satisfies VersionLister for batch upgrade version
+// refresh.
+func (Yay) ListInstalledVersions() (map[string]string, error) {
+	lines, err := runListOutput("pacman", "-Q")
+	if err != nil {
+		return nil, err
+	}
+	versions := make(map[string]string, len(lines))
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 {
+			versions[fields[0]] = fields[1]
+		}
+	}
+	return versions, nil
 }
 
 func (Yay) QueryVersion(pkgName string) (string, error) {
@@ -55,4 +102,10 @@ func (Yay) QueryVersion(pkgName string) (string, error) {
 		return out, err
 	}
 	return parseMgrQueryVersion(out), nil
+}
+
+// ListOutdated reports installed packages with a newer version available via
+// yay, keyed by package name -> target version, intersected with pkgNames.
+func (Yay) ListOutdated(pkgNames []string) (map[string]string, error) {
+	return listPacmanQuOutdated("yay", pkgNames)
 }

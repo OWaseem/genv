@@ -2,61 +2,169 @@ name: Release
 
 on:
   workflow_dispatch:
+    inputs:
+      mode:
+        description: "full = GoReleaser + AUR; aur-only = republish AUR for an existing GitHub release"
+        type: choice
+        options:
+          - full
+          - aur-only
+        default: full
+      version:
+        description: "Semver without leading v (required for aur-only, e.g. 4.0.3)"
+        required: false
+        type: string
   push:
     tags:
-      - 'v*'
+      - "v*"
 
 permissions:
   contents: write
   id-token: write
 
 jobs:
+  # A tag push must not publish binaries that fail their own test suite.
+  # v4.5.2 shipped with a red Windows job because nothing between the tag and
+  # GoReleaser checked anything. This runs the same reusable all-platform
+  # workflow CI uses, so release readiness is a fact rather than an assumption.
+  preflight:
+    uses: ./.github/workflows/test.yml
+
   release:
     name: Build and publish release
+    needs: preflight
     runs-on: ubuntu-latest
 
     steps:
+      - name: Resolve checkout ref
+        id: ref
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ github.event.inputs.mode }}" = "aur-only" ]; then
+            version="${{ github.event.inputs.version }}"
+            version="${version#v}"
+            if [ -z "$version" ]; then
+              echo "aur-only requires the version input" >&2
+              exit 1
+            fi
+            # Checkout the workflow branch (latest publish scripts), not the
+            # release tag — AUR scripts only need the version string + GitHub
+            # release assets, not the tagged tree.
+            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=${{ github.ref }}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - name: Resolve mode and version
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            mode="full"
+            version="${GITHUB_REF_NAME#v}"
+          else
+            mode="${{ github.event.inputs.mode }}"
+            version="${{ github.event.inputs.version }}"
+            version="${version#v}"
+            if [ -z "$version" ]; then
+              version="$(git describe --tags --abbrev=0)"
+              version="${version#v}"
+            fi
+          fi
+          if [ -z "$version" ]; then
+            echo "could not resolve release version" >&2
+            exit 1
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Resolved mode=$mode version=$version"
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        if: steps.meta.outputs.mode == 'full'
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Install cosign
+        if: steps.meta.outputs.mode == 'full'
         uses: sigstore/cosign-installer@v3
 
-      - name: Install snapcraft
-        run: sudo snap install snapcraft --classic
-
       - name: Run unit test suite
+        if: steps.meta.outputs.mode == 'full'
         run: go test ./...
 
       - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v6
+        if: steps.meta.outputs.mode == 'full'
+        uses: goreleaser/goreleaser-action@v7
         with:
           distribution: goreleaser
           version: "~> v2"
-          args: release --clean
+          # Notarization wait can exceed the default on first Apple submit.
+          args: release --clean --timeout 60m
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
-          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          SCOOP_BUCKET_GITHUB_TOKEN: ${{ secrets.SCOOP_BUCKET_GITHUB_TOKEN }}
+          # Developer ID Application (.p12 base64) + App Store Connect API key.
+          # When MACOS_SIGN_P12 is unset, GoReleaser skips notarize.macos.
+          MACOS_SIGN_P12: ${{ secrets.MACOS_SIGN_P12 }}
+          MACOS_SIGN_PASSWORD: ${{ secrets.MACOS_SIGN_PASSWORD }}
+          MACOS_NOTARY_KEY: ${{ secrets.MACOS_NOTARY_KEY }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+
+  # AUR SSH from ubuntu-latest currently gets "down due to maintenance" while
+  # residential/macOS egress reaches a healthy IPv4 endpoint. Publish AUR from
+  # macOS so v4.x repairs and releases can land.
+  aur:
+    name: Publish to AUR
+    needs: release
+    if: always() && (needs.release.result == 'success' || (github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'aur-only'))
+    runs-on: macos-latest
+    steps:
+      - name: Resolve version
+        id: meta
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "push" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="${{ github.event.inputs.version }}"
+            version="${version#v}"
+          fi
+          if [ -z "$version" ]; then
+            echo "could not resolve release version" >&2
+            exit 1
+          fi
+          if [[ "$version" == *-* ]]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        if: steps.meta.outputs.skip == 'false'
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          ref: ${{ github.ref }}
 
       - name: Publish to AUR (genv-bin, pre-compiled binary)
-        if: "!contains(github.ref_name, '-')"
+        if: steps.meta.outputs.skip == 'false'
         env:
           AUR_KEY: ${{ secrets.AUR_KEY }}
-          VERSION: ${{ github.ref_name }}
-        run: bash .github/scripts/publish-aur.sh "${VERSION#v}"
+        run: bash .github/scripts/publish-aur.sh "${{ steps.meta.outputs.version }}"
 
       - name: Publish to AUR (genv, builds from source)
-        if: "!contains(github.ref_name, '-')"
+        if: steps.meta.outputs.skip == 'false'
         env:
           AUR_KEY: ${{ secrets.AUR_KEY }}
-          VERSION: ${{ github.ref_name }}
-        run: bash .github/scripts/publish-aur-src.sh "${VERSION#v}"
+        run: bash .github/scripts/publish-aur-src.sh "${{ steps.meta.outputs.version }}"

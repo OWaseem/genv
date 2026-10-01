@@ -1,0 +1,377 @@
+package service
+
+import (
+	"context"
+	"encoding/binary"
+	"fmt"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"strings"
+	"time"
+	"unicode/utf16"
+)
+
+const (
+	// Task Scheduler's documented minimum repetition interval is one minute.
+	schtasksMinInterval = time.Minute
+	// Repetition duration long enough to outlive a typical machine lifetime
+	// (indefinite duration is version-dependent on /XML import).
+	schtasksRepetitionDuration = "P3650D"
+)
+
+// wscript can keep the .vbs mapped for a short time after schtasks /Delete.
+// Retry just long enough for the host to exit; do not block stop on a wedged job.
+var (
+	scheduledRemoveRetryDelay  = 50 * time.Millisecond
+	scheduledRemoveRetryBudget = 2 * time.Second
+)
+
+// schtasksRun invokes schtasks.exe. Tests replace it so Linux CI can cover
+// register/status/stop without a Windows host.
+var schtasksRun = func(ctx context.Context, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, "schtasks", args...).CombinedOutput()
+}
+
+func schtasksTaskName(name string) string {
+	return "genv-" + serviceUnitSlug(name)
+}
+
+func schtasksArtifactDir() (string, error) {
+	home, err := homeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "genv", "scheduled"), nil
+}
+
+func schtasksCmdFileName(name string) string {
+	return schtasksTaskName(name) + ".cmd"
+}
+
+func schtasksXMLFileName(name string) string {
+	return schtasksTaskName(name) + ".xml"
+}
+
+func schtasksVbsFileName(name string) string {
+	return schtasksTaskName(name) + ".vbs"
+}
+
+func schtasksSystem32(exe string) string {
+	root := os.Getenv("SystemRoot")
+	if root == "" {
+		root = `C:\Windows`
+	}
+	return root + `\System32\` + exe
+}
+
+func schtasksCmdExe() string {
+	return schtasksSystem32("cmd.exe")
+}
+
+func schtasksWscriptExe() string {
+	return schtasksSystem32("wscript.exe")
+}
+
+func startSchtasksScheduledJob(ctx context.Context, job ScheduledJob) error {
+	dir, err := schtasksArtifactDir()
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return fmt.Errorf("creating scheduled task directory: %w", err)
+	}
+	scriptPath := filepath.Join(dir, schtasksCmdFileName(job.Name))
+	vbsPath := filepath.Join(dir, schtasksVbsFileName(job.Name))
+	xmlPath := filepath.Join(dir, schtasksXMLFileName(job.Name))
+	if err := os.WriteFile(scriptPath, []byte(SchtasksScheduledCmdContent(job)), 0o644); err != nil {
+		return fmt.Errorf("writing scheduled task script %q: %w", scriptPath, err)
+	}
+	if err := os.WriteFile(vbsPath, []byte(SchtasksScheduledVbsContent(schtasksCmdExe(), scriptPath)), 0o644); err != nil {
+		return fmt.Errorf("writing scheduled task host %q: %w", vbsPath, err)
+	}
+	xmlContent := SchtasksScheduledTaskXML(job.Name, schtasksWscriptExe(), vbsPath, job.Interval)
+	if err := os.WriteFile(xmlPath, encodeUTF16LE(xmlContent), 0o644); err != nil {
+		return fmt.Errorf("writing scheduled task XML %q: %w", xmlPath, err)
+	}
+	taskName := schtasksTaskName(job.Name)
+	if out, err := schtasksRun(ctx, "/Create", "/TN", taskName, "/XML", xmlPath, "/F"); err != nil {
+		decoded := decodeSchtasksOutput(out)
+		return fmt.Errorf("creating scheduled task %q: %w\n%s%s", taskName, err, decoded, schtasksCreateAccessDeniedHint(decoded))
+	}
+	// Kick once through Task Scheduler so the process is a child of the
+	// scheduler service, not this session. OpenSSH on Windows assigns a job
+	// object to the session; processes that do not break away die on disconnect.
+	_, _ = schtasksRun(ctx, "/Run", "/TN", taskName)
+	return nil
+}
+
+func stopSchtasksScheduledJob(ctx context.Context, name string) error {
+	taskName := schtasksTaskName(name)
+	_, _ = schtasksRun(ctx, "/End", "/TN", taskName)
+	if out, err := schtasksRun(ctx, "/Delete", "/TN", taskName, "/F"); err != nil {
+		decoded := decodeSchtasksOutput(out)
+		if !schtasksTaskMissing(decoded) {
+			return fmt.Errorf("deleting scheduled task %q: %w\n%s", taskName, err, decoded)
+		}
+	}
+	dir, err := schtasksArtifactDir()
+	if err != nil {
+		return err
+	}
+	for _, path := range []string{
+		filepath.Join(dir, schtasksCmdFileName(name)),
+		filepath.Join(dir, schtasksVbsFileName(name)),
+		filepath.Join(dir, schtasksXMLFileName(name)),
+	} {
+		if err := removeScheduledArtifact(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func removeScheduledArtifact(path string) error {
+	return removeScheduledArtifactWith(os.Remove, path, scheduledRemoveRetryBudget)
+}
+
+func removeScheduledArtifactWith(remove func(string) error, path string, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	for {
+		err := remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return nil
+		}
+		if !isBusyFile(err) || !time.Now().Before(deadline) {
+			return fmt.Errorf("removing scheduled task file %q: %w", path, err)
+		}
+		if scheduledRemoveRetryDelay > 0 {
+			time.Sleep(scheduledRemoveRetryDelay)
+		}
+	}
+}
+
+func isBusyFile(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "used by another process") ||
+		strings.Contains(msg, "sharing violation")
+}
+
+// SchtasksScheduledVbsContent renders a windowless WSH host that runs
+// scriptPath via cmd.exe. WshShell.Run window style 0 hides the console that
+// InteractiveToken would otherwise allocate for cmd.exe / genv.exe.
+func SchtasksScheduledVbsContent(cmdExe, scriptPath string) string {
+	run := schtasksHiddenCmdLine(cmdExe, scriptPath)
+	return "Set sh = CreateObject(\"WScript.Shell\")\r\nWScript.Quit sh.Run(" + vbsQuoteString(run) + ", 0, True)\r\n"
+}
+
+func schtasksHiddenCmdLine(cmdExe, scriptPath string) string {
+	return cmdQuoteArg(stripLineBreaks(cmdExe)) + " /d /c call " + cmdQuoteArg(stripLineBreaks(scriptPath))
+}
+
+func vbsQuoteString(s string) string {
+	return `"` + strings.ReplaceAll(s, `"`, `""`) + `"`
+}
+
+// SchtasksScheduledCmdContent renders the .cmd wrapper that sets PATH (and any
+// other environment) then execs the one-shot genv command.
+func SchtasksScheduledCmdContent(job ScheduledJob) string {
+	var b strings.Builder
+	b.WriteString("@echo off\r\n")
+	if len(job.Command) > 0 {
+		fmt.Fprintf(&b, "rem genv-program: %s\r\n", stripLineBreaks(job.Command[0]))
+	}
+	for _, name := range sortedEnvironmentNames(job.Environment) {
+		fmt.Fprintf(&b, "%s\r\n", cmdSetAssignment(name, job.Environment[name]))
+	}
+	if len(job.Command) == 0 {
+		return b.String()
+	}
+	parts := make([]string, 0, len(job.Command))
+	for _, arg := range job.Command {
+		parts = append(parts, cmdQuoteArg(stripLineBreaks(arg)))
+	}
+	b.WriteString(strings.Join(parts, " "))
+	b.WriteString("\r\n")
+	return b.String()
+}
+
+// schtasksCurrentUserID resolves the Windows identity for a per-user task.
+// Prefer os/user.Current(); fall back to USERDOMAIN\USERNAME / USERNAME so
+// InteractiveToken + LeastPrivilege registration stays scoped to this account.
+func schtasksCurrentUserID() string {
+	if u, err := user.Current(); err == nil {
+		if id := strings.TrimSpace(u.Username); id != "" {
+			return id
+		}
+	}
+	domain := strings.TrimSpace(os.Getenv("USERDOMAIN"))
+	name := strings.TrimSpace(os.Getenv("USERNAME"))
+	switch {
+	case domain != "" && name != "":
+		return domain + `\` + name
+	case name != "":
+		return name
+	default:
+		return ""
+	}
+}
+
+func schtasksUserIDXML(userID string) string {
+	userID = strings.TrimSpace(stripLineBreaks(userID))
+	if userID == "" {
+		return ""
+	}
+	return "      <UserId>" + xmlEscape(userID) + "</UserId>\r\n"
+}
+
+func schtasksAccessDenied(output string) bool {
+	message := strings.ToLower(output)
+	if strings.Contains(message, "access is denied") {
+		return true
+	}
+	// Win32 ERROR_ACCESS_DENIED (5) / HRESULT 0x80070005 variants from schtasks.
+	if strings.Contains(message, "0x80070005") {
+		return true
+	}
+	if strings.Contains(message, "error code = 5") || strings.Contains(message, "error code: 5") {
+		return true
+	}
+	if strings.Contains(message, "(5)") && (strings.Contains(message, "denied") || strings.Contains(message, "access")) {
+		return true
+	}
+	return false
+}
+
+func schtasksCreateAccessDeniedHint(output string) string {
+	if !schtasksAccessDenied(output) {
+		return ""
+	}
+	return "\nHint: Task Scheduler denied creating the current-user genv-updates task. Retry from an elevated PowerShell, check Task Scheduler / Group Policy permissions, or delete a foreign-owned genv-updates task and retry."
+}
+
+// SchtasksScheduledTaskXML renders a Task Scheduler 1.3 XML definition:
+// logon trigger (reboot/logon) plus repetition matching interval. command is
+// the windowless host (wscript.exe); scriptPath is the .vbs wrapper.
+// UserId is set under Principal and LogonTrigger so registration stays
+// per-user with InteractiveToken + LeastPrivilege (no elevation required).
+func SchtasksScheduledTaskXML(name, command, scriptPath string, interval time.Duration) string {
+	name = stripLineBreaks(name)
+	taskName := schtasksTaskName(name)
+	userIDXML := schtasksUserIDXML(schtasksCurrentUserID())
+	return fmt.Sprintf(`<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.3" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <RegistrationInfo>
+    <Description>genv scheduled job: %s</Description>
+    <URI>\%s</URI>
+  </RegistrationInfo>
+  <Triggers>
+    <LogonTrigger>
+%s      <Enabled>true</Enabled>
+      <Delay>PT1M</Delay>
+      <Repetition>
+        <Interval>%s</Interval>
+        <Duration>%s</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+%s      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
+    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
+    <AllowHardTerminate>true</AllowHardTerminate>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
+    <IdleSettings>
+      <StopOnIdleEnd>false</StopOnIdleEnd>
+      <RestartOnIdle>false</RestartOnIdle>
+    </IdleSettings>
+    <AllowStartOnDemand>true</AllowStartOnDemand>
+    <Enabled>true</Enabled>
+    <Hidden>true</Hidden>
+    <RunOnlyIfIdle>false</RunOnlyIfIdle>
+    <DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>
+    <UseUnifiedSchedulingEngine>true</UseUnifiedSchedulingEngine>
+    <WakeToRun>false</WakeToRun>
+    <ExecutionTimeLimit>%s</ExecutionTimeLimit>
+    <Priority>7</Priority>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>%s</Command>
+      <Arguments>%s</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+`, xmlEscape(name), xmlEscape(taskName), userIDXML, schtasksRepetitionInterval(interval), schtasksRepetitionDuration, userIDXML, schtasksExecutionTimeLimit(interval), xmlEscape(stripLineBreaks(command)), xmlEscape(schtasksWscriptArguments(scriptPath)))
+}
+
+func schtasksWscriptArguments(scriptPath string) string {
+	return `//B //Nologo ` + cmdQuoteArg(stripLineBreaks(scriptPath))
+}
+
+func schtasksRepetitionInterval(interval time.Duration) string {
+	sec := max(int(interval.Seconds()), int(schtasksMinInterval.Seconds()))
+	if sec%3600 == 0 {
+		return fmt.Sprintf("PT%dH", sec/3600)
+	}
+	if sec%60 == 0 {
+		return fmt.Sprintf("PT%dM", sec/60)
+	}
+	return fmt.Sprintf("PT%dS", sec)
+}
+
+func schtasksExecutionTimeLimit(interval time.Duration) string {
+	return fmt.Sprintf("PT%dS", scheduledJobTimeOutSeconds(interval))
+}
+
+func cmdQuoteArg(arg string) string {
+	return `"` + strings.ReplaceAll(arg, `"`, `""`) + `"`
+}
+
+func cmdSetAssignment(name, value string) string {
+	value = stripLineBreaks(value)
+	value = strings.ReplaceAll(value, `"`, "")
+	value = strings.ReplaceAll(value, "%", "%%")
+	return fmt.Sprintf("set \"%s=%s\"", stripLineBreaks(name), value)
+}
+
+func encodeUTF16LE(s string) []byte {
+	u := utf16.Encode([]rune(s))
+	buf := make([]byte, 2+len(u)*2)
+	buf[0], buf[1] = 0xFF, 0xFE
+	for i, r := range u {
+		binary.LittleEndian.PutUint16(buf[2+i*2:], r)
+	}
+	return buf
+}
+
+func decodeSchtasksOutput(b []byte) string {
+	if len(b) >= 2 && b[0] == 0xFF && b[1] == 0xFE {
+		u16 := make([]uint16, 0, (len(b)-2)/2)
+		for i := 2; i+1 < len(b); i += 2 {
+			u16 = append(u16, binary.LittleEndian.Uint16(b[i:i+2]))
+		}
+		return string(utf16.Decode(u16))
+	}
+	return string(b)
+}
+
+func schtasksTaskMissing(output string) bool {
+	message := strings.ToLower(output)
+	return strings.Contains(message, "the system cannot find the file specified") ||
+		strings.Contains(message, "cannot find the path specified") ||
+		strings.Contains(message, "does not exist in the system") ||
+		(strings.Contains(message, "the specified task name") && strings.Contains(message, "does not exist"))
+}

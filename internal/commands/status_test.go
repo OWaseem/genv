@@ -83,7 +83,15 @@ func TestStatus_Drift(t *testing.T) {
 }
 
 func TestStatus_NoDriftWhenNoInstalledVersion(t *testing.T) {
-	// Old lock entries without InstalledVersion should not cause drift.
+	// An old lock entry without InstalledVersion must not be reported as
+	// drift: genv has no version to compare, and calling that drift would be
+	// a false alarm on every upgraded host.
+	//
+	// It is also not "unknown" here, because Status is the lock-only view:
+	// with no live inventory there is no evidence either way, and many
+	// managers never record a version for a package they just installed.
+	// "unknown" is reserved for the case where a live inventory positively
+	// contradicts the lock — see status_unknown_test.go (#213).
 	f := &schema.GenvFile{
 		Packages: []schema.Package{{ID: "git", Version: "2.40.*"}},
 	}
@@ -96,8 +104,33 @@ func TestStatus_NoDriftWhenNoInstalledVersion(t *testing.T) {
 	if len(entries) != 1 {
 		t.Fatalf("len = %d, want 1", len(entries))
 	}
+	if entries[0].Kind == StatusDrift {
+		t.Errorf("kind = %q, must not be drift (old lock entries must not drift)", entries[0].Kind)
+	}
 	if entries[0].Kind != StatusOK {
-		t.Errorf("kind = %q, want %q (old lock entries must not drift)", entries[0].Kind, StatusOK)
+		t.Errorf("kind = %q, want %q: no live evidence means no reason to doubt the lock", entries[0].Kind, StatusOK)
+	}
+}
+
+func TestStatusEntry_DisplayVersion(t *testing.T) {
+	cases := []struct {
+		name      string
+		spec      string
+		installed string
+		want      string
+	}{
+		{name: "installed version wins", spec: "", installed: "2.1.259", want: "2.1.259"},
+		{name: "installed version wins over constraint", spec: "2.*", installed: "2.1.259", want: "2.1.259"},
+		{name: "no constraint and unknown install", spec: "", installed: "", want: "*"},
+		{name: "constraint and unknown install", spec: "2.40.*", installed: "", want: "?"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := StatusEntry{SpecVersion: tc.spec, InstalledVersion: tc.installed}.DisplayVersion()
+			if got != tc.want {
+				t.Fatalf("DisplayVersion() = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -142,5 +175,40 @@ func TestStatus_Mixed(t *testing.T) {
 		if got := byID[id]; got != want {
 			t.Errorf("entry %q: kind = %q, want %q", id, got, want)
 		}
+	}
+}
+
+func TestStatus_PresentWhenLiveButUnlocked(t *testing.T) {
+	f := &schema.GenvFile{Packages: []schema.Package{{
+		ID: "cursor", Managers: map[string]string{"winget": "Anysphere.Cursor"},
+	}}}
+	lf := &genvfile.LockFile{}
+	live := map[string]map[string]bool{"winget": {"Anysphere.Cursor": true}}
+	entries := StatusWithLive(f, lf, live)
+	if len(entries) != 1 || entries[0].Kind != StatusPresent {
+		t.Fatalf("got %+v, want present", entries)
+	}
+	if entries[0].Manager != "winget" || entries[0].PkgName != "Anysphere.Cursor" {
+		t.Fatalf("got manager/name %+v", entries[0])
+	}
+}
+
+func TestStatus_MissingWhenNotLive(t *testing.T) {
+	f := &schema.GenvFile{Packages: []schema.Package{{
+		ID: "syncthing", Managers: map[string]string{"winget": "Syncthing.Syncthing"},
+	}}}
+	entries := StatusWithLive(f, &genvfile.LockFile{}, map[string]map[string]bool{"winget": {}})
+	if len(entries) != 1 || entries[0].Kind != StatusMissing {
+		t.Fatalf("got %+v, want missing", entries)
+	}
+}
+
+func TestStatus_NilLive_SameAsStatus(t *testing.T) {
+	f := &schema.GenvFile{Packages: []schema.Package{{ID: "curl"}}}
+	lf := &genvfile.LockFile{}
+	got := StatusWithLive(f, lf, nil)
+	want := Status(f, lf)
+	if len(got) != 1 || got[0].Kind != want[0].Kind {
+		t.Fatalf("nil live = %+v, want %+v", got, want)
 	}
 }

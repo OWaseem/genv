@@ -1,0 +1,10 @@
+# Normalize line endings on checkout so every platform sees identical bytes.
+#
+# Without this, a Windows runner checks text files out with CRLF and
+# `gofmt -l .` reports all 368 Go files as unformatted, which is a false
+# failure that says nothing about formatting. It also makes any other
+# byte-comparing check (diff, grep, checksum) behave differently per platform.
+#
+# eol=lf controls what lands in the working tree; text=auto lets git detect
+# binary files and leave them alone.
+* text=auto eol=lf

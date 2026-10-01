@@ -1,0 +1,271 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/ks1686/genv/schema/v8/genv.json",
+  "title": "genv.json",
+  "description": "genv portable targets manifest - schema version 8",
+  "type": "object",
+  "required": ["schemaVersion", "targets"],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schemaVersion": {
+      "type": "string",
+      "const": "8"
+    },
+    "repo": {
+      "type": "object"
+    },
+    "defaults": {
+      "$ref": "#/$defs/defaultBundle"
+    },
+    "targets": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "enum": ["macos", "windows", "arch", "ubuntu", "wsl-arch", "linux"]
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/targetBundle"
+      }
+    },
+    "packages": {
+      "type": "array",
+      "maxItems": 0
+    },
+    "env": {
+      "type": "null"
+    },
+    "shell": {
+      "type": "null"
+    },
+    "files": {
+      "type": "null"
+    },
+    "services": {
+      "type": "null"
+    },
+    "hooks": {
+      "type": "null"
+    },
+    "updates": {
+      "type": "object"
+    },
+    "adapters": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/adapterDef"
+      }
+    }
+  },
+  "$defs": {
+    "defaultBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "packages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/package"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/envVar"
+          }
+        },
+        "shell": {
+          "type": "object"
+        },
+        "files": {
+          "type": "object"
+        },
+        "services": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/service"
+          }
+        },
+        "hooks": {
+          "type": "object"
+        }
+      }
+    },
+    "targetBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "packages": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/package"
+          }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/envVar"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "shell": {
+          "type": "object"
+        },
+        "files": {
+          "type": "object"
+        },
+        "services": {
+          "type": "object",
+          "additionalProperties": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/service"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "hooks": {
+          "type": "object"
+        }
+      }
+    },
+    "envVar": {
+      "type": "object",
+      "properties": {
+        "value": {
+          "type": "string"
+        },
+        "sensitive": {
+          "type": "boolean"
+        }
+      }
+    },
+    "service": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "start": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "stop": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "restart": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "status": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "brew_formula": {
+          "type": "string"
+        },
+        "launchd": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "plist": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        "systemd": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "unit": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      }
+    },
+    "package": {
+      "type": "object",
+      "required": ["id"],
+      "additionalProperties": false,
+      "not": {
+        "required": ["host"]
+      },
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "version": {
+          "type": "string"
+        },
+        "prefer": {
+          "type": "string"
+        },
+        "managers": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "adapterDef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["list", "install", "remove"],
+      "properties": {
+        "list": {
+          "type": "string",
+          "minLength": 1
+        },
+        "install": {
+          "type": "string",
+          "minLength": 1
+        },
+        "remove": {
+          "type": "string",
+          "minLength": 1
+        },
+        "upgrade": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "outdated": {
+          "type": "string"
+        },
+        "listMatch": {
+          "type": "string"
+        },
+        "idField": {
+          "type": "string"
+        },
+        "versionField": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

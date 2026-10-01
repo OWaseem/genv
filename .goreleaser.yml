@@ -38,18 +38,36 @@ checksum:
 # ── Keyless signing via Sigstore/cosign ────────────────────────────────────────
 # Signs the checksums file using the cosign keyless (OIDC) workflow.
 # Requires: sigstore/cosign-installer step + id-token: write permission in the
-# release workflow. Produces checksums.txt.sig and checksums.txt.pem alongside
-# every release.
+# release workflow. Produces checksums.txt.sigstore.json alongside every release.
 signs:
   - cmd: cosign
+    signature: "${artifact}.sigstore.json"
     args:
       - sign-blob
-      - --yes
-      - --output-certificate=${certificate}
-      - --output-signature=${signature}
+      - --bundle=${signature}
       - ${artifact}
+      - --yes
     artifacts: checksum
     output: true
+
+# ── macOS Developer ID signing + notarization (anchore/quill) ─────────────────
+# Signs and notarizes Darwin binaries on any OS (including ubuntu-latest CI).
+# Enabled only when MACOS_SIGN_P12 is set so local snapshots still work without
+# Apple credentials. See RELEASING.md for one-time cert / API key / secrets setup.
+notarize:
+  macos:
+    - enabled: '{{ isEnvSet "MACOS_SIGN_P12" }}'
+      ids:
+        - genv
+      sign:
+        certificate: "{{ .Env.MACOS_SIGN_P12 }}"
+        password: "{{ .Env.MACOS_SIGN_PASSWORD }}"
+      notarize:
+        issuer_id: "{{ .Env.MACOS_NOTARY_ISSUER_ID }}"
+        key_id: "{{ .Env.MACOS_NOTARY_KEY_ID }}"
+        key: "{{ .Env.MACOS_NOTARY_KEY }}"
+        wait: true
+        timeout: 20m
 
 # ── Homebrew tap ──────────────────────────────────────────────────────────────
 # Publishes a cask to ks1686/homebrew-tap on every non-prerelease tag.
@@ -58,7 +76,7 @@ signs:
 #
 # Install after setup:
 #   brew tap ks1686/tap
-#   brew install genv
+#   brew install --cask genv
 homebrew_casks:
   - name: genv
     repository:
@@ -66,28 +84,46 @@ homebrew_casks:
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     homepage: "https://github.com/ks1686/genv"
-    description: "Track, sync, and reproduce your software environment across Linux, macOS, and WSL2."
+    description: "Track, sync, and reproduce your software environment across Linux, macOS, Windows, and WSL2."
     license: MIT
     skip_upload: auto  # skips pre-releases automatically
+    # PreferStable makes a Caskroom reload unnecessary: modern
+    # `genv updates start` registers a PATH-stable brew prefix bin path,
+    # so launchd does not pin a versioned Caskroom binary. GoReleaser's
+    # homebrew_casks.hooks.post.install always renders as a legacy Ruby
+    # `postflight do` block; there is no field that emits postflight_steps
+    # yet. Caveats below cover agents registered before PreferStable.
+    caveats: |
+      If you use the hourly updates LaunchAgent and it was registered
+      before PATH-stable paths (or `genv updates status` hints a missing
+      executable), run `genv updates start` after upgrading.
 
-# ── Snap Store ────────────────────────────────────────────────────────────────
-# Publishes a snap to the Snap Store on every non-prerelease tag.
-# Requires secret: SNAPCRAFT_STORE_CREDENTIALS
+# ── Scoop bucket ──────────────────────────────────────────────────────────────
+# Publishes a manifest to ks1686/scoop-bucket on every non-prerelease tag
+# Empty or unset SCOOP_BUCKET_GITHUB_TOKEN → skip upload so the
+# rest of the release (GitHub and Homebrew) still succeeds.
+# Requires secret: SCOOP_BUCKET_GITHUB_TOKEN (fine-grained PAT with
+# Contents: read+write on the scoop-bucket repo).
+#
+# Manifests stay at the bucket root (do not set directory) so
+# `scoop install genv` can find them.
 #
 # Install after setup:
-#   snap install genv
-snapcrafts:
+#   scoop bucket add ks1686 https://github.com/ks1686/scoop-bucket
+#   scoop install genv
+#
+# winget and Chocolatey publishers are GoReleaser Pro-only; do not declare
+# them here or OSS goreleaser check / CI fails to parse the config.
+scoops:
   - name: genv
-    summary: "Declarative package and environment manager for Linux, macOS, and WSL2."
-    description: "genv is a command-line tool to track, sync, and reproduce your software environment across Linux, macOS, and WSL2. It helps you manage packages, environment variables, and shell configuration declaratively."
+    repository:
+      owner: ks1686
+      name: scoop-bucket
+      token: "{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}"
+    homepage: "https://github.com/ks1686/genv"
+    description: "Track, sync, and reproduce your software environment across Linux, macOS, Windows, and WSL2."
     license: MIT
-    grade: stable
-    confinement: strict
-    channel_templates:
-      - stable
-    publish: true
-
-
+    skip_upload: '{{ if isEnvSet "SCOOP_BUCKET_GITHUB_TOKEN" }}{{ if .Env.SCOOP_BUCKET_GITHUB_TOKEN }}auto{{ else }}true{{ end }}{{ else }}true{{ end }}'
 
 changelog:
   sort: asc

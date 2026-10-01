@@ -5,23 +5,23 @@
 # Requires: AUR_KEY env var containing the SSH private key.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aur-common.sh
+source "${SCRIPT_DIR}/aur-common.sh"
+
 VERSION="$1"
 PKGBASE="genv"
 REPO="https://github.com/ks1686/genv"
 
 # ── Fetch source tarball and compute sha256sum ─────────────────────────────────
 curl -fsSL "${REPO}/archive/refs/tags/v${VERSION}.tar.gz" -o /tmp/genv-src.tar.gz
-SHA256SRC=$(sha256sum /tmp/genv-src.tar.gz | awk '{print $1}')
+SHA256SRC=$(aur_sha256_file /tmp/genv-src.tar.gz)
 
 # ── SSH setup ─────────────────────────────────────────────────────────────────
-mkdir -p ~/.ssh
-printf '%s\n' "${AUR_KEY}" > ~/.ssh/aur
-chmod 600 ~/.ssh/aur
-ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
-export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur -o StrictHostKeyChecking=yes"
+aur_setup_ssh
 
 # ── Clone AUR repo ────────────────────────────────────────────────────────────
-git clone "ssh://aur@aur.archlinux.org/${PKGBASE}.git" /tmp/aur-src-pkg
+aur_clone "${PKGBASE}" /tmp/aur-src-pkg
 cd /tmp/aur-src-pkg
 
 # ── Generate PKGBUILD ─────────────────────────────────────────────────────────
@@ -56,7 +56,7 @@ package() {
 }
 PKGEOF
 
-sed -i \
+aur_sed_inplace \
   -e "s/__PKGBASE__/${PKGBASE}/g" \
   -e "s/__VERSION__/${VERSION}/g" \
   -e "s/__SHA256SRC__/${SHA256SRC}/g" \
@@ -87,4 +87,4 @@ git config user.name  "ks1686"
 git config user.email "ks1686@users.noreply.github.com"
 git add PKGBUILD .SRCINFO
 git diff --cached --quiet || git commit -m "Update to ${VERSION}"
-git push origin master
+aur_push

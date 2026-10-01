@@ -5,19 +5,24 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/ks1686/genv/internal/schema"
+	"github.com/ks1686/genv/internal/testutil"
 )
 
 func TestNew(t *testing.T) {
 	f := New()
-	if f.SchemaVersion != schema.Version {
-		t.Errorf("SchemaVersion = %q, want %q", f.SchemaVersion, schema.Version)
+	if f.SchemaVersion != schema.Version8 {
+		t.Errorf("SchemaVersion = %q, want %q", f.SchemaVersion, schema.Version8)
 	}
-	if f.Packages == nil {
-		t.Error("Packages must be non-nil to marshal as [] not null")
+	if f.Defaults == nil {
+		t.Error("Defaults must be non-nil")
+	}
+	if len(f.Targets) != len(schema.KnownTargets) {
+		t.Errorf("Targets = %d, want %d known targets", len(f.Targets), len(schema.KnownTargets))
 	}
 }
 
@@ -50,6 +55,7 @@ func TestWriteAndRead_Roundtrip(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("Read returned nil")
+		return
 	}
 
 	if got.SchemaVersion != original.SchemaVersion {
@@ -77,6 +83,41 @@ func TestWriteAndRead_Roundtrip(t *testing.T) {
 				t.Errorf("Packages[%d].Managers[%q]: got %q, want %q", i, k, p.Managers[k], wantV)
 			}
 		}
+	}
+}
+
+func TestWrite_V8OmitsEmptyLegacyTopLevelFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "genv.json")
+
+	original := &schema.GenvFile{
+		SchemaVersion: schema.Version8,
+		Targets: map[string]*schema.TargetBundle{
+			"arch": {},
+		},
+	}
+	if err := Write(path, original); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	for _, forbidden := range []string{
+		`"packages": null`,
+		`"env": null`,
+		`"shell": null`,
+		`"files": null`,
+		`"services": null`,
+		`"hooks": null`,
+	} {
+		if strings.Contains(string(data), forbidden) {
+			t.Fatalf("v8 write emitted %s:\n%s", forbidden, data)
+		}
+	}
+	if strings.Contains(string(data), `"packages"`) {
+		t.Fatalf("v8 write emitted empty top-level packages:\n%s", data)
 	}
 }
 
@@ -113,8 +154,9 @@ func TestReadOrNew_CreatesNew(t *testing.T) {
 	}
 	if f == nil {
 		t.Fatal("expected non-nil GenvFile")
+		return
 	}
-	if f.SchemaVersion != schema.Version {
+	if f.SchemaVersion != schema.Version8 {
 		t.Errorf("SchemaVersion = %q", f.SchemaVersion)
 	}
 }
@@ -177,6 +219,9 @@ func TestRead_SyntaxError(t *testing.T) {
 }
 
 func TestRead_PermissionError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("chmod 0200 does not deny the file owner on Windows")
+	}
 	// Write a valid file then remove all permissions so os.ReadFile returns a
 	// permission-denied error, which is neither ErrNotFound nor ErrInvalidFile.
 	dir := t.TempDir()
@@ -260,6 +305,7 @@ func TestWrite_OverwritesExistingFile(t *testing.T) {
 	}
 	if got == nil {
 		t.Fatal("Read returned nil")
+		return
 	}
 	if len(got.Packages) != 1 || got.Packages[0].ID != "git" {
 		t.Errorf("expected 1 package 'git' after overwrite, got: %+v", got.Packages)
@@ -267,24 +313,76 @@ func TestWrite_OverwritesExistingFile(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// LockPathFrom — pure function
+// LockPathFrom — lock lives next to the spec (absolute).
 // ---------------------------------------------------------------------------
 
 func TestLockPathFrom(t *testing.T) {
-	tests := []struct {
-		specPath string
-		want     string
-	}{
-		{"genv.json", "genv.lock.json"},
-		{"/home/user/.config/genv/genv.json", "/home/user/.config/genv/genv.lock.json"},
-		{"custom.json", "custom.lock.json"},
-		{"/tmp/env.json", "/tmp/env.lock.json"},
+	t.Setenv("XDG_CONFIG_HOME", filepath.FromSlash("/custom/config"))
+	spec := filepath.FromSlash("/tmp/repo/genv.json")
+	got := filepath.Clean(LockPathFrom(spec))
+	absSpec, err := filepath.Abs(spec)
+	if err != nil {
+		t.Fatal(err)
 	}
-	for _, tc := range tests {
-		got := LockPathFrom(tc.specPath)
-		if got != tc.want {
-			t.Errorf("LockPathFrom(%q) = %q, want %q", tc.specPath, got, tc.want)
-		}
+	want := filepath.Clean(filepath.Join(filepath.Dir(absSpec), "genv.lock.json"))
+	if got != want {
+		t.Errorf("LockPathFrom(spec) = %q, want lock next to spec %q", got, want)
+	}
+}
+
+func TestLockPathFrom_EmptySpecUsesDefaultDir(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", filepath.FromSlash("/custom/config"))
+	got := LockPathFrom("")
+	want := filepath.Join(filepath.FromSlash("/custom/config"), "genv", "genv.lock.json")
+	if got != want {
+		t.Errorf("LockPathFrom(\"\") = %q, want %q", got, want)
+	}
+}
+
+func TestLockPathFrom_FallsBackToHomeConfig(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", "")
+	home := filepath.FromSlash("/home/testuser")
+	testutil.SetHome(t, home)
+	got := LockPathFrom("")
+	want := filepath.Join(home, ".config", "genv", "genv.lock.json")
+	if got != want {
+		t.Errorf("LockPathFrom fallback = %q, want %q", got, want)
+	}
+}
+
+func TestResolveStateDir(t *testing.T) {
+	spec := filepath.Join(t.TempDir(), "nested", "genv.json")
+	got, err := ResolveStateDir(spec, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != filepath.Dir(spec) {
+		t.Fatalf("ResolveStateDir(spec) = %q, want %q", got, filepath.Dir(spec))
+	}
+	override := t.TempDir()
+	got, err = ResolveStateDir(spec, override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absOverride, err := filepath.Abs(override)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != absOverride {
+		t.Fatalf("ResolveStateDir(spec, override) = %q, want %q", got, absOverride)
+	}
+}
+
+func TestWithinDir(t *testing.T) {
+	dir := t.TempDir()
+	if !WithinDir(dir, filepath.Join(dir, "env.sh")) {
+		t.Fatal("expected env.sh inside dir")
+	}
+	if !WithinDir(dir, dir) {
+		t.Fatal("expected dir to contain itself")
+	}
+	if WithinDir(dir, filepath.Join(dir, "..", "outside")) {
+		t.Fatal("parent path must not be inside dir")
 	}
 }
 
@@ -293,13 +391,14 @@ func TestLockPathFrom(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestDefaultDir_UsesXDG(t *testing.T) {
-	t.Setenv("XDG_CONFIG_HOME", "/custom/config")
+	xdg := filepath.FromSlash("/custom/config")
+	t.Setenv("XDG_CONFIG_HOME", xdg)
 	dir, err := DefaultDir()
 	if err != nil {
 		t.Fatalf("DefaultDir: %v", err)
 	}
-	if !strings.HasPrefix(dir, "/custom/config") {
-		t.Errorf("DefaultDir with XDG_CONFIG_HOME: got %q, expected prefix /custom/config", dir)
+	if !strings.HasPrefix(dir, xdg) {
+		t.Errorf("DefaultDir with XDG_CONFIG_HOME: got %q, expected prefix %s", dir, xdg)
 	}
 }
 
@@ -339,6 +438,7 @@ func TestReadLock_MissingFile_ReturnsEmpty(t *testing.T) {
 	}
 	if lf == nil {
 		t.Fatal("ReadLock on missing file: expected non-nil LockFile")
+		return
 	}
 	if lf.SchemaVersion != schema.Version {
 		t.Errorf("SchemaVersion: got %q, want %q", lf.SchemaVersion, schema.Version)
@@ -354,6 +454,8 @@ func TestReadLock_ValidFile_RoundTrip(t *testing.T) {
 
 	original := &LockFile{
 		SchemaVersion: schema.Version,
+		Target:        "arch",
+		GOOS:          "linux",
 		Packages: []LockedPackage{
 			{ID: "git", Manager: "brew", PkgName: "git", InstalledVersion: "2.43.0"},
 			{ID: "neovim", Manager: "paru", PkgName: "neovim"},
@@ -372,6 +474,12 @@ func TestReadLock_ValidFile_RoundTrip(t *testing.T) {
 	}
 	if got.Packages[0].ID != "git" {
 		t.Errorf("Packages[0].ID: got %q, want \"git\"", got.Packages[0].ID)
+	}
+	if got.Target != "arch" {
+		t.Errorf("Target: got %q, want \"arch\"", got.Target)
+	}
+	if got.GOOS != "linux" {
+		t.Errorf("GOOS: got %q, want \"linux\"", got.GOOS)
 	}
 	if got.Packages[0].InstalledVersion != "2.43.0" {
 		t.Errorf("InstalledVersion: got %q, want \"2.43.0\"", got.Packages[0].InstalledVersion)
@@ -454,6 +562,41 @@ func TestWriteLock_ProducesValidJSON(t *testing.T) {
 	}
 }
 
+func TestWriteLock_ContentHash_OmitEmptyAndRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "genv.lock.json")
+	lf := &LockFile{
+		SchemaVersion: schema.Version,
+		Files: []LockedFile{
+			{Source: "a", Target: "b", Mode: "managed-link", ContentHash: "sha256:abc"},
+			{Source: "c", Target: "d", Mode: "link"},
+		},
+	}
+	if err := WriteLock(path, lf); err != nil {
+		t.Fatalf("WriteLock: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if !strings.Contains(string(data), `"contentHash": "sha256:abc"`) {
+		t.Fatalf("expected contentHash in lock JSON:\n%s", data)
+	}
+	got, err := ReadLock(path)
+	if err != nil {
+		t.Fatalf("ReadLock: %v", err)
+	}
+	if got.Files[0].ContentHash != "sha256:abc" {
+		t.Fatalf("Files[0].ContentHash = %q", got.Files[0].ContentHash)
+	}
+	if got.Files[1].ContentHash != "" {
+		t.Fatalf("empty ContentHash should omit; got %q", got.Files[1].ContentHash)
+	}
+	if strings.Count(string(data), "contentHash") != 1 {
+		t.Fatalf("contentHash should be omitted when empty:\n%s", data)
+	}
+}
+
 func TestWriteLock_InstalledVersion_OmitEmpty(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "genv.lock.json")
@@ -475,15 +618,62 @@ func TestWriteLock_InstalledVersion_OmitEmpty(t *testing.T) {
 	}
 }
 
-// TestNew_PackagesNonNil verifies that New() initialises Packages as a non-nil
-// empty slice so that it marshals as "[]" rather than "null".
-func TestNew_PackagesNonNil(t *testing.T) {
-	f := New()
-	if f.Packages == nil {
-		t.Error("New().Packages must be non-nil to serialize as []")
+func TestWriteLock_Mode0600(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits are not POSIX on Windows")
 	}
-	if len(f.Packages) != 0 {
-		t.Errorf("New().Packages should be empty, got %d entries", len(f.Packages))
+	dir := t.TempDir()
+	path := filepath.Join(dir, "genv.lock.json")
+	lf := &LockFile{SchemaVersion: schema.Version, Packages: []LockedPackage{}}
+	if err := WriteLock(path, lf); err != nil {
+		t.Fatalf("WriteLock: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("lock mode = %o, want 0600", got)
+	}
+}
+
+func TestWritePrivate_Mode0600(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits are not POSIX on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nested", "secret")
+	if err := WritePrivate(path, []byte("ok\n")); err != nil {
+		t.Fatalf("WritePrivate: %v", err)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	if string(got) != "ok\n" {
+		t.Fatalf("content = %q, want %q", got, "ok\n")
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("mode = %o, want 0600", perm)
+	}
+}
+
+func TestNew_WritesValidV8(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "genv.json")
+	if err := Write(path, New()); err != nil {
+		t.Fatalf("Write New(): %v", err)
+	}
+	got, err := Read(path)
+	if err != nil {
+		t.Fatalf("Read: %v", err)
+	}
+	if got.SchemaVersion != schema.Version8 {
+		t.Fatalf("schemaVersion = %q", got.SchemaVersion)
 	}
 }
 
@@ -518,5 +708,43 @@ func TestWrite_ProducesValidJSON(t *testing.T) {
 	}
 	if got.Packages[0].Managers["snap"] != "firefox" {
 		t.Errorf("managers roundtrip: got %v", got.Packages[0].Managers)
+	}
+}
+
+func TestWrite_RejectsInvalidSchemaContent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "genv.json")
+
+	f := &schema.GenvFile{
+		SchemaVersion: schema.Version4,
+		Packages:      []schema.Package{},
+		Services: map[string]schema.Service{
+			"bad\nname": {Start: []string{"echo", "ok"}},
+		},
+	}
+
+	err := Write(path, f)
+	if err == nil {
+		t.Fatal("expected Write to reject invalid content")
+	}
+	if !errors.Is(err, ErrInvalidFile) {
+		t.Fatalf("expected ErrInvalidFile, got: %v", err)
+	}
+}
+
+func TestDefaultDir_HomeDirError(t *testing.T) {
+	// First ensure XDG_CONFIG_HOME is unset
+	t.Setenv("XDG_CONFIG_HOME", "")
+
+	t.Setenv("HOME", "")
+	t.Setenv("USERPROFILE", "")
+	t.Setenv("HOMEDRIVE", "")
+	t.Setenv("HOMEPATH", "")
+
+	_, err := DefaultDir()
+	if err == nil {
+		t.Error("DefaultDir: expected error when home directory cannot be determined, got nil")
+	} else if !strings.Contains(err.Error(), "cannot determine home directory") {
+		t.Errorf("DefaultDir: expected error to mention 'cannot determine home directory', got %v", err)
 	}
 }

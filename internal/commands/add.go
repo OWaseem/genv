@@ -18,24 +18,39 @@ var ErrAlreadyTracked = errors.New("package already tracked")
 //   - managers may be nil; each key must be a known manager name.
 //
 // Returns ErrAlreadyTracked if the ID is already present.
-func Add(f *schema.GenvFile, id, version, prefer string, managers map[string]string) error {
+func Add(f *schema.GenvFile, id, version, prefer string, managers map[string]string, targetID string) error {
 	if id == "" {
 		return fmt.Errorf("package id must not be empty")
 	}
+	if !schema.ValidPackageName(id) {
+		return fmt.Errorf("invalid package id %q: must not start with '-' or contain whitespace", id)
+	}
 
-	for _, p := range f.Packages {
+	packages := &f.Packages
+	if schema.IsPortableVersion(f.SchemaVersion) {
+		targetPackages, err := activePackageSlice(f, targetID)
+		if err != nil {
+			return err
+		}
+		packages = targetPackages
+	}
+
+	for _, p := range *packages {
 		if p.ID == id {
 			return fmt.Errorf("%w: %q (use 'genv remove %s' first to re-add it)", ErrAlreadyTracked, id, id)
 		}
 	}
 
-	if prefer != "" && !schema.KnownManagers[prefer] {
-		return fmt.Errorf("unknown manager %q for --prefer; valid managers: %s", prefer, KnownManagerList())
+	if prefer != "" && !schema.KnownManager(f, prefer) {
+		return fmt.Errorf("unknown manager %q for --prefer; valid managers: %s", prefer, KnownManagerListFor(f))
 	}
 
-	for mgr := range managers {
-		if !schema.KnownManagers[mgr] {
-			return fmt.Errorf("unknown manager %q in --manager; valid managers: %s", mgr, KnownManagerList())
+	for mgr, pkgName := range managers {
+		if !schema.KnownManager(f, mgr) {
+			return fmt.Errorf("unknown manager %q in --manager; valid managers: %s", mgr, KnownManagerListFor(f))
+		}
+		if !schema.ValidPackageName(pkgName) {
+			return fmt.Errorf("invalid package name %q for manager %q: must not be empty, start with '-', or contain whitespace", pkgName, mgr)
 		}
 	}
 
@@ -46,6 +61,6 @@ func Add(f *schema.GenvFile, id, version, prefer string, managers map[string]str
 		Managers: managers, // nil is safe: omitempty omits nil and empty maps
 	}
 
-	f.Packages = append(f.Packages, pkg)
+	*packages = append(*packages, pkg)
 	return nil
 }

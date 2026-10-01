@@ -1,6 +1,8 @@
 # Roadmap and Implementation Checklist
 
-This document is the public source of truth for delivery milestones, scope, and acceptance criteria.
+This document is the **historical** delivery checklist for milestones through v3.0.0, plus release notes for later tags. For current product docs, start at [README.md](README.md) and [CHANGELOG.md](CHANGELOG.md).
+
+**Shipped:** [v4.0.0](https://github.com/ks1686/genv/releases/tag/v4.0.0) — schema v7 PowerShell parity and schema v8 portable multi-target configs (`defaults` / `targets`, migrate/export/map, foreign-lock gate). New major work should land as issues/proposals before becoming committed milestones.
 
 ## Status Legend
 
@@ -50,7 +52,7 @@ Target outcomes:
 Checklist:
 
 - [x] Build adapter interface: detect, query, plan install, plan uninstall, plan cache clean, and normalize package IDs.
-- [x] Implement Linux adapters: `apt`, `dnf`, `pacman`, `paru`, `yay`, `flatpak`, `snap`.
+- [x] Implement Linux adapters: `apt`, `dnf`, `pacman`, `paru`, `yay`, `snap`. (`flatpak` was planned historically and is not shipped.)
 - [x] Implement macOS adapters: `brew` (formulae and casks).
 - [x] Implement Linuxbrew path support where available.
 - [x] Implement host manager detection and capability reporting.
@@ -162,18 +164,18 @@ Checklist:
 
 - [x] Add `version` field to the `--json` output envelope so consumers can detect schema changes.
 - [x] Define and document the formal deprecation policy (major version for breaking changes).
-- [x] Achieve ≥80% unit test line coverage across all internal packages.
+- [x] Report statement coverage in CI and enforce a regression floor (`COVER_MIN`, default 80% total).
 - [x] Add property-based / fuzz tests for version constraint logic and the resolver.
 - [x] Add end-to-end smoke tests that run `genv apply` against real package managers in CI.
-- [x] Benchmark resolver + manager detection; enforce a <200ms cold-start budget in CI.
+- [x] Benchmark resolver + manager detection; enforce a cold-start budget in CI (`make bench-gate`, `BENCH_MAX_MS`; local default 200ms, CI uses a higher shared-runner budget).
 - [x] Security review: audit every adapter's shell invocations for injection vectors.
 
 Acceptance criteria:
 
 - [x] `--json` output includes a `"version"` field and the schema is documented.
-- [x] All internal packages reach ≥80% line coverage as reported by `go test -cover`.
-- [x] CI enforces the cold-start budget via a benchmark gate.
-- [x] No known shell-injection vectors in any adapter after the audit.
+- [x] CI fails when total statement coverage drops below the documented floor (`COVER_MIN`, default 80).
+- [x] CI enforces the cold-start budget via a benchmark gate (`BENCH_MAX_MS`).
+- [x] No known shell-injection vectors in adapter argv construction after the audit.
 
 ## Milestone M7 - Developer and User Experience
 
@@ -272,11 +274,11 @@ Target outcomes:
 
 Checklist:
 
-- [x] Implement Linux adapter: `zypper` (openSUSE / SLES).
-- [x] Implement Linux adapter: `xbps` (Void Linux).
-- [x] Implement Linux adapter: `emerge` (Gentoo).
+- [ ] Implement Linux adapter: `zypper` (openSUSE / SLES). Historical checklist item — not in `KnownManagers`.
+- [ ] Implement Linux adapter: `xbps` (Void Linux). Historical checklist item — not in `KnownManagers`.
+- [ ] Implement Linux adapter: `emerge` (Gentoo). Historical checklist item — not in `KnownManagers`.
 - [x] Publish genv as `.deb` and `.rpm` release artifacts via GoReleaser `nfpms` (covers apt, dnf, and zypper direct-install).
-- [x] Publish genv to the Snap Store (`snapcraft.yaml` + GoReleaser snapcraft section).
+- [x] Publish genv to the Snap Store (historical; withdrawn because strict confinement prevents host package and configuration management).
 - [x] Extend `genv.json` schema to accept a `services` block with per-service `start`, `stop`, and optional `restart` commands.
 - [x] Implement `genv service add <name> --start <cmd> [--stop <cmd>]` and `genv service remove <name>`.
 - [x] Implement `genv service start <name>`, `genv service stop <name>`, and `genv service status <name>`.
@@ -307,23 +309,25 @@ Target outcomes:
 
 Checklist:
 
-- [ ] Implement `genv updates start` and `genv updates stop` to manage the daemon lifecycle (using the M10 service layer where possible).
-- [ ] Add an `updates` block to `genv.json` with `enabled`, `interval`, and `autoApply` fields.
-- [ ] Implement daemon logic: on each tick, call `genv upgrade --dry-run` per package, collect candidates, then either apply or log a notification.
-- [ ] Respect pinned version constraints in the lock file — never upgrade a package beyond its constraint.
-- [ ] Add structured logging to a genv-managed log file (`~/.config/genv/updates.log`) with rotation.
-- [ ] Implement desktop notification support (via `notify-send` on Linux, `osascript` on macOS) when updates are available but `autoApply` is false.
-- [ ] Add unit and integration tests for daemon configuration parsing and update-candidate selection.
+- [x] Implement `genv updates check`, `genv updates start`, `genv updates stop`, and `genv updates status`.
+- [x] Add an `updates` block to `genv.json` with `enabled`, `interval`, `autoApply`, `notify`, and tracked-only filter fields.
+- [x] Implement managed checker logic: on each interval, reuse the shared tracked-only upgrade planner, then either apply or log/notify depending on `autoApply`.
+- [x] Preserve genv's tracked-only model: untracked packages are never checked or upgraded.
+- [x] Add structured logging to `~/.config/genv/updates.log` with rotation.
+- [x] Implement desktop notification support (via `notify-send` on Linux, `osascript` on macOS) when updates are available but `autoApply` is false.
+- [x] Add unit and integration tests for updates configuration parsing and update-candidate selection.
 
 Acceptance criteria:
 
-- [ ] With `autoApply: true`, packages are upgraded automatically when a new version is available within the declared constraint.
-- [ ] With `autoApply: false`, a desktop notification is sent and the update is recorded in the log without being applied.
-- [ ] The daemon survives restarts gracefully and does not duplicate notifications.
+- [x] With `autoApply: true`, genv applies the tracked upgrade plan on schedule.
+- [x] With `autoApply: false`, available tracked updates are recorded in the log and reported through best-effort notification.
+- [x] The managed checker can be started, stopped, and inspected without duplicating scheduler registrations.
 
 ## Milestone M12 - Named Profiles
 
 Goal: Allow users to declare multiple named environment profiles in a single repository and switch between them, enabling distinct configurations for different contexts (e.g. work, personal, server, laptop).
+
+Note: the record-level `host:` filter shipped as part of the `tc-genv-migration` work (see Migration Surface below) is additive and non-conflicting with M12 named profiles. It does not implement full profiles, but it covers the macOS/Arch/WSL2 host divergence that M12 is intended to address more generally.
 
 Target outcomes:
 
@@ -333,23 +337,24 @@ Target outcomes:
 
 Checklist:
 
-- [ ] Define a profile schema: a `profiles/` directory of named `<profile>.json` files that extend a root `genv.json` base.
-- [ ] Implement `genv profile switch <name>` — compute the diff between the current active profile and the target, then apply it.
-- [ ] Implement `genv profile list` — list available profiles and mark the active one.
-- [ ] Implement `genv profile create <name>` — scaffold a new profile file from the current environment.
-- [ ] Track the active profile name in `genv.lock.json`.
-- [ ] Implement inheritance: packages, env vars, and shell aliases declared in the base are always included; profiles add on top.
-- [ ] Add `genv status` awareness: report the active profile and flag drift between the profile and the live system.
-- [ ] Add unit and integration tests for profile switching, inheritance, and lock tracking.
+- [x] Define a profile layout: `profiles/<name>.json` next to the root `genv.json`, with the root spec acting as the base profile.
+- [x] Implement `genv profile switch <name>` — merge the named profile over the base and reconcile the result.
+- [x] Implement `genv profile list` — list available profiles and mark the active one.
+- [x] Implement `genv profile create <name>` — scaffold a new empty profile file.
+- [x] Track the active profile name in `genv.lock.json`.
+- [x] Implement inheritance: packages, env vars, shell config, services, files, hooks, repo, and updates are merged from base plus profile.
+- [x] Add unit and integration tests for profile switching, inheritance, and lock tracking.
 
 Acceptance criteria:
 
-- [ ] `genv profile switch work` installs packages only in the `work` profile and removes packages exclusive to the previous profile.
-- [ ] `genv profile switch home` correctly reverts to the `home` profile state.
-- [ ] Base-profile packages are never removed during a profile switch.
-- [ ] `genv status` reports the active profile name alongside the drift summary.
+- [x] `genv profile switch work` applies the merged base+work profile.
+- [x] `genv profile switch home` records and applies the home profile state.
+- [x] Base-profile entries remain part of the merged spec during profile switches.
+- [x] `genv profile list` reports the active profile from the lock file.
 
 ## Milestone M13 - Hooks and Lifecycle Scripts
+
+Status: complete in the v3.0.0 line. The earlier `tc-genv-migration` subset shipped the first three hook phases; schema v6 expands lifecycle hooks to apply/add/remove/upgrade, supports script-file hooks, adds hook context environment, and wires skip/timeout controls into the user-facing commands.
 
 Goal: Allow users to declare shell hooks that run before or after specific genv lifecycle events, enabling custom bootstrapping, notifications, and integration with external tools.
 
@@ -361,21 +366,40 @@ Target outcomes:
 
 Checklist:
 
-- [ ] Extend `genv.json` schema to accept a `hooks` block mapping event names to shell command strings.
-- [ ] Implement hook execution in the apply, add, remove, and upgrade command paths.
-- [ ] Pass event context to hooks via environment variables (e.g. `GENV_EVENT`, `GENV_INSTALLED`, `GENV_REMOVED`).
-- [ ] Define and enforce a timeout for hook execution; surface timeout errors clearly.
-- [ ] Implement `--no-hooks` flag on apply and related commands to skip hook execution.
-- [ ] Support both inline commands and script file references (`file: ~/.config/genv/hooks/post-apply.sh`).
-- [ ] Add unit tests for hook parsing, execution ordering, and error propagation.
-- [ ] Document hook security implications: hooks run as the current user with full shell access; warn in docs.
+- [x] Extend `genv.json` schema to accept lifecycle hook arrays for apply, add, remove, and upgrade.
+- [x] Implement hook execution in the apply, add, remove, and upgrade command paths.
+- [x] Pass event context to hooks via environment variables including `GENV_EVENT`, `GENV_INSTALLED`, `GENV_REMOVED`, `GENV_UPGRADED`, `GENV_FAILED`, and `GENV_SKIPPED`.
+- [x] Define and enforce hook timeouts; surface timeout errors clearly.
+- [x] Implement `--no-hooks` flags on apply/add/remove/upgrade to skip hook execution.
+- [x] Support both inline commands and script file references (`file: ~/.config/genv/hooks/post-apply.sh`).
+- [x] Add unit tests for hook parsing, execution ordering, and error propagation.
+- [x] Document hook security implications in README and schema docs.
 
 Acceptance criteria:
 
-- [ ] A `post.apply` hook declared in `genv.json` runs after every successful `genv apply`, with `GENV_INSTALLED` set to the list of installed package IDs.
-- [ ] A failing hook exits the command with a non-zero code and prints the hook's stderr output.
-- [ ] `genv apply --no-hooks` skips hook execution and exits 0 if the apply itself succeeded.
-- [ ] Hook timeouts are enforced and reported clearly.
+- [x] A `postApply` hook declared in `genv.json` runs after every successful `genv apply`, with deterministic context environment.
+- [x] A failing hook exits the command with a non-zero code and prints the hook's stderr output.
+- [x] `genv apply --no-hooks` skips hook execution and exits 0 if the apply itself succeeded.
+- [x] Hook timeouts are enforced and reported clearly.
+
+## Migration Surface (tc-genv-migration)
+
+This release ships the surface needed to move `~/terminal-config` from shell scripts into a declarative `genv.json` v5 spec.
+
+- **Schema v5** (`internal/schema/schema.go`):
+  - `files` block with `link`, `copy`, `copy-template`, and `managed-link` modes
+  - `hooks` block with `pre.upgrade`, `post.apply`, and `post.upgrade` phases
+  - `host` selector on packages, services, files, and hooks
+  - `repo` field for the local spec-repo path consumed by `genv pull`
+  - `template` flag and `backup` flag on file targets
+- **Adapters**: `pacman` (official repos only), `bun` (global installs only), `uv` (global tool installs only)
+- **Commands**:
+  - `genv pull` — self-pull the spec repo declared in the `repo` field, refusing on a dirty tree
+  - `genv adopt --files` — register already-managed files into the lock without rewriting them
+  - `genv status --files` — live filesystem parity check for the `files` block
+- **Host / target filter (historical note)**: early releases detected `macos` / `arch` / `wsl2` with WSL→arch inherit. As of v4.0.0, classification returns `macos` / `windows` / `arch` / `ubuntu` / `wsl-arch`, and schema v8 uses `targets.*` instead of per-record `host`.
+- **Hooks executor**: `internal/hooks` runs declared shell command strings, filters by host, propagates non-zero exits, and honors `GENV_NO_INTERACTIVE=1`
+- **Lock file outside repo**: default lock path is `~/.config/genv/genv.lock.json` from `genvfile.DefaultDir`, not derived from the spec path; overridable via `--lock-file`
 
 ## Cross-Cutting Quality Gates
 
@@ -385,7 +409,7 @@ These gates apply to every milestone.
 - [x] Add tests for every new command or resolver rule.
 - [x] Keep dry-run output human-readable and stable for CI snapshots.
 - [x] Ensure commands are non-destructive unless explicitly requested.
-- [x] Keep WSL2 behavior explicitly Linux-only (no native Windows installer scope creep).
+- [x] ~~Keep WSL2 behavior explicitly Linux-only (no native Windows installer scope creep).~~ **Superseded by v2.3.0:** native Windows is now a first-class host. WSL2 still uses Linux adapters with no Windows path leakage, but genv additionally ships a `windows` host class and `winget`/`scoop`/`choco` adapters, so "no native Windows" is no longer a project constraint.
 
 ## Release Plan
 
@@ -394,15 +418,25 @@ These gates apply to every milestone.
 - [x] v0.2.0 — M3–M5 complete and validated, with cross-platform support, reproducibility, and reliability improvements
 - [x] v1.0.0 — M6 and M7 complete; stable API and behavior guarantees, with a formal deprecation policy
 - [x] v2.0.0 — M8 and M9 complete; full environment reproducibility: packages, global shell variables, and basic shell configuration managed as a single declarative spec
-- [x] v2.1.0 — M10 complete; services management, new adapters (zypper/xbps/emerge), Snap packaging
-- [ ] v2.2.0 — M13 complete; hooks and lifecycle scripts for custom bootstrapping and integration
-- [ ] v2.3.0 — M12 complete; named profiles for context-switching between work, personal, and server environments
-- [ ] v3.0.0 — M11 complete + first-party Windows support via native Windows package managers (e.g. Chocolatey, Scoop) and WSL2 improvements
-- [ ] v4.0.0 — potential major release with support for language-specific package managers (e.g. npm, pip, cargo) and/or a plugin system for custom adapters
+- [x] v2.1.0 — M10 complete; services management, new adapters (zypper/xbps/emerge), historical Snap packaging (later withdrawn)
+- [x] v2.2.0 — scoped M13 surface shipped: schema v5 `files`, `hooks`, host selectors, repo metadata, and `pull`/`status --files`/`adopt --files` commands
+- [x] v2.3.0 — native Windows support shipped ahead of the original v3.0.0 milestone: `windows` host classification, `winget`/`scoop`/`choco` adapters, and `merge-dir` file links
+- [x] v3.0.0 — M11 updates checker, M12 named profiles, M13 lifecycle hooks, upgrade JSON/filtering, and tracked-only ecosystem adapters complete.
+- [x] v3.2.x — outdated-aware `genv upgrade` / `updates check`
+- [x] v4.0.0 — schema v7 PowerShell parity; schema v8 portable targets (`defaults` / `targets.*`), migrate/export/map, foreign-lock refusal
+
+## Future Ideas
+
+The committed milestone backlog through v3.0.0 is closed; v4.0.0 shipped portability as the next major line. Further major work should start as an issue or proposal before becoming a committed milestone.
+
+Possible non-committed ideas:
+
+- Additional ecosystem adapters where the upstream tool has safe per-item lifecycle commands.
+- Optional richer profile composition rules beyond base-plus-one-profile merging.
+- More notification backends for the managed updates checker.
 
 ## How to Contribute Against This Roadmap
 
-1. Pick one unchecked item.
-2. Open an issue with the relevant milestone tag (`M11`, `M12`, or `M13`).
-3. Link tests and sample output in the PR.
-4. Update checklist state when merged.
+1. Open an issue or proposal for new work.
+2. Link tests and sample output in the PR.
+3. Update checklist state when merged if the proposal becomes a committed roadmap item.

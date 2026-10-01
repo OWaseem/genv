@@ -34,10 +34,11 @@ func FragmentPath() (string, error) {
 }
 
 // WriteFragment atomically writes a POSIX-compatible shell fragment that
-// defines every alias, function, and source entry in cfg. If cfg is nil or
-// empty the fragment is removed.
+// defines every alias, function, and source entry in cfg. Entries with
+// shell:"powershell" are omitted (owned by the PowerShell profile backend).
+// If cfg is nil or has no POSIX-relevant content the fragment is removed.
 func WriteFragment(path string, cfg *schema.ShellConfig) error {
-	if cfg == nil || (len(cfg.Aliases) == 0 && len(cfg.Functions) == 0 && len(cfg.Source) == 0) {
+	if !hasPOSIXFragmentContent(cfg) {
 		err := os.Remove(path)
 		if err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("removing empty shell fragment %s: %w", path, err)
@@ -50,10 +51,17 @@ func WriteFragment(path string, cfg *schema.ShellConfig) error {
 	sb.WriteString("# BEGIN genv shell\n")
 
 	// --- Aliases ---
-	if len(cfg.Aliases) > 0 {
+	posixAliases := make([]string, 0)
+	for name, a := range cfg.Aliases {
+		if a.Shell == "powershell" {
+			continue
+		}
+		posixAliases = append(posixAliases, name)
+	}
+	sort.Strings(posixAliases)
+	if len(posixAliases) > 0 {
 		sb.WriteString("\n# aliases\n")
-		names := sortedKeys(cfg.Aliases)
-		for _, name := range names {
+		for _, name := range posixAliases {
 			a := cfg.Aliases[name]
 			line := fmt.Sprintf("alias %s=%s", name, singleQuote(a.Value))
 			sb.WriteString(shellGuard(line, a.Shell))
@@ -62,10 +70,17 @@ func WriteFragment(path string, cfg *schema.ShellConfig) error {
 	}
 
 	// --- Functions ---
-	if len(cfg.Functions) > 0 {
+	posixFuncs := make([]string, 0)
+	for name, fn := range cfg.Functions {
+		if fn.Shell == "powershell" {
+			continue
+		}
+		posixFuncs = append(posixFuncs, name)
+	}
+	sort.Strings(posixFuncs)
+	if len(posixFuncs) > 0 {
 		sb.WriteString("\n# functions\n")
-		names := sortedFuncKeys(cfg.Functions)
-		for _, name := range names {
+		for _, name := range posixFuncs {
 			fn := cfg.Functions[name]
 			body := fmt.Sprintf("%s() {\n%s\n}", name, indent(fn.Body))
 			sb.WriteString(shellGuard(body, fn.Shell))
@@ -77,26 +92,36 @@ func WriteFragment(path string, cfg *schema.ShellConfig) error {
 	if len(cfg.Source) > 0 {
 		sb.WriteString("\n# source\n")
 		for _, s := range cfg.Source {
-			sb.WriteString(fmt.Sprintf(". %s\n", s))
+			_, _ = fmt.Fprintf(&sb, ". %s\n", singleQuote(s))
 		}
 	}
 
 	sb.WriteString("\n# END genv shell\n")
 
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("creating directory %s: %w", dir, err)
-	}
-
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, []byte(sb.String()), 0o644); err != nil {
-		return fmt.Errorf("writing %s: %w", tmp, err)
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
-		return fmt.Errorf("saving %s: %w", path, err)
+	if err := genvfile.WritePrivate(path, []byte(sb.String())); err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
 	}
 	return nil
+}
+
+func hasPOSIXFragmentContent(cfg *schema.ShellConfig) bool {
+	if cfg == nil {
+		return false
+	}
+	if len(cfg.Source) > 0 {
+		return true
+	}
+	for _, a := range cfg.Aliases {
+		if a.Shell != "powershell" {
+			return true
+		}
+	}
+	for _, fn := range cfg.Functions {
+		if fn.Shell != "powershell" {
+			return true
+		}
+	}
+	return false
 }
 
 // ApplyShell writes the managed shell fragment and injects source lines into
@@ -105,7 +130,7 @@ func ApplyShell(fragmentPath string, cfg *schema.ShellConfig, rcFiles []string) 
 	if err := WriteFragment(fragmentPath, cfg); err != nil {
 		return err
 	}
-	if cfg == nil || (len(cfg.Aliases) == 0 && len(cfg.Functions) == 0 && len(cfg.Source) == 0) {
+	if !hasPOSIXFragmentContent(cfg) {
 		return nil
 	}
 	for _, rc := range rcFiles {
@@ -242,7 +267,8 @@ func SpecToLock(cfg *schema.ShellConfig) *genvfile.LockedShellConfig {
 }
 
 // shellGuard wraps line in a per-shell if guard when target is non-empty.
-// target may be "bash", "zsh", or "fish". Empty target = no guard (all shells).
+// target may be "bash", "zsh", or "fish". Empty target = no guard (all POSIX).
+// "powershell" is never emitted here (filtered before shellGuard is called).
 func shellGuard(line, target string) string {
 	switch target {
 	case "bash":
@@ -252,6 +278,8 @@ func shellGuard(line, target string) string {
 	case "fish":
 		// Fish uses a different syntax; emit a comment noting it is fish-only.
 		return fmt.Sprintf("# fish-only (source manually in config.fish):\n# %s", line)
+	case "powershell":
+		return ""
 	default:
 		return line
 	}
@@ -259,7 +287,21 @@ func shellGuard(line, target string) string {
 
 // singleQuote wraps v in POSIX single quotes, escaping embedded single quotes.
 func singleQuote(v string) string {
-	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
+	if v == "" {
+		return "''"
+	}
+	var b strings.Builder
+	b.Grow(len(v) + 2)
+	b.WriteByte('\'')
+	for i := 0; i < len(v); i++ {
+		if v[i] == '\'' {
+			b.WriteString(`'\''`)
+			continue
+		}
+		b.WriteByte(v[i])
+	}
+	b.WriteByte('\'')
+	return b.String()
 }
 
 // indent prefixes every line of s with two spaces.

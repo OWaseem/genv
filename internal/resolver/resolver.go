@@ -4,15 +4,19 @@ package resolver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/ks1686/genv/internal/adapter"
+	externalpkg "github.com/ks1686/genv/internal/external"
 	"github.com/ks1686/genv/internal/genvfile"
 	"github.com/ks1686/genv/internal/schema"
 	"github.com/ks1686/genv/internal/version"
@@ -27,7 +31,7 @@ func fprint(w io.Writer, a ...any)                 { _, _ = fmt.Fprint(w, a...) 
 // by checking each registered adapter's binary in PATH.
 func Detect() map[string]bool {
 	available := make(map[string]bool)
-	for _, a := range adapter.All {
+	for _, a := range adapter.Registered() {
 		if a.Available() {
 			available[a.Name()] = true
 		}
@@ -43,6 +47,8 @@ type Action struct {
 	PkgName      string   // concrete name to pass to the manager
 	Cmd          []string // installation command; nil if unresolved
 	UninstallCmd []string // uninstall command; nil if unresolved
+	Locked       *genvfile.LockedPackage
+	Detail       string
 }
 
 // Resolved reports whether a manager was found for this package.
@@ -51,42 +57,55 @@ func (a Action) Resolved() bool { return a.Manager != "" }
 // ResolveOne resolves a single package into an Action using the provided set of
 // available manager names. Used by addCmd to install one package immediately.
 func ResolveOne(pkg schema.Package, available map[string]bool) Action {
-	return resolve(pkg, available)
+	return resolveOnGOOS(pkg, available, runtime.GOOS)
 }
 
 // Plan resolves every package in f into an Action, using the provided set of
 // available manager names. Call Detect() to build the available map.
 func Plan(f *schema.GenvFile, available map[string]bool) []Action {
+	return planOnGOOS(f, available, runtime.GOOS)
+}
+
+func planOnGOOS(f *schema.GenvFile, available map[string]bool, goos string) []Action {
 	actions := make([]Action, 0, len(f.Packages))
 	for _, pkg := range f.Packages {
-		actions = append(actions, resolve(pkg, available))
+		actions = append(actions, resolveOnGOOS(pkg, available, goos))
 	}
 	return actions
 }
 
-func resolve(pkg schema.Package, available map[string]bool) Action {
+func resolveOnGOOS(pkg schema.Package, available map[string]bool, goos string) Action {
 	// 1. Honor the prefer hint if that manager is available.
 	// ByName is guaranteed non-nil here: available is built from adapter.All
 	// in Detect(), so any name present in available has a registered adapter.
 	if pkg.Prefer != "" && available[pkg.Prefer] {
 		if a := adapter.ByName(pkg.Prefer); a != nil {
 			name, _ := a.NormalizeID(pkg.ID, pkg.Managers)
-			return Action{Pkg: pkg, Manager: a.Name(), PkgName: name, Cmd: a.PlanInstall(name), UninstallCmd: a.PlanUninstall(name)}
+			action := Action{Pkg: pkg, Manager: a.Name(), PkgName: name, Cmd: a.PlanInstall(name), UninstallCmd: a.PlanUninstall(name)}
+			if pkg.External != nil && a.Name() == "external" {
+				action.Detail = externalPlanDetail(pkg.External)
+			}
+			return action
 		}
 	}
 
 	// 2. Pick the first available adapter in registry order whose manager name
 	//    appears in the package's explicit managers map.
-	for _, a := range adapter.All {
+	for _, a := range adapter.Registered() {
 		if _, ok := pkg.Managers[a.Name()]; ok && available[a.Name()] {
 			name, _ := a.NormalizeID(pkg.ID, pkg.Managers)
 			return Action{Pkg: pkg, Manager: a.Name(), PkgName: name, Cmd: a.PlanInstall(name), UninstallCmd: a.PlanUninstall(name)}
 		}
 	}
 
-	// 3. Fall back to the first available adapter, using the package ID as name.
-	for _, a := range adapter.All {
-		if available[a.Name()] {
+	// 3. Fall back to the first available default-fallback-eligible adapter,
+	//    using the package ID as name. Only OS/system package managers are
+	//    eligible here; ecosystem/language/plugin managers are explicit-only
+	//    (reachable via prefer or the managers map above) so `genv add git`
+	//    never silently resolves to npm/cargo/go just because one happens to be
+	//    installed.
+	for _, a := range adapter.Registered() {
+		if available[a.Name()] && adapter.IsDefaultFallbackEligible(a) && adapter.AutomaticOnGOOS(a.Name(), goos) {
 			name, _ := a.NormalizeID(pkg.ID, pkg.Managers)
 			return Action{Pkg: pkg, Manager: a.Name(), PkgName: name, Cmd: a.PlanInstall(name), UninstallCmd: a.PlanUninstall(name)}
 		}
@@ -99,6 +118,32 @@ func resolve(pkg schema.Package, available map[string]bool) Action {
 // PrintPlan writes a human-readable installation plan to w and returns the number
 // of resolved and unresolved packages so callers can act on the counts without
 // a second pass over the actions slice.
+func EnrichExternalPlan(ctx context.Context, result *ReconcileResult) {
+	if result == nil {
+		return
+	}
+	for i := range result.ToInstall {
+		action := &result.ToInstall[i]
+		if action.Pkg.External == nil || action.Manager != "external" {
+			continue
+		}
+		planned, err := planExternal(ctx, action.Pkg)
+		if err != nil {
+			action.Detail = "managed external release (plan failed)"
+			continue
+		}
+		action.Detail = planned
+	}
+}
+
+var planExternal = func(ctx context.Context, pkg schema.Package) (string, error) {
+	planned, err := (externalpkg.Engine{Host: externalpkg.CurrentHost()}).Plan(ctx, pkg)
+	if err != nil {
+		return "", err
+	}
+	return planned.Detail, nil
+}
+
 func PrintPlan(actions []Action, w io.Writer) (resolved, unresolved int) {
 	for _, a := range actions {
 		if a.Resolved() {
@@ -122,7 +167,7 @@ func PrintPlan(actions []Action, w io.Writer) (resolved, unresolved int) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, a := range actions {
 		if a.Resolved() {
-			fprintf(tw, "  %s\tvia %s\t%s\n", a.Pkg.ID, a.Manager, strings.Join(a.Cmd, " "))
+			fprintf(tw, "  %s\tvia %s\t%s\n", a.Pkg.ID, a.Manager, actionPlanDetail(a))
 		} else {
 			fprintf(tw, "  %s\tunresolved\t(no manager available)\n", a.Pkg.ID)
 		}
@@ -138,19 +183,81 @@ func PrintPlan(actions []Action, w io.Writer) (resolved, unresolved int) {
 	return
 }
 
+func actionPlanDetail(action Action) string {
+	if action.Detail != "" {
+		return action.Detail
+	}
+	return strings.Join(action.Cmd, " ")
+}
+
+func externalPlanDetail(recipe *schema.ExternalRecipe) string {
+	platform, err := externalpkg.SelectPlatform(recipe.Platforms, externalpkg.CurrentHost())
+	if err != nil {
+		return "managed external release"
+	}
+	verification := make([]string, 0, len(recipe.Verify))
+	for _, method := range recipe.Verify {
+		verification = append(verification, method.Type)
+	}
+	if len(verification) == 0 {
+		verification = append(verification, "unverified")
+	}
+	scope := platform.Install.Scope
+	if scope == "" {
+		scope = "user"
+	}
+	return fmt.Sprintf("managed %s release; verify=%s; scope=%s", platform.Install.Type, strings.Join(verification, "+"), scope)
+}
+
 // runSubcmd prints the command to stdout, spawns it as a subprocess wiring
 // stdin/stdout/stderr, logs timing via slog, and returns any execution error.
 // Shared by Execute and ExecuteApply to avoid repeating the logging boilerplate.
+// RunCommand runs argv with the same stdin/stdout/timeout rules as package
+// install and upgrade actions. The upgrade runner uses it for OS/firmware steps.
+func RunCommand(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	return runSubcmd(ctx, args, stdin, stdout, stderr)
+}
+
+// subprocessWaitDelay bounds how long a spawn waits for inherited output
+// pipes to close after the process itself is gone. Without it, a hook or
+// manager that backgrounds a process (or a timeout that kills only the direct
+// child) keeps the pipe open and Wait blocks until every holder exits — which
+// wedged the hourly worker until its job deadline. Mirrors adapter.probeWaitDelay.
+var subprocessWaitDelay = 2 * time.Second
+
 func runSubcmd(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) error {
+	if len(args) == 0 || args[0] == "" {
+		return fmt.Errorf("empty command")
+	}
 	fprintf(stdout, "\n==> %s\n", strings.Join(args, " "))
 	slog.Debug("spawn", "cmd", strings.Join(args, " "))
 	start := time.Now()
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	runCtx := ctx
+	cancel := func() {}
+	if d := SubprocessTimeout(ctx); d > 0 {
+		runCtx, cancel = context.WithTimeout(ctx, d)
+	}
+	defer cancel()
+	cmd := exec.CommandContext(runCtx, args[0], args[1:]...)
+	cmd.WaitDelay = subprocessWaitDelay
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	if runtime.GOOS == "windows" {
+		if _, err := exec.LookPath("git"); err != nil {
+			if dir := adapter.ScoopGitCmdDir(); dir != "" {
+				cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+			}
+		}
+	}
 	err := cmd.Run()
 	slog.Debug("done", "cmd", args[0], "duration", time.Since(start), "err", err)
+	// ErrWaitDelay means the command already exited but a backgrounded
+	// grandchild still held the inherited pipe. The command's own exit status
+	// is the real result.
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.ProcessState != nil && cmd.ProcessState.Success() {
+		return nil
+	}
 	return err
 }
 
@@ -175,57 +282,269 @@ func Execute(ctx context.Context, actions []Action, stdin io.Reader, stdout, std
 
 // ---- Upgrade (genv upgrade) --------------------------------------------------
 
-// UpgradeAction is the resolved upgrade action for a single package.
+// UpgradeAction is the resolved upgrade action for one or more packages that
+// can be upgraded together by the same package manager. Most adapters produce
+// one action per package; adapters implementing BatchUpgrader may produce one
+// action for several packages.
 type UpgradeAction struct {
-	LP  genvfile.LockedPackage
-	Mgr adapter.Adapter
-	Cmd []string
+	LPs           []genvfile.LockedPackage
+	Mgr           adapter.Adapter
+	Cmd           []string
+	External      *schema.Package
+	RemoteVersion string
 }
 
-// SkippedPackage records a package that was skipped during upgrade planning
-// because its recorded package manager adapter is no longer registered.
+// SkippedPackage records a package that was skipped during upgrade planning.
 type SkippedPackage struct {
 	ID      string
 	Manager string
+	Reason  string
 }
 
 // PlanUpgrade builds an upgrade plan for all packages tracked in the lock file.
 // It returns a list of actions and a list of packages that were skipped because
 // their recorded package manager adapter is no longer registered.
+// Packages are grouped by manager; when a manager implements BatchUpgrader and
+// has more than one tracked package, a single batched command is emitted.
 func PlanUpgrade(packages []genvfile.LockedPackage) (plan []UpgradeAction, skipped []SkippedPackage) {
+	adapters := make(map[string]adapter.Adapter)
+	getAdapter := func(name string) adapter.Adapter {
+		if mgr, ok := adapters[name]; ok {
+			return mgr
+		}
+		mgr := adapter.ByName(name)
+		adapters[name] = mgr
+		return mgr
+	}
+
+	// Group packages by manager while preserving first-seen order.
+	type group struct {
+		mgr adapter.Adapter
+		lps []genvfile.LockedPackage
+	}
+	groups := make(map[string]*group)
+	var order []string
 	for _, lp := range packages {
-		mgr := adapter.ByName(lp.Manager)
+		mgr := getAdapter(lp.Manager)
 		if mgr == nil {
-			skipped = append(skipped, SkippedPackage{ID: lp.ID, Manager: lp.Manager})
+			skipped = append(skipped, SkippedPackage{ID: lp.ID, Manager: lp.Manager, Reason: fmt.Sprintf("adapter %q not registered", lp.Manager)})
 			continue
 		}
-		plan = append(plan, UpgradeAction{LP: lp, Mgr: mgr, Cmd: mgr.PlanUpgrade(lp.PkgName)})
+		if !mgr.Available() {
+			skipped = append(skipped, SkippedPackage{ID: lp.ID, Manager: lp.Manager, Reason: fmt.Sprintf("manager %q is not available", lp.Manager)})
+			continue
+		}
+		if _, ok := groups[lp.Manager]; !ok {
+			groups[lp.Manager] = &group{mgr: mgr}
+			order = append(order, lp.Manager)
+		}
+		groups[lp.Manager].lps = append(groups[lp.Manager].lps, lp)
+	}
+
+	for _, name := range order {
+		g := groups[name]
+		if batcher, ok := g.mgr.(adapter.BatchUpgrader); ok && len(g.lps) > 1 {
+			pkgNames := make([]string, len(g.lps))
+			for i, lp := range g.lps {
+				pkgNames[i] = lp.PkgName
+			}
+			plan = append(plan, UpgradeAction{LPs: g.lps, Mgr: g.mgr, Cmd: batcher.PlanUpgradeBatch(pkgNames)})
+			continue
+		}
+		for _, lp := range g.lps {
+			plan = append(plan, UpgradeAction{LPs: []genvfile.LockedPackage{lp}, Mgr: g.mgr, Cmd: g.mgr.PlanUpgrade(lp.PkgName)})
+		}
 	}
 	return plan, skipped
+}
+
+// lookupAdapter resolves a manager name to its adapter. It is a var so tests
+// can inject fake adapters for FilterOutdated without touching the global
+// registry, mirroring the lookPath seam in the adapter package.
+var lookupAdapter = adapter.ByName
+
+// FilterOutdated narrows packages to those with an update actually available,
+// querying each manager's OutdatedLister capability. Packages whose manager does
+// not implement OutdatedLister are kept unchanged (no detection is possible, so
+// nothing is dropped). When a manager's outdated query fails, all of that
+// manager's packages are kept conservatively and a warning is recorded, so a
+// real update is never silently missed. Input order is preserved.
+func FilterOutdated(packages []genvfile.LockedPackage) (kept []genvfile.LockedPackage, warnings []string) {
+	// Group package names by manager so each manager is queried at most once,
+	// preserving first-seen order for stable, testable output.
+	type group struct {
+		mgr      adapter.Adapter
+		pkgNames []string
+	}
+	groups := make(map[string]*group)
+	var order []string
+	for _, lp := range packages {
+		if _, ok := groups[lp.Manager]; !ok {
+			groups[lp.Manager] = &group{mgr: lookupAdapter(lp.Manager)}
+			order = append(order, lp.Manager)
+		}
+		g := groups[lp.Manager]
+		g.pkgNames = append(g.pkgNames, lp.PkgName)
+	}
+
+	// For each manager, decide which of its packages to keep.
+	// keep[manager] == nil means "keep all" (no detection / query failed);
+	// otherwise it is the set of manager-native names that are outdated.
+	keep := make(map[string]map[string]bool, len(order))
+	for _, name := range order {
+		g := groups[name]
+		if g.mgr == nil || !g.mgr.Available() {
+			keep[name] = nil // PlanUpgrade records the unavailable skip
+			continue
+		}
+		lister, ok := g.mgr.(adapter.OutdatedLister)
+		if !ok {
+			keep[name] = nil // no capability: keep all
+			continue
+		}
+		started := time.Now()
+		outdated, err := CallTimed(func() (map[string]string, error) { return lister.ListOutdated(g.pkgNames) }, DefaultLiveListTimeout)
+		elapsed := time.Since(started).Round(time.Millisecond)
+		if err != nil {
+			warnings = append(warnings, fmt.Sprintf("could not determine outdated packages for %s after %s (%v) — keeping all", name, elapsed, err))
+			keep[name] = nil // query failed or timed out: keep all conservatively
+			continue
+		}
+		// Timing is debug detail, not a user-facing warning: the scheduled
+		// worker logged it for every manager on every successful query, and a
+		// genuine slowness or failure is already reported above.
+		slog.Debug("outdated query", "manager", name, "elapsed", elapsed, "hits", len(outdated))
+		set := make(map[string]bool, len(outdated))
+		for pkgName := range outdated {
+			set[pkgName] = true
+		}
+		keep[name] = set
+	}
+
+	for _, lp := range packages {
+		set := keep[lp.Manager]
+		if set == nil || set[lp.PkgName] {
+			kept = append(kept, lp)
+		}
+	}
+	return kept, warnings
 }
 
 // UpgradeExecution records the outcome of ExecuteUpgrade so the caller can update
 // the lock file with new versions.
 type UpgradeExecution struct {
 	Upgraded []genvfile.LockedPackage
+	Skipped  []SkippedPackage
 	Errors   []error
+	Failures []UpgradeFailure
+}
+
+// UpgradeFailure identifies the tracked packages affected by one failed action.
+type UpgradeFailure struct {
+	IDs []string
+	Err error
 }
 
 // ExecuteUpgrade runs each resolved upgrade action sequentially, updating the
-// InstalledVersion on success. Returns an UpgradeExecution holding the updated
-// packages and any errors encountered.
-func ExecuteUpgrade(ctx context.Context, plan []UpgradeAction, stdin io.Reader, stdout, stderr io.Writer) UpgradeExecution {
+// InstalledVersion for packages whose version changed. Returns an UpgradeExecution
+// holding the updated packages and any errors encountered.
+func ExecuteUpgrade(ctx context.Context, plan []UpgradeAction, stdin io.Reader, stdout, stderr io.Writer, options ...ApplyExecutionOptions) UpgradeExecution {
 	var out UpgradeExecution
+	var executionOptions ApplyExecutionOptions
+	if len(options) > 0 {
+		executionOptions = options[0]
+	}
 	for _, a := range plan {
-		if err := runSubcmd(ctx, a.Cmd, stdin, stdout, stderr); err != nil {
-			out.Errors = append(out.Errors, fmt.Errorf("upgrade %q: %w", a.LP.ID, err))
+		ids := make([]string, len(a.LPs))
+		for i, lp := range a.LPs {
+			ids[i] = lp.ID
+		}
+
+		if a.External != nil {
+			installed, err := (externalpkg.Engine{
+				Host: externalpkg.CurrentHost(), Mode: executionOptions.ExternalMode,
+				Acknowledge: executionOptions.AcknowledgeExternal, Stdin: stdin, Output: stderr,
+				SourceRoot: executionOptions.SourceRoot,
+			}).Install(ctx, *a.External)
+			if err != nil {
+				if errors.Is(err, externalpkg.ErrUnattendedElevation) {
+					id := ""
+					if len(a.LPs) > 0 {
+						id = a.LPs[0].ID
+					}
+					out.Skipped = append(out.Skipped, SkippedPackage{ID: id, Manager: "external", Reason: unattendedElevationReason})
+					continue
+				}
+				wrappedErr := fmt.Errorf("upgrade %q: %w", ids, err)
+				out.Errors = append(out.Errors, wrappedErr)
+				out.Failures = append(out.Failures, UpgradeFailure{IDs: ids, Err: wrappedErr})
+				continue
+			}
+			lp := a.LPs[0]
+			lp.InstalledVersion = installed.Version
+			lp.External = installed.Receipt
+			out.Upgraded = append(out.Upgraded, lp)
 			continue
 		}
-		// Update InstalledVersion in lock for successfully upgraded packages.
-		if v, err := a.Mgr.QueryVersion(a.LP.PkgName); err == nil && v != "" {
-			a.LP.InstalledVersion = v
+
+		argv := a.Cmd
+		if executionOptions.Unattended {
+			argv = withNoninteractiveSudo(argv)
+			if skipUnattendedElevation(true, argv) {
+				out.Skipped = append(out.Skipped, skippedElevation(a.LPs, argv)...)
+				continue
+			}
 		}
-		out.Upgraded = append(out.Upgraded, a.LP)
+
+		cmdErr := runSubcmd(ctx, argv, stdin, stdout, stderr)
+		if cmdErr != nil {
+			wrappedErr := fmt.Errorf("upgrade %q: %w", ids, cmdErr)
+			out.Errors = append(out.Errors, wrappedErr)
+			out.Failures = append(out.Failures, UpgradeFailure{IDs: ids, Err: wrappedErr})
+		}
+
+		// Collect current versions for every package in the action. Use a single
+		// ListInstalledVersions call when the adapter supports it, then fall back
+		// to per-package QueryVersion for anything missing. Both probes are
+		// capped so a hung manager cannot stall the lock update indefinitely;
+		// a timed-out probe is skipped (version stays empty) rather than
+		// treated as a real version.
+		versions := make(map[string]string, len(a.LPs))
+		if versionLister, ok := a.Mgr.(adapter.VersionLister); ok {
+			if listedVersions, err := CallTimed(versionLister.ListInstalledVersions, DefaultLiveListTimeout); err == nil {
+				for _, lp := range a.LPs {
+					if v, ok := listedVersions[lp.PkgName]; ok {
+						versions[lp.ID] = v
+					}
+				}
+			}
+		}
+		for _, lp := range a.LPs {
+			if _, ok := versions[lp.ID]; ok {
+				continue
+			}
+			if a.Mgr == nil {
+				continue
+			}
+			if v, err := CallTimed(func() (string, error) { return a.Mgr.QueryVersion(lp.PkgName) }, DefaultLiveListTimeout); err == nil && v != "" {
+				versions[lp.ID] = v
+			}
+		}
+
+		// Update the lock for packages whose version actually changed. On a
+		// successful command include every package so already-current packages
+		// remain recorded; on failure only include packages that upgraded anyway.
+		for i := range a.LPs {
+			lp := &a.LPs[i]
+			v, hasV := versions[lp.ID]
+			versionChanged := hasV && v != "" && v != lp.InstalledVersion
+			if cmdErr == nil || versionChanged {
+				if versionChanged {
+					lp.InstalledVersion = v
+				}
+				out.Upgraded = append(out.Upgraded, *lp)
+			}
+		}
 	}
 	return out
 }
@@ -239,6 +558,43 @@ func versionDrifted(pkg schema.Package, lp genvfile.LockedPackage) bool {
 	return lp.InstalledVersion != "" && !version.Satisfies(pkg.Version, lp.InstalledVersion)
 }
 
+func packageDrifted(pkg schema.Package, lp genvfile.LockedPackage) bool {
+	if pkg.External != nil {
+		state := externalpkg.InspectLocal(context.Background(), pkg, &lp)
+		return !state.Present || state.Drift || !version.Satisfies(pkg.Version, state.Version)
+	}
+	return versionDrifted(pkg, lp)
+}
+
+// missingDespiteLock reports whether a lock entry asserts an install that the
+// manager contradicts.
+//
+// A lock entry with no InstalledVersion is not evidence that anything was
+// installed — it is what a failed install leaves behind, because the manager
+// never produced a version to record. Such an entry used to be believed
+// forever: versionDrifted had nothing to compare, so the package was never
+// re-queued, and it was written back into Unchanged on every later apply.
+// The state could not recover even after the package became installable.
+//
+// The manager's own inventory is the tie-breaker, and only when it was
+// actually read: LiveSet.reports distinguishes "this manager says the package
+// is absent" from "we never managed to ask", so an unavailable manager does
+// not trigger a pointless reinstall (#213).
+func missingDespiteLock(pkg schema.Package, lp genvfile.LockedPackage, live LiveSet) bool {
+	if pkg.External != nil || lp.Manager == "" || lp.PkgName == "" {
+		return false
+	}
+	if lp.InstalledVersion != "" {
+		// A recorded version is a real observation; absence is not a version
+		// comparison, so leave this to versionDrifted and the spec constraint.
+		return false
+	}
+	if !live.reports(lp.Manager) {
+		return false
+	}
+	return !live.has(lp.Manager, lp.PkgName)
+}
+
 // ReconcileResult holds the delta between the desired state (genv.json) and the
 // previously applied state (genv.lock.json). ToInstall are packages added to the
 // spec since the last apply; ToRemove are packages that were removed from it.
@@ -246,6 +602,154 @@ type ReconcileResult struct {
 	ToInstall []Action
 	ToRemove  []Action // UninstallCmd populated; Pkg.ID identifies the package
 	Unchanged []genvfile.LockedPackage
+	Adopted   []genvfile.LockedPackage // live-installed, not yet in the lock
+	Warnings  []string
+}
+
+// LiveSet is manager name → manager-native package name → installed.
+// Names are matched case-insensitively. A nil LiveSet means lock-only
+// (do not probe the live system).
+type LiveSet map[string]map[string]bool
+
+// reports reports whether manager was successfully inventoried. It separates
+// "this manager says the package is absent" from "we never managed to ask",
+// which has to mean different things before a missing package can be treated
+// as evidence.
+func (s LiveSet) reports(manager string) bool {
+	if s == nil || manager == "" {
+		return false
+	}
+	_, ok := s[manager]
+	return ok
+}
+
+func (s LiveSet) has(manager, pkgName string) bool {
+	if s == nil || manager == "" || pkgName == "" {
+		return false
+	}
+	names := s[manager]
+	if names[pkgName] {
+		return true
+	}
+	for n := range names {
+		if strings.EqualFold(n, pkgName) {
+			return true
+		}
+	}
+	return false
+}
+
+// DefaultLiveListTimeout caps each manager inventory so a hung
+// `composer global show` (or similar) cannot stall apply/status.
+// Exported so commands that inventory managers directly (scan) share it.
+// Var so tests can shorten the deadline.
+var DefaultLiveListTimeout = 30 * time.Second
+
+// CallTimed runs f under a wall-clock deadline d. If f has not returned by
+// then, CallTimed returns a timeout error; f keeps running in the background
+// and its eventual result is dropped. Use it to bound calls into adapters,
+// which spawn external package managers that can block indefinitely.
+// ErrInventoryTimeout is returned by CallTimed and RunTimed when a live
+// inventory probe exceeds its per-manager deadline. It is a distinct sentinel
+// so callers can tell an expected transient stall (winget's first-run source
+// sync can hang for minutes) from a manager that genuinely failed to report,
+// without matching on the message text.
+var ErrInventoryTimeout = errors.New("inventory probe timed out")
+
+func CallTimed[T any](f func() (T, error), d time.Duration) (T, error) {
+	if d <= 0 {
+		return f()
+	}
+	type result struct {
+		value T
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		v, err := f()
+		ch <- result{v, err}
+	}()
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.value, r.err
+	case <-timer.C:
+		var zero T
+		return zero, fmt.Errorf("%w after %s", ErrInventoryTimeout, d)
+	}
+}
+
+// RunTimed is CallTimed for probes that only report success or failure.
+func RunTimed(f func() error, d time.Duration) error {
+	_, err := CallTimed(func() (struct{}, error) { return struct{}{}, f() }, d)
+	return err
+}
+
+// ManagersToList is the set of managers apply/status actually need to
+// inventory: unlocked spec packages only. An empty spec yields an empty
+// set, so live listing is skipped entirely.
+func ManagersToList(packages []schema.Package, locked []genvfile.LockedPackage, available map[string]bool) map[string]bool {
+	lockedIDs := make(map[string]bool, len(locked))
+	for _, lp := range locked {
+		lockedIDs[lp.ID] = true
+	}
+	need := make(map[string]bool)
+	for _, pkg := range packages {
+		if lockedIDs[pkg.ID] {
+			continue
+		}
+		if pkg.Prefer != "" {
+			need[pkg.Prefer] = true
+		}
+		for m := range pkg.Managers {
+			need[m] = true
+		}
+		action := resolveOnGOOS(pkg, available, runtime.GOOS)
+		if action.Resolved() {
+			need[action.Manager] = true
+		}
+	}
+	return need
+}
+
+// LoadLiveSet calls ListInstalled once per available manager. Listing errors
+// become warnings; they never fail the whole apply/status run.
+func LoadLiveSet(available map[string]bool) (LiveSet, []string) {
+	return LoadLiveSetOnly(available, nil)
+}
+
+// LoadLiveSetOnly is LoadLiveSet restricted to `only`. A nil `only` lists
+// every available manager (same as LoadLiveSet). An empty `only` lists none.
+func LoadLiveSetOnly(available, only map[string]bool) (LiveSet, []string) {
+	out := make(LiveSet)
+	var warns []string
+	if only != nil && len(only) == 0 {
+		return out, warns
+	}
+	for name, ok := range available {
+		if !ok {
+			continue
+		}
+		if only != nil && !only[name] {
+			continue
+		}
+		mgr := adapter.ByName(name)
+		if mgr == nil {
+			continue
+		}
+		list, err := CallTimed(mgr.ListInstalled, DefaultLiveListTimeout)
+		if err != nil {
+			warns = append(warns, fmt.Sprintf("listing %s: %v", name, err))
+			continue
+		}
+		set := make(map[string]bool, len(list))
+		for _, pkgName := range list {
+			set[pkgName] = true
+		}
+		out[name] = set
+	}
+	return out, warns
 }
 
 // Reconcile computes the delta between the desired packages (from genv.json)
@@ -255,7 +759,26 @@ type ReconcileResult struct {
 //   - ToRemove:  in lock but not in desired → uninstall using the manager
 //     recorded in the lock (not re-resolved, preserving the original manager).
 //   - Unchanged: in both desired and lock → nothing to do.
+//
+// Reconcile is lock-only. Prefer ReconcileWith when a live inventory exists.
 func Reconcile(desired []schema.Package, managed []genvfile.LockedPackage, available map[string]bool) ReconcileResult {
+	return ReconcileWith(desired, managed, available, nil)
+}
+
+// ReconcileWith is Reconcile plus a live inventory. Packages in desired, not in
+// the lock, but already installed under the resolved manager are Adopted
+// instead of ToInstall so apply can lock them without spawning an installer.
+func ReconcileWith(desired []schema.Package, managed []genvfile.LockedPackage, available map[string]bool, live LiveSet) ReconcileResult {
+	adapters := make(map[string]adapter.Adapter)
+	getAdapter := func(name string) adapter.Adapter {
+		if mgr, ok := adapters[name]; ok {
+			return mgr
+		}
+		mgr := adapter.ByName(name)
+		adapters[name] = mgr
+		return mgr
+	}
+
 	managedByID := make(map[string]genvfile.LockedPackage, len(managed))
 	for _, lp := range managed {
 		managedByID[lp.ID] = lp
@@ -268,44 +791,58 @@ func Reconcile(desired []schema.Package, managed []genvfile.LockedPackage, avail
 	}
 
 	var toInstall []Action
+	var adopted []genvfile.LockedPackage
 	for _, pkg := range desired {
 		lp, alreadyManaged := managedByID[pkg.ID]
 		if !alreadyManaged {
-			toInstall = append(toInstall, resolve(pkg, available))
+			action := resolveOnGOOS(pkg, available, runtime.GOOS)
+			if action.Resolved() && live.has(action.Manager, action.PkgName) {
+				adopted = append(adopted, genvfile.LockedPackage{
+					ID:      pkg.ID,
+					Manager: action.Manager,
+					PkgName: action.PkgName,
+				})
+				continue
+			}
+			toInstall = append(toInstall, action)
 			continue
 		}
 		// Package is already in the lock. Check version constraint: if the lock
 		// recorded an InstalledVersion and it no longer satisfies the spec
 		// constraint, queue for reinstallation.
-		if versionDrifted(pkg, lp) {
-			toInstall = append(toInstall, resolve(pkg, available))
+		if packageDrifted(pkg, lp) || missingDespiteLock(pkg, lp, live) {
+			toInstall = append(toInstall, resolveOnGOOS(pkg, available, runtime.GOOS))
 		}
 	}
 
 	var toRemove []Action
 	var unchanged []genvfile.LockedPackage
+	var warnings []string
 	for _, lp := range managed {
 		if !desiredByID[lp.ID] {
-			a := adapter.ByName(lp.Manager)
+			a := getAdapter(lp.Manager)
 			if a == nil {
-				continue // adapter no longer registered; skip silently
+				unchanged = append(unchanged, lp)
+				warnings = append(warnings, fmt.Sprintf("lock package %q uses unregistered manager %q; skipping uninstall", lp.ID, lp.Manager))
+				continue
 			}
 			toRemove = append(toRemove, Action{
 				Pkg:          schema.Package{ID: lp.ID},
 				Manager:      lp.Manager,
 				PkgName:      lp.PkgName,
 				UninstallCmd: a.PlanUninstall(lp.PkgName),
+				Locked:       &lp,
 			})
 			continue
 		}
 		// In desired — skip packages queued for reinstall; they must not appear in Unchanged.
-		if versionDrifted(specByID[lp.ID], lp) {
+		if packageDrifted(specByID[lp.ID], lp) || missingDespiteLock(specByID[lp.ID], lp, live) {
 			continue
 		}
 		unchanged = append(unchanged, lp)
 	}
 
-	return ReconcileResult{ToInstall: toInstall, ToRemove: toRemove, Unchanged: unchanged}
+	return ReconcileResult{ToInstall: toInstall, ToRemove: toRemove, Unchanged: unchanged, Adopted: adopted, Warnings: warnings}
 }
 
 // PrintReconcilePlan writes a human-readable apply plan to w. Each line is
@@ -316,7 +853,8 @@ func PrintReconcilePlan(result ReconcileResult, w io.Writer) (toInstall, toRemov
 	toInstall = len(result.ToInstall)
 	toRemove = len(result.ToRemove)
 	unchanged := len(result.Unchanged)
-	total := toInstall + toRemove + unchanged
+	adopted := len(result.Adopted)
+	total := toInstall + toRemove + unchanged + adopted
 
 	fprintf(w, "Apply plan — %d package", total)
 	if total != 1 {
@@ -328,6 +866,9 @@ func PrintReconcilePlan(result ReconcileResult, w io.Writer) (toInstall, toRemov
 	}
 	if toRemove > 0 {
 		parts = append(parts, fmt.Sprintf("%d to remove", toRemove))
+	}
+	if adopted > 0 {
+		parts = append(parts, fmt.Sprintf("%d already installed", adopted))
 	}
 	if unchanged > 0 {
 		parts = append(parts, fmt.Sprintf("%d up to date", unchanged))
@@ -341,16 +882,19 @@ func PrintReconcilePlan(result ReconcileResult, w io.Writer) (toInstall, toRemov
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	for _, a := range result.ToInstall {
 		if a.Resolved() {
-			fprintf(tw, "  + %s\tvia %s\t%s\n", a.Pkg.ID, a.Manager, strings.Join(a.Cmd, " "))
+			fprintf(tw, "  + %s	via %s	%s\n", a.Pkg.ID, a.Manager, actionPlanDetail(a))
 		} else {
-			fprintf(tw, "  + %s\tunresolved\t(no manager available)\n", a.Pkg.ID)
+			fprintf(tw, "  + %s	unresolved	(no manager available)\n", a.Pkg.ID)
 		}
 	}
 	for _, a := range result.ToRemove {
-		fprintf(tw, "  - %s\tvia %s\t%s\n", a.Pkg.ID, a.Manager, strings.Join(a.UninstallCmd, " "))
+		fprintf(tw, "  - %s	via %s	%s\n", a.Pkg.ID, a.Manager, strings.Join(a.UninstallCmd, " "))
+	}
+	for _, lp := range result.Adopted {
+		fprintf(tw, "  = %s	via %s	(already installed)\n", lp.ID, lp.Manager)
 	}
 	for _, lp := range result.Unchanged {
-		fprintf(tw, "    %s\tvia %s\t(up to date)\n", lp.ID, lp.Manager)
+		fprintf(tw, "    %s	via %s	(up to date)\n", lp.ID, lp.Manager)
 	}
 	_ = tw.Flush()
 	fPrintln(w)
@@ -376,18 +920,57 @@ type ApplyExecution struct {
 	Errors      []error
 }
 
+// ApplyExecutionOptions controls external-package interaction policy.
+type ApplyExecutionOptions struct {
+	ExternalMode        externalpkg.ExecutionMode
+	AcknowledgeExternal func(message string) bool
+	// Unattended is set by the scheduled updates worker. It never prompts for
+	// elevation; commands that would need admin are skipped or fail closed.
+	Unattended bool
+	// SourceRoot is the spec directory, used to resolve relative external
+	// publicKeyFile paths (including keys bundled by `genv export`).
+	SourceRoot string
+}
+
 // ExecuteApply runs all removals then all installs from a ReconcileResult.
 // Removals are run first (mirrors how package managers handle upgrades/downgrades).
 // Cache-clean commands run once per manager that had at least one successful removal.
 // ctx controls the deadline for every subprocess; use context.Background() for no timeout.
 // Returns an ApplyExecution so the caller can write an updated lock file that
 // reflects only what actually succeeded.
-func ExecuteApply(ctx context.Context, result ReconcileResult, stdin io.Reader, stdout, stderr io.Writer) ApplyExecution {
+func ExecuteApply(ctx context.Context, result ReconcileResult, stdin io.Reader, stdout, stderr io.Writer, options ...ApplyExecutionOptions) ApplyExecution {
 	var out ApplyExecution
+	var executionOptions ApplyExecutionOptions
+	if len(options) > 0 {
+		executionOptions = options[0]
+	}
 	cleanManagers := make(map[string]bool)
 
 	for _, a := range result.ToRemove {
+		if a.Manager == "external" && a.Locked != nil && a.Locked.External != nil {
+			var err error
+			if a.Locked.External.Owned {
+				err = externalpkg.Remove(a.Locked.External)
+			} else {
+				err = externalpkg.RunUninstall(ctx, a.Locked.External.Uninstall, stdin, stderr)
+			}
+			if err != nil {
+				out.Errors = append(out.Errors, fmt.Errorf("remove %q (via external): %w", a.Pkg.ID, err))
+			} else {
+				out.Uninstalled = append(out.Uninstalled, a.Pkg.ID)
+			}
+			continue
+		}
+		mgr := adapter.ByName(a.Manager)
+		if adapter.Absent(mgr, a.PkgName) {
+			out.Uninstalled = append(out.Uninstalled, a.Pkg.ID)
+			continue
+		}
 		if err := runSubcmd(ctx, a.UninstallCmd, stdin, stdout, stderr); err != nil {
+			if adapter.Absent(mgr, a.PkgName) {
+				out.Uninstalled = append(out.Uninstalled, a.Pkg.ID)
+				continue
+			}
 			out.Errors = append(out.Errors, fmt.Errorf("remove %q (via %s): %w", a.Pkg.ID, a.Manager, err))
 		} else {
 			out.Uninstalled = append(out.Uninstalled, a.Pkg.ID)
@@ -421,7 +1004,54 @@ func ExecuteApply(ctx context.Context, result ReconcileResult, stdin io.Reader, 
 		if !a.Resolved() {
 			continue
 		}
-		if err := runSubcmd(ctx, a.Cmd, stdin, stdout, stderr); err != nil {
+		if a.Manager == "external" && a.Pkg.External != nil {
+			installed, err := (externalpkg.Engine{
+				Host: externalpkg.CurrentHost(), Mode: executionOptions.ExternalMode,
+				Acknowledge: executionOptions.AcknowledgeExternal, Stdin: stdin, Output: stderr,
+				SourceRoot: executionOptions.SourceRoot,
+			}).Install(ctx, a.Pkg)
+			if err != nil {
+				out.Errors = append(out.Errors, fmt.Errorf("install %q (via external): %w", a.Pkg.ID, err))
+				continue
+			}
+			out.Installed = append(out.Installed, genvfile.LockedPackage{
+				ID: a.Pkg.ID, Manager: a.Manager, PkgName: a.PkgName,
+				InstalledVersion: installed.Version, External: installed.Receipt,
+			})
+			continue
+		}
+		if mgr := getAdapter(a.Manager); mgr != nil {
+			if _, trackOnly := mgr.(adapter.TrackOnly); trackOnly {
+				installed, qerr := mgr.Query(a.PkgName)
+				if qerr != nil {
+					out.Errors = append(out.Errors, fmt.Errorf("query %q (via %s): %w", a.Pkg.ID, a.Manager, qerr))
+					continue
+				}
+				if !installed {
+					out.Errors = append(out.Errors, fmt.Errorf("install %q (via %s): not on PATH — install it with the official installer, then re-run apply", a.Pkg.ID, a.Manager))
+					continue
+				}
+				out.Installed = append(out.Installed, genvfile.LockedPackage{
+					ID:      a.Pkg.ID,
+					Manager: a.Manager,
+					PkgName: a.PkgName,
+				})
+				continue
+			}
+		}
+		// Unattended runs never prompt. sudo is made non-interactive, and a
+		// command that would still need elevation fails closed: ApplyExecution
+		// has no Skipped channel (unlike UpgradeExecution), and running the
+		// command anyway would block on a prompt nobody can answer.
+		argv := a.Cmd
+		if executionOptions.Unattended {
+			argv = withNoninteractiveSudo(argv)
+			if skipUnattendedElevation(true, argv) {
+				out.Errors = append(out.Errors, fmt.Errorf("install %q (via %s): %s", a.Pkg.ID, a.Manager, unattendedElevationReason))
+				continue
+			}
+		}
+		if err := runSubcmd(ctx, argv, stdin, stdout, stderr); err != nil {
 			out.Errors = append(out.Errors, fmt.Errorf("install %q (via %s): %w", a.Pkg.ID, a.Manager, err))
 		} else {
 			lp := genvfile.LockedPackage{
@@ -440,4 +1070,45 @@ func ExecuteApply(ctx context.Context, result ReconcileResult, stdin io.Reader, 
 	}
 
 	return out
+}
+
+// FillMissingInstalledVersions writes InstalledVersion on lock entries that
+// lack one, using each manager's VersionLister inventory when that listing
+// already reports versions. Existing versions are left unchanged. Managers
+// that are not VersionListers, failed listings, and names absent from the
+// inventory are skipped.
+func FillMissingInstalledVersions(pkgs []genvfile.LockedPackage) {
+	byMgr := make(map[string][]int)
+	for i, lp := range pkgs {
+		if lp.InstalledVersion != "" || lp.Manager == "" {
+			continue
+		}
+		byMgr[lp.Manager] = append(byMgr[lp.Manager], i)
+	}
+	for mgrName, idxs := range byMgr {
+		mgr := adapter.ByName(mgrName)
+		if mgr == nil {
+			continue
+		}
+		versionLister, ok := mgr.(adapter.VersionLister)
+		if !ok {
+			continue
+		}
+		listed, err := CallTimed(versionLister.ListInstalledVersions, DefaultLiveListTimeout)
+		if err != nil || len(listed) == 0 {
+			continue
+		}
+		for _, i := range idxs {
+			if v := listed[pkgs[i].PkgName]; v != "" {
+				pkgs[i].InstalledVersion = v
+				continue
+			}
+			for name, ver := range listed {
+				if ver != "" && strings.EqualFold(name, pkgs[i].PkgName) {
+					pkgs[i].InstalledVersion = ver
+					break
+				}
+			}
+		}
+	}
 }

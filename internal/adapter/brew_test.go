@@ -1,0 +1,364 @@
+package adapter
+
+import (
+	"maps"
+	"os"
+	"testing"
+)
+
+func TestBrew_Name(t *testing.T) {
+	if got := (Brew{}).Name(); got != "brew" {
+		t.Errorf("Name() = %q, want %q", got, "brew")
+	}
+}
+
+func TestLinuxbrew_Name(t *testing.T) {
+	if got := (Linuxbrew{}).Name(); got != "linuxbrew" {
+		t.Errorf("Name() = %q, want %q", got, "linuxbrew")
+	}
+}
+
+func TestBrew_PlanInstall(t *testing.T) {
+	args := Brew{}.PlanInstall("git")
+	want := []string{"brew", "install", "git"}
+	if len(args) != len(want) {
+		t.Fatalf("PlanInstall: got %v, want %v", args, want)
+	}
+	for i, w := range want {
+		if args[i] != w {
+			t.Errorf("PlanInstall[%d] = %q, want %q", i, args[i], w)
+		}
+	}
+}
+
+func TestBrew_PlanUninstall(t *testing.T) {
+	args := Brew{}.PlanUninstall("git")
+	want := []string{"brew", "uninstall", "git"}
+	if len(args) != len(want) {
+		t.Fatalf("PlanUninstall: got %v, want %v", args, want)
+	}
+	for i, w := range want {
+		if args[i] != w {
+			t.Errorf("PlanUninstall[%d] = %q, want %q", i, args[i], w)
+		}
+	}
+}
+
+func TestBrew_PlanClean(t *testing.T) {
+	cmds := Brew{}.PlanClean()
+	if len(cmds) != 1 {
+		t.Fatalf("PlanClean: expected 1 command, got %v", cmds)
+	}
+	want := []string{"brew", "cleanup"}
+	if len(cmds[0]) != len(want) {
+		t.Fatalf("PlanClean[0]: got %v, want %v", cmds[0], want)
+	}
+	for i, w := range want {
+		if cmds[0][i] != w {
+			t.Errorf("PlanClean[0][%d] = %q, want %q", i, cmds[0][i], w)
+		}
+	}
+}
+
+func TestBrew_PlanUpgradeBatch(t *testing.T) {
+	args := Brew{}.PlanUpgradeBatch([]string{"git", "neovim"})
+	want := []string{"brew", "upgrade", "git", "neovim"}
+	if len(args) != len(want) {
+		t.Fatalf("PlanUpgradeBatch: got %v, want %v", args, want)
+	}
+	for i, w := range want {
+		if args[i] != w {
+			t.Errorf("PlanUpgradeBatch[%d] = %q, want %q", i, args[i], w)
+		}
+	}
+}
+
+func TestLinuxbrew_PlanUpgradeBatch(t *testing.T) {
+	args := Linuxbrew{}.PlanUpgradeBatch([]string{"git"})
+	want := []string{"brew", "upgrade", "git"}
+	if len(args) != len(want) {
+		t.Fatalf("PlanUpgradeBatch: got %v, want %v", args, want)
+	}
+	for i, w := range want {
+		if args[i] != w {
+			t.Errorf("PlanUpgradeBatch[%d] = %q, want %q", i, args[i], w)
+		}
+	}
+}
+
+// TestBrew_ListInstalled_UsesSingleDashOne is a regression test for a bug
+// where the adapter passed "--1" (an unrecognized flag that makes brew print
+// its usage banner and exit 0) instead of "-1" (one-per-line output). With
+// the wrong flag, ListInstalled silently returned zero packages on every
+// real machine, which broke "genv scan" for every brew/linuxbrew user.
+func TestBrew_ListInstalled_UsesSingleDashOne(t *testing.T) {
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "list" ] && [ "$2" = "--formula" ] && [ "$3" = "-1" ]; then
+	echo "formula-a"
+	echo "formula-b"
+	exit 0
+fi
+if [ "$1" = "list" ] && [ "$2" = "--cask" ] && [ "$3" = "-1" ]; then
+	echo "cask-a"
+	exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1`)
+
+	pkgs, err := Brew{}.ListInstalled()
+	if err != nil {
+		t.Fatalf("ListInstalled: unexpected error: %v", err)
+	}
+	want := []string{"formula-a", "formula-b", "cask-a"}
+	if len(pkgs) != len(want) {
+		t.Fatalf("ListInstalled: got %v, want %v", pkgs, want)
+	}
+	for i, w := range want {
+		if pkgs[i] != w {
+			t.Errorf("ListInstalled[%d] = %q, want %q", i, pkgs[i], w)
+		}
+	}
+}
+
+// TestBrew_ListForScan_LeavesPlusCasks is the #130 contract: default scan
+// must propose brew leaves and casks, not the full formula tree (openssl@3,
+// libpng, gettext, …) that `brew list --formula` reports.
+func TestBrew_ListForScan_LeavesPlusCasks(t *testing.T) {
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "leaves" ]; then
+	echo "git"
+	echo "neovim"
+	exit 0
+fi
+if [ "$1" = "list" ] && [ "$2" = "--cask" ] && [ "$3" = "-1" ]; then
+	echo "iterm2"
+	exit 0
+fi
+if [ "$1" = "list" ] && [ "$2" = "--formula" ] && [ "$3" = "-1" ]; then
+	echo "git"
+	echo "neovim"
+	echo "openssl@3"
+	echo "libpng"
+	echo "gettext"
+	exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1`)
+
+	pkgs, err := Brew{}.ListForScan()
+	if err != nil {
+		t.Fatalf("ListForScan: unexpected error: %v", err)
+	}
+	want := []string{"git", "neovim", "iterm2"}
+	if len(pkgs) != len(want) {
+		t.Fatalf("ListForScan: got %v, want %v", pkgs, want)
+	}
+	for i, w := range want {
+		if pkgs[i] != w {
+			t.Errorf("ListForScan[%d] = %q, want %q", i, pkgs[i], w)
+		}
+	}
+	for _, noise := range []string{"openssl@3", "libpng", "gettext"} {
+		for _, got := range pkgs {
+			if got == noise {
+				t.Errorf("ListForScan included brew dependency %q", noise)
+			}
+		}
+	}
+}
+
+func TestLinuxbrew_ListForScan_LeavesOnly(t *testing.T) {
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "leaves" ]; then
+	echo "jq"
+	exit 0
+fi
+if [ "$1" = "list" ] && [ "$2" = "--formula" ] && [ "$3" = "-1" ]; then
+	echo "jq"
+	echo "openssl@3"
+	exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1`)
+
+	pkgs, err := Linuxbrew{}.ListForScan()
+	if err != nil {
+		t.Fatalf("ListForScan: unexpected error: %v", err)
+	}
+	want := []string{"jq"}
+	if len(pkgs) != len(want) || pkgs[0] != want[0] {
+		t.Fatalf("ListForScan: got %v, want %v", pkgs, want)
+	}
+}
+
+func TestLinuxbrew_ListInstalled_UsesSingleDashOne(t *testing.T) {
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "list" ] && [ "$2" = "--formula" ] && [ "$3" = "-1" ]; then
+	echo "formula-a"
+	exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1`)
+
+	pkgs, err := Linuxbrew{}.ListInstalled()
+	if err != nil {
+		t.Fatalf("ListInstalled: unexpected error: %v", err)
+	}
+	want := []string{"formula-a"}
+	if len(pkgs) != len(want) {
+		t.Fatalf("ListInstalled: got %v, want %v", pkgs, want)
+	}
+	if pkgs[0] != want[0] {
+		t.Errorf("ListInstalled[0] = %q, want %q", pkgs[0], want[0])
+	}
+}
+
+func TestBrew_Query_NotInstalled(t *testing.T) {
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "list" ] && [ "$2" = "--formula" ] && [ "$3" = "__genv_missing__" ]; then
+	exit 1
+fi
+if [ "$1" = "list" ] && [ "$2" = "--cask" ] && [ "$3" = "__genv_missing__" ]; then
+	exit 1
+fi`)
+	ok, err := Brew{}.Query("__genv_missing__")
+	if err != nil {
+		t.Fatalf("Query: unexpected error: %v", err)
+	}
+	if ok {
+		t.Error("Query: expected false for missing package")
+	}
+}
+
+func TestBrew_Query_InstalledFormula(t *testing.T) {
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "list" ] && [ "$2" = "--formula" ] && [ "$3" = "jq" ]; then
+	exit 0
+fi
+exit 1`)
+	ok, err := Brew{}.Query("jq")
+	if err != nil {
+		t.Fatalf("Query: unexpected error: %v", err)
+	}
+	if !ok {
+		t.Error("Query: expected true for installed formula")
+	}
+}
+
+func TestBrew_Query_InstalledCask(t *testing.T) {
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "list" ] && [ "$2" = "--formula" ]; then
+	exit 1
+fi
+if [ "$1" = "list" ] && [ "$2" = "--cask" ] && [ "$3" = "docker" ]; then
+	exit 0
+fi
+exit 1`)
+	ok, err := Brew{}.Query("docker")
+	if err != nil {
+		t.Fatalf("Query: unexpected error: %v", err)
+	}
+	if !ok {
+		t.Error("Query: expected true for installed cask")
+	}
+}
+
+func TestBrew_Available(t *testing.T) {
+	orig := lookPath
+	t.Cleanup(func() { lookPath = orig })
+
+	lookPath = func(name string) (string, error) {
+		if name == "brew" {
+			return "/opt/homebrew/bin/brew", nil
+		}
+		return "", &os.PathError{Op: "lookpath", Err: os.ErrNotExist}
+	}
+	if !(Brew{}).Available() {
+		t.Error("Available() = false when lookPath finds brew")
+	}
+
+	lookPath = func(string) (string, error) {
+		return "", &os.PathError{Op: "lookpath", Err: os.ErrNotExist}
+	}
+	if (Brew{}).Available() {
+		t.Error("Available() = true when lookPath fails")
+	}
+}
+
+func TestBrew_ListInstalledVersions_returnsVersionsAndExecsListOnce(t *testing.T) {
+	// Given
+	counterPath := t.TempDir() + "/count"
+	t.Setenv("GENV_FAKE_COUNTER", counterPath)
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "list" ] && [ "$2" = "--versions" ]; then
+  count=$(cat "$GENV_FAKE_COUNTER" 2>/dev/null || printf 0)
+  count=$((count + 1))
+  printf "%s" "$count" > "$GENV_FAKE_COUNTER"
+  cat <<'EOF'
+git 2.45.0
+foo 1.0.0 extra tokens here
+bar 3.0
+EOF
+  exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1`)
+
+	// When
+	versions, err := Brew{}.ListInstalledVersions()
+	// Then
+	if err != nil {
+		t.Fatalf("ListInstalledVersions: unexpected error: %v", err)
+	}
+	want := map[string]string{
+		"git": "2.45.0",
+		"foo": "1.0.0 extra tokens here",
+		"bar": "3.0",
+	}
+	if !maps.Equal(versions, want) {
+		t.Errorf("ListInstalledVersions: got %v, want %v", versions, want)
+	}
+	count, err := os.ReadFile(counterPath)
+	if err != nil {
+		t.Fatalf("counter: %v", err)
+	}
+	if string(count) != "1" {
+		t.Errorf("brew list --versions exec count = %q, want 1", string(count))
+	}
+}
+
+func TestLinuxbrew_ListInstalledVersions_returnsVersionsAndExecsListOnce(t *testing.T) {
+	// Given
+	counterPath := t.TempDir() + "/count"
+	t.Setenv("GENV_FAKE_COUNTER", counterPath)
+	installFakeBinary(t, "brew",
+		`if [ "$1" = "list" ] && [ "$2" = "--versions" ]; then
+  count=$(cat "$GENV_FAKE_COUNTER" 2>/dev/null || printf 0)
+  count=$((count + 1))
+  printf "%s" "$count" > "$GENV_FAKE_COUNTER"
+  cat <<'EOF'
+node 20.12.0
+EOF
+  exit 0
+fi
+echo "unexpected args: $*" >&2
+exit 1`)
+
+	// When
+	versions, err := Linuxbrew{}.ListInstalledVersions()
+	// Then
+	if err != nil {
+		t.Fatalf("ListInstalledVersions: unexpected error: %v", err)
+	}
+	want := map[string]string{"node": "20.12.0"}
+	if !maps.Equal(versions, want) {
+		t.Errorf("ListInstalledVersions: got %v, want %v", versions, want)
+	}
+	count, err := os.ReadFile(counterPath)
+	if err != nil {
+		t.Fatalf("counter: %v", err)
+	}
+	if string(count) != "1" {
+		t.Errorf("brew list --versions exec count = %q, want 1", string(count))
+	}
+}

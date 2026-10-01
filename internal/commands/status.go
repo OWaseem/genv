@@ -1,8 +1,14 @@
 package commands
 
 import (
+	"context"
+	"strings"
+
+	"github.com/ks1686/genv/internal/adapter"
+	externalpkg "github.com/ks1686/genv/internal/external"
 	"github.com/ks1686/genv/internal/genvfile"
 	"github.com/ks1686/genv/internal/schema"
+	"github.com/ks1686/genv/internal/verify"
 	"github.com/ks1686/genv/internal/version"
 )
 
@@ -18,13 +24,25 @@ const (
 	// InstalledVersion does not satisfy the spec version constraint.
 	StatusDrift StatusKind = "drift"
 
-	// StatusMissing means the package is in the spec but has no lock entry —
-	// it has never been installed by genv (run 'genv apply').
+	// StatusMissing means the package is in the spec but has no lock entry and
+	// is not installed on the live system (run 'genv apply').
 	StatusMissing StatusKind = "missing"
+
+	// StatusPresent means the package is in the spec, not in the lock, but
+	// already installed via its manager. Apply will adopt it without installing.
+	StatusPresent StatusKind = "present"
 
 	// StatusExtra means the package is in the lock but not in the spec —
 	// it was removed from the spec without being uninstalled (run 'genv apply').
 	StatusExtra StatusKind = "extra"
+
+	// StatusUnknown means the package is in both the spec and the lock, but
+	// the lock records no installed version, so genv cannot claim it is
+	// installed. This is what a failed install leaves behind: the entry is
+	// present, but no version was ever produced, and treating the entry's
+	// presence as proof made the state unrecoverable — the check that would
+	// have re-checked it was gated on the very thing that was missing (#213).
+	StatusUnknown StatusKind = "unknown"
 )
 
 // StatusEntry is one row in the status report.
@@ -37,16 +55,116 @@ type StatusEntry struct {
 	InstalledVersion string // recorded version from lock, may be empty
 }
 
+// DisplayVersion is the human-readable version column for a status row.
+// A recorded install version wins. "*" means no spec constraint (and no
+// recorded install version). "?" means a constraint exists but the lock has
+// no installed version. The StatusUnknown kind is the signal that genv cannot
+// confirm an install; the column keeps its own distinct meaning.
+func (e StatusEntry) DisplayVersion() string {
+	if e.InstalledVersion != "" {
+		return e.InstalledVersion
+	}
+	if e.SpecVersion == "" {
+		return "*"
+	}
+	return "?"
+}
+
 // Status computes the three-way diff between the spec (genv.json) and the lock
 // file (genv.lock.json). It does not query the live system — the lock file is
 // the record of what genv last installed.
-//
-// Categories:
-//   - ok:      in spec and lock, version constraint satisfied (or unconstrained)
-//   - drift:   in spec and lock, but InstalledVersion fails the spec constraint
-//   - missing: in spec only (genv apply needed)
-//   - extra:   in lock only (removed from spec without genv remove / genv apply)
 func Status(f *schema.GenvFile, lf *genvfile.LockFile) []StatusEntry {
+	return StatusWithLive(f, lf, nil)
+}
+
+// StatusWithVerify is Status using per-package manager Query results instead of
+// the lock-trusted installed set or a bulk ListInstalled inventory.
+func StatusWithVerify(f *schema.GenvFile, lf *genvfile.LockFile, results []verify.Result) []StatusEntry {
+	if lf == nil {
+		lf = &genvfile.LockFile{}
+	}
+	lockByID := make(map[string]genvfile.LockedPackage, len(lf.Packages))
+	for _, lp := range lf.Packages {
+		lockByID[lp.ID] = lp
+	}
+	specByID := make(map[string]bool, len(f.Packages))
+	for _, pkg := range f.Packages {
+		specByID[pkg.ID] = true
+	}
+	byID := make(map[string]verify.Result, len(results))
+	for _, r := range results {
+		byID[r.PackageID] = r
+	}
+
+	var entries []StatusEntry
+	for _, pkg := range f.Packages {
+		r := byID[pkg.ID]
+		lp, inLock := lockByID[pkg.ID]
+		manager := r.Manager
+		pkgName := r.PkgName
+		if manager == "" && inLock {
+			manager = lp.Manager
+			pkgName = lp.PkgName
+		}
+		if !inLock {
+			if r.OK() {
+				entries = append(entries, StatusEntry{
+					ID:               pkg.ID,
+					Manager:          manager,
+					PkgName:          pkgName,
+					Kind:             StatusPresent,
+					SpecVersion:      pkg.Version,
+					InstalledVersion: r.Version,
+				})
+				continue
+			}
+			entries = append(entries, StatusEntry{
+				ID:          pkg.ID,
+				Manager:     manager,
+				PkgName:     pkgName,
+				Kind:        StatusMissing,
+				SpecVersion: pkg.Version,
+			})
+			continue
+		}
+		installedVersion := r.Version
+		if installedVersion == "" && r.OK() {
+			installedVersion = lp.InstalledVersion
+		}
+		kind := StatusOK
+		if !r.OK() {
+			kind = StatusDrift
+			installedVersion = ""
+		} else if r.Drift || (installedVersion != "" && !version.Satisfies(pkg.Version, installedVersion)) {
+			kind = StatusDrift
+		}
+		entries = append(entries, StatusEntry{
+			ID:               pkg.ID,
+			Manager:          manager,
+			PkgName:          pkgName,
+			Kind:             kind,
+			SpecVersion:      pkg.Version,
+			InstalledVersion: installedVersion,
+		})
+	}
+
+	for _, lp := range lf.Packages {
+		if !specByID[lp.ID] {
+			entries = append(entries, StatusEntry{
+				ID:               lp.ID,
+				Manager:          lp.Manager,
+				PkgName:          lp.PkgName,
+				Kind:             StatusExtra,
+				InstalledVersion: lp.InstalledVersion,
+			})
+		}
+	}
+	return entries
+}
+
+// StatusWithLive is Status plus a live inventory (manager → native names).
+// Unlocked spec packages that are live-installed are StatusPresent.
+func StatusWithLive(f *schema.GenvFile, lf *genvfile.LockFile, live map[string]map[string]bool) []StatusEntry {
 	lockByID := make(map[string]genvfile.LockedPackage, len(lf.Packages))
 	for _, lp := range lf.Packages {
 		lockByID[lp.ID] = lp
@@ -58,10 +176,40 @@ func Status(f *schema.GenvFile, lf *genvfile.LockFile) []StatusEntry {
 
 	var entries []StatusEntry
 
-	// Spec-side pass: ok, drift, or missing.
 	for _, pkg := range f.Packages {
 		lp, inLock := lockByID[pkg.ID]
+		if pkg.External != nil {
+			var locked *genvfile.LockedPackage
+			if inLock {
+				locked = &lp
+			}
+			state := externalpkg.InspectLocal(context.Background(), pkg, locked)
+			if !inLock {
+				kind := StatusMissing
+				if state.Present {
+					kind = StatusPresent
+				}
+				entries = append(entries, StatusEntry{ID: pkg.ID, Manager: "external", PkgName: pkg.ID, Kind: kind, SpecVersion: pkg.Version, InstalledVersion: state.Version})
+				continue
+			}
+			kind := StatusOK
+			if !state.Present || state.Drift || !version.Satisfies(pkg.Version, state.Version) {
+				kind = StatusDrift
+			}
+			entries = append(entries, StatusEntry{ID: pkg.ID, Manager: lp.Manager, PkgName: lp.PkgName, Kind: kind, SpecVersion: pkg.Version, InstalledVersion: state.Version})
+			continue
+		}
 		if !inLock {
+			if mgr, name, ok := liveMatch(pkg, live); ok {
+				entries = append(entries, StatusEntry{
+					ID:          pkg.ID,
+					Manager:     mgr,
+					PkgName:     name,
+					Kind:        StatusPresent,
+					SpecVersion: pkg.Version,
+				})
+				continue
+			}
 			entries = append(entries, StatusEntry{
 				ID:          pkg.ID,
 				Kind:        StatusMissing,
@@ -70,9 +218,19 @@ func Status(f *schema.GenvFile, lf *genvfile.LockFile) []StatusEntry {
 			continue
 		}
 		kind := StatusOK
-		// Only report drift when an installed version is actually recorded.
-		if lp.InstalledVersion != "" && !version.Satisfies(pkg.Version, lp.InstalledVersion) {
+		switch {
+		case lp.InstalledVersion != "" && !version.Satisfies(pkg.Version, lp.InstalledVersion):
 			kind = StatusDrift
+		case lp.InstalledVersion == "" && liveReportsAbsent(live, lp.Manager, lp.PkgName):
+			// #213: a lock entry with no recorded version is not evidence of
+			// an install — that is the state a failed install leaves behind.
+			// But plenty of managers never report a version, so the missing
+			// version alone is not enough to call a healthy system bad. Only
+			// flag it when the live inventory positively contradicts the
+			// lock: the manager was inventoried and does not list the
+			// package. The same evidence gates the reconciler's re-check, so
+			// status never reports something apply would not act on.
+			kind = StatusUnknown
 		}
 		entries = append(entries, StatusEntry{
 			ID:               pkg.ID,
@@ -84,7 +242,6 @@ func Status(f *schema.GenvFile, lf *genvfile.LockFile) []StatusEntry {
 		})
 	}
 
-	// Lock-side pass: extra entries not in spec.
 	for _, lp := range lf.Packages {
 		if !specByID[lp.ID] {
 			entries = append(entries, StatusEntry{
@@ -98,4 +255,62 @@ func Status(f *schema.GenvFile, lf *genvfile.LockFile) []StatusEntry {
 	}
 
 	return entries
+}
+
+func liveMatch(pkg schema.Package, live map[string]map[string]bool) (manager, pkgName string, ok bool) {
+	if live == nil {
+		return "", "", false
+	}
+	try := func(mgr string) (string, string, bool) {
+		if mgr == "" {
+			return "", "", false
+		}
+		name := pkg.ID
+		if a := adapter.ByName(mgr); a != nil {
+			name, _ = a.NormalizeID(pkg.ID, pkg.Managers)
+		} else if n, exists := pkg.Managers[mgr]; exists {
+			name = n
+		}
+		if liveHas(live, mgr, name) {
+			return mgr, name, true
+		}
+		return "", "", false
+	}
+	if mgr, name, ok := try(pkg.Prefer); ok {
+		return mgr, name, true
+	}
+	for mgr := range pkg.Managers {
+		if m, name, ok := try(mgr); ok {
+			return m, name, true
+		}
+	}
+	return "", "", false
+}
+
+// liveReportsAbsent reports whether the live inventory positively contradicts
+// the lock: the manager was inventoried and does not list the package.
+//
+// A manager that was never inventoried — unavailable, or whose listing failed —
+// yields false, so an unavailable manager can never manufacture a false alarm.
+func liveReportsAbsent(live map[string]map[string]bool, manager, pkgName string) bool {
+	if live == nil || manager == "" || pkgName == "" {
+		return false
+	}
+	if _, inventoried := live[manager]; !inventoried {
+		return false
+	}
+	return !liveHas(live, manager, pkgName)
+}
+
+func liveHas(live map[string]map[string]bool, manager, pkgName string) bool {
+	names := live[manager]
+	if names[pkgName] {
+		return true
+	}
+	for n := range names {
+		if strings.EqualFold(n, pkgName) {
+			return true
+		}
+	}
+	return false
 }

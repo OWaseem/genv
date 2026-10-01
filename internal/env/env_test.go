@@ -3,6 +3,7 @@ package env
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -17,6 +18,8 @@ func TestShellQuoteRoundtrip(t *testing.T) {
 		"simple",
 		"with spaces",
 		"has'single'quote",
+		"'leading-quote",
+		"trailing-quote'",
 		`has"double"quote`,
 		"dollar$sign",
 		"back`tick`here",
@@ -133,8 +136,26 @@ func TestWriteFragment_Deterministic(t *testing.T) {
 	iAAA := strings.Index(content, "export AAA=")
 	iMMM := strings.Index(content, "export MMM=")
 	iZZZ := strings.Index(content, "export ZZZ=")
-	if !(iAAA < iMMM && iMMM < iZZZ) {
+	if iAAA >= iMMM || iMMM >= iZZZ {
 		t.Errorf("fragment not sorted: AAA@%d MMM@%d ZZZ@%d\n%s", iAAA, iMMM, iZZZ, content)
+	}
+}
+
+func TestWriteFragment_Mode0600(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits are not POSIX on Windows")
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "env.sh")
+	if err := WriteFragment(path, map[string]schema.EnvVar{"X": {Value: "1"}}); err != nil {
+		t.Fatalf("WriteFragment: %v", err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat: %v", err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("fragment mode = %o, want 0600", got)
 	}
 }
 
@@ -154,14 +175,15 @@ func TestInjectSourceLine_AddsOnce(t *testing.T) {
 		t.Error("expected fragment path in rc file")
 	}
 
-	// Second injection — should not duplicate.
+	// Second injection — should not duplicate. Count the block marker rather
+	// than the path: a guarded source line names the fragment twice, once in
+	// the readability test and once in the dot-source.
 	if err := InjectSourceLine(rc, frag); err != nil {
 		t.Fatalf("InjectSourceLine (2nd): %v", err)
 	}
 	data2, _ := os.ReadFile(rc)
-	count := strings.Count(string(data2), frag)
-	if count != 1 {
-		t.Errorf("expected fragment referenced once, found %d times", count)
+	if count := strings.Count(string(data2), envBlockMarker); count != 1 {
+		t.Errorf("expected one genv env block, found %d", count)
 	}
 }
 
@@ -175,6 +197,27 @@ func TestInjectSourceLine_CreatesRcFile(t *testing.T) {
 	}
 	if _, err := os.Stat(rc); err != nil {
 		t.Errorf("expected rc file to be created: %v", err)
+	}
+}
+
+func TestInjectSourceLine_QuotesFragmentPath(t *testing.T) {
+	dir := t.TempDir()
+	rc := filepath.Join(dir, ".bashrc")
+	frag := "/tmp/frag';echo pwned #.sh"
+
+	if err := InjectSourceLine(rc, frag); err != nil {
+		t.Fatalf("InjectSourceLine: %v", err)
+	}
+	data, err := os.ReadFile(rc)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	content := string(data)
+	if strings.Contains(content, ". /tmp/frag';echo pwned #.sh") {
+		t.Fatalf("source line is unquoted and injectable: %s", content)
+	}
+	if !strings.Contains(content, ". '/tmp/frag'\\'';echo pwned #.sh'") {
+		t.Fatalf("expected quoted source line, got: %s", content)
 	}
 }
 

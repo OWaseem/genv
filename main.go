@@ -8,25 +8,47 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/ks1686/genv/internal/adapter"
 	"github.com/ks1686/genv/internal/commands"
+	"github.com/ks1686/genv/internal/complete"
 	genvenv "github.com/ks1686/genv/internal/env"
+	externalpkg "github.com/ks1686/genv/internal/external"
+	"github.com/ks1686/genv/internal/files"
 	"github.com/ks1686/genv/internal/genvfile"
+	"github.com/ks1686/genv/internal/hooks"
+	"github.com/ks1686/genv/internal/host"
+	"github.com/ks1686/genv/internal/lockgate"
 	"github.com/ks1686/genv/internal/logging"
 	"github.com/ks1686/genv/internal/output"
+	"github.com/ks1686/genv/internal/profile"
+	"github.com/ks1686/genv/internal/profilebackend"
 	"github.com/ks1686/genv/internal/resolver"
 	"github.com/ks1686/genv/internal/schema"
 	"github.com/ks1686/genv/internal/search"
 	"github.com/ks1686/genv/internal/service"
 	"github.com/ks1686/genv/internal/shellcfg"
+	"github.com/ks1686/genv/internal/target"
+	"github.com/ks1686/genv/internal/upgrade"
+	"github.com/ks1686/genv/internal/verify"
 )
+
+func runForegroundCommand(argv []string) error {
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
 
 //go:embed completions/genv.bash
 var completionBash string
@@ -37,6 +59,9 @@ var completionZsh string
 //go:embed completions/genv.fish
 var completionFish string
 
+//go:embed completions/genv.ps1
+var completionPowerShell string
+
 // Structured exit codes.
 const (
 	exitOK         = 0 // success
@@ -44,6 +69,13 @@ const (
 	exitIO         = 2 // filesystem or serialization error
 	exitValidation = 3 // genv.json fails schema validation
 	exitLogic      = 4 // semantic error (duplicate id, not found, etc.)
+)
+
+// --target applies to every portable spec (schemaVersion 8+). Keep these
+// version-agnostic so help does not go stale when the current schemaVersion moves.
+const (
+	targetFlagHelp            = "portable target id for current schemaVersion specs"
+	targetFlagHelpWithDefault = "portable target id for current schemaVersion specs (defaults to $GENV_TARGET or host classification)"
 )
 
 var (
@@ -99,12 +131,24 @@ func run(args []string) int {
 		return scanCmd(args[1:])
 	case "status":
 		return statusCmd(args[1:])
+	case "profile":
+		return profileCmd(args[1:])
 	case "completion":
 		return completionCmd(args[1:])
 	case "validate":
 		return validateCmd(args[1:])
 	case "upgrade":
 		return upgradeCmd(args[1:])
+	case "updates":
+		return updatesCmd(args[1:])
+	case "pull":
+		return pullCmd(args[1:])
+	case "migrate":
+		return migrateCmd(args[1:])
+	case "export":
+		return exportCmd(args[1:])
+	case "map":
+		return mapCmd(args[1:])
 	case "init":
 		return initCmd(args[1:])
 	case "env":
@@ -113,6 +157,8 @@ func run(args []string) int {
 		return shellCmd(args[1:])
 	case "service":
 		return serviceCmd(args[1:])
+	case "files":
+		return filesCmd(args[1:])
 	case "__complete":
 		return completeInternalCmd(args[1:])
 	case "version", "--version":
@@ -145,11 +191,20 @@ func fprintf(w io.Writer, format string, a ...any) { _, _ = fmt.Fprintf(w, forma
 func fPrintln(w io.Writer, a ...any)               { _, _ = fmt.Fprintln(w, a...) }
 func fprint(w io.Writer, a ...any)                 { _, _ = fmt.Fprint(w, a...) }
 
+// confirmReader is the buffered stdin shared by every prompt in a run, so a
+// piped "y\ny\n" is not swallowed by the first prompt and read as EOF by the
+// second. It is created on first use rather than at init so that it wraps
+// whatever os.Stdin is at that moment.
+var confirmReader *bufio.Reader
+
 // confirm writes prompt to stdout and reads a y/Y response from stdin.
 // Returns true if the user confirmed.
 func confirm(prompt string) bool {
 	fprint(os.Stdout, prompt)
-	answer, _ := bufio.NewReader(os.Stdin).ReadString('\n')
+	if confirmReader == nil {
+		confirmReader = bufio.NewReader(os.Stdin)
+	}
+	answer, _ := confirmReader.ReadString('\n')
 	answer = strings.TrimSpace(answer)
 	return answer == "y" || answer == "Y"
 }
@@ -192,7 +247,7 @@ func pickCandidate(id string, candidates []search.Candidate) *search.Candidate {
 	fprintf(os.Stdout, "multiple packages match %q — select one to install:\n\n", id)
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	for i, c := range candidates {
-		fmt.Fprintf(tw, "  [%d]\t%s:\t%s\n", i+1, c.Manager, c.PkgName)
+		_, _ = fmt.Fprintf(tw, "  [%d]\t%s:\t%s\n", i+1, c.Manager, c.PkgName)
 	}
 	_ = tw.Flush()
 	fprintf(os.Stdout, "\nselect [1-%d] or 0 to cancel: ", len(candidates))
@@ -204,25 +259,155 @@ func pickCandidate(id string, candidates []search.Candidate) *search.Candidate {
 	return &c
 }
 
-// addToSpec reads or creates the spec at file, records the package, and writes
-// it back. Prints "created <file>" when the file is brand-new. Returns an exit
-// code; exitOK means success.
-func addToSpec(file, id, version, prefer string, managers map[string]string) int {
+func resolveMutationTarget(commandName, file string, f *schema.GenvFile, targetFlag string) (string, int) {
+	if !schema.IsPortableVersion(f.SchemaVersion) {
+		return "", exitOK
+	}
+	targetID, err := target.Resolve(targetFlag)
+	if err != nil {
+		fprintf(os.Stderr, "genv %s: %v\n", commandName, err)
+		return "", exitUsage
+	}
+	if _, err := commands.ActiveBundle(f, targetID); err != nil {
+		fprintf(os.Stderr, "genv %s: %v in %s\n", commandName, err, file)
+		return "", exitValidation
+	}
+	return targetID, exitOK
+}
+
+// resolveEffectiveSpec flattens a schemaVersion 8 target (MergeTarget) or applies
+// legacy host filtering so callers can read top-level packages/env/shell/services.
+// useSpecAdapters binds command adapters declared in f so Detect, ByName,
+// scan, and upgrade treat prefer: <custom> as a real manager.
+func useSpecAdapters(f *schema.GenvFile) {
+	if f == nil || len(f.Adapters) == 0 {
+		adapter.SetSpecAdapters(nil)
+		return
+	}
+	defs := make(map[string]adapter.CommandDef, len(f.Adapters))
+	for name, d := range f.Adapters {
+		defs[name] = adapter.CommandDef{
+			List:         d.List,
+			Install:      d.Install,
+			Remove:       d.Remove,
+			Upgrade:      d.Upgrade,
+			Version:      d.Version,
+			Outdated:     d.Outdated,
+			ListMatch:    d.ListMatch,
+			IDField:      d.IDField,
+			VersionField: d.VersionField,
+		}
+	}
+	adapter.SetSpecAdapters(adapter.CommandsFromDefs(defs))
+}
+
+func resolveEffectiveSpec(f *schema.GenvFile, hostName, targetFlag string) (*schema.GenvFile, string, error) {
+	if f == nil {
+		return nil, "", fmt.Errorf("genv file is nil")
+	}
+	useSpecAdapters(f)
+	if schema.IsPortableVersion(f.SchemaVersion) {
+		targetID, err := target.Resolve(targetFlag)
+		if err != nil {
+			return nil, "", err
+		}
+		if f.Targets[targetID] == nil {
+			return nil, "", fmt.Errorf("no matching targets.%s", targetID)
+		}
+		effective, err := schema.MergeTarget(f, targetID)
+		if err != nil {
+			return nil, "", err
+		}
+		return effective, targetID, nil
+	}
+	return host.FilterForHost(f, hostName), "", nil
+}
+
+// materializeSpecForCommand resolves the effective flat spec for read paths
+// (status, upgrade, updates) using the same Resolve+MergeTarget path as apply.
+func materializeSpecForCommand(commandName, file string, f *schema.GenvFile, hostFlag, targetFlag string) (*schema.GenvFile, string, int) {
+	effective, targetID, err := resolveEffectiveSpec(f, hostForCommand(hostFlag), targetFlag)
+	if err == nil {
+		effective = schema.DropInapplicable(effective, runtime.GOOS)
+		return effective, targetID, exitOK
+	}
+	msg := err.Error()
+	switch {
+	case strings.Contains(msg, "resolve target") || strings.Contains(msg, "pass --target"):
+		fprintf(os.Stderr, "genv %s: %v\n", commandName, err)
+		return nil, "", exitUsage
+	case strings.HasPrefix(msg, "no matching targets."):
+		fprintf(os.Stderr, "genv %s: %s in %s\n", commandName, msg, file)
+		return nil, "", exitValidation
+	default:
+		fprintf(os.Stderr, "genv %s: %v\n", commandName, err)
+		return nil, "", exitValidation
+	}
+}
+
+// readMaterializedSpec loads genv.json and flattens the active v8 target (or
+// applies legacy host filtering) so callers can read top-level fields.
+func readMaterializedSpec(commandName, file, hostFlag, targetFlag string) (*schema.GenvFile, int) {
+	f, err := genvfile.Read(file)
+	if err != nil {
+		if errors.Is(err, genvfile.ErrNotFound) {
+			fprintf(os.Stderr, "genv %s: %s not found\n", commandName, file)
+			return nil, exitIO
+		}
+		fprintf(os.Stderr, "genv %s: %v\n", commandName, err)
+		if errors.Is(err, genvfile.ErrInvalidFile) {
+			return nil, exitValidation
+		}
+		return nil, exitIO
+	}
+	effective, _, code := materializeSpecForCommand(commandName, file, f, hostFlag, targetFlag)
+	return effective, code
+}
+
+// materializedHooks returns the effective hooks block for lifecycle commands.
+// Returns nil hooks (not an error) when the spec is missing or has no hooks.
+func materializedHooks(commandName, file, hostFlag, targetFlag string) (*schema.HooksConfig, int) {
+	f, err := genvfile.Read(file)
+	if err != nil {
+		return nil, exitOK
+	}
+	effective, _, code := materializeSpecForCommand(commandName, file, f, hostFlag, targetFlag)
+	if code != exitOK {
+		return nil, code
+	}
+	if effective == nil {
+		return nil, exitOK
+	}
+	return effective.Hooks, exitOK
+}
+
+// prepareAddSpec reads or creates the spec in memory and records the package
+// without writing. Callers persist with writePreparedAdd after a successful
+// install so unresolved/failed adds leave the file unchanged.
+func prepareAddSpec(file, id, version, prefer string, managers map[string]string, targetFlag string) (*schema.GenvFile, bool, int) {
 	f, isNew, err := genvfile.ReadOrNew(file)
 	if err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		if errors.Is(err, genvfile.ErrInvalidFile) {
-			return exitValidation
+			return nil, false, exitValidation
 		}
-		return exitIO
+		return nil, false, exitIO
 	}
-	if err := commands.Add(f, id, version, prefer, managers); err != nil {
+	targetID, exit := resolveMutationTarget("add", file, f, targetFlag)
+	if exit != exitOK {
+		return nil, false, exit
+	}
+	if err := commands.Add(f, id, version, prefer, managers, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		if errors.Is(err, commands.ErrAlreadyTracked) {
-			return exitLogic
+			return nil, false, exitLogic
 		}
-		return exitUsage
+		return nil, false, exitUsage
 	}
+	return f, isNew, exitOK
+}
+
+func writePreparedAdd(file string, f *schema.GenvFile, isNew bool) int {
 	if err := genvfile.Write(file, f); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		return exitIO
@@ -233,15 +418,115 @@ func addToSpec(file, id, version, prefer string, managers map[string]string) int
 	return exitOK
 }
 
+// addToSpec records a package and writes immediately. Used by adopt, which has
+// already verified the package is installed.
+func addToSpec(file, id, version, prefer string, managers map[string]string, targetFlag string) int {
+	f, isNew, exit := prepareAddSpec(file, id, version, prefer, managers, targetFlag)
+	if exit != exitOK {
+		return exit
+	}
+	return writePreparedAdd(file, f, isNew)
+}
+
 // appendLockEntry reads the lock at lockPath, appends lp, and writes it back.
 // Returns an exit code; exitOK means success.
-func appendLockEntry(lockPath string, lp genvfile.LockedPackage) int {
+func lockPathForSpec(file, override string) string {
+	return lockPathForState(file, "", override)
+}
+
+func lockPathForState(file, stateDir, override string) string {
+	if override != "" {
+		return override
+	}
+	dir, err := genvfile.ResolveStateDir(file, stateDir)
+	if err != nil {
+		return "genv.lock.json"
+	}
+	return genvfile.LockPathIn(dir)
+}
+
+func resolveApplyState(opts applyOptions) (stateDir, lockPath string, err error) {
+	stateDir, err = genvfile.ResolveStateDir(opts.File, opts.StateDir)
+	if err != nil {
+		return "", "", err
+	}
+	return stateDir, lockPathForState(opts.File, opts.StateDir, opts.LockFile), nil
+}
+
+func applyStatePaths(stateDir, lockPath string) output.StatePaths {
+	if stateDir == "" {
+		if dir, err := genvfile.DefaultDir(); err == nil {
+			stateDir = dir
+		}
+	}
+	envName, shellName := "env.sh", "shell.sh"
+	if runtime.GOOS == "windows" {
+		envName, shellName = "env.ps1", "shell.ps1"
+	}
+	return output.StatePaths{
+		Dir:   stateDir,
+		Lock:  lockPath,
+		Env:   filepath.Join(stateDir, envName),
+		Shell: filepath.Join(stateDir, shellName),
+	}
+}
+
+func printApplyStatePlan(w io.Writer, state output.StatePaths) {
+	fPrintln(w, "state:")
+	fprintf(w, "  lock: %s\n", state.Lock)
+	if state.Env != "" {
+		fprintf(w, "  env: %s\n", state.Env)
+	}
+	if state.Shell != "" {
+		fprintf(w, "  shell: %s\n", state.Shell)
+	}
+	fPrintln(w)
+}
+
+func guardApplyStateWrites(opts applyOptions, stateDir, lockPath string) error {
+	allowed, err := genvfile.ResolveStateDir(opts.File, opts.StateDir)
+	if err != nil {
+		return err
+	}
+	state := applyStatePaths(stateDir, lockPath)
+	if opts.LockFile == "" && !genvfile.WithinDir(allowed, lockPath) {
+		return fmt.Errorf("refusing to write lock %s outside %s (pass --lock-file or --state-dir)", lockPath, allowed)
+	}
+	if !genvfile.WithinDir(allowed, state.Env) {
+		return fmt.Errorf("refusing to write env fragment %s outside %s (pass --state-dir)", state.Env, allowed)
+	}
+	if !genvfile.WithinDir(allowed, state.Shell) {
+		return fmt.Errorf("refusing to write shell fragment %s outside %s (pass --state-dir)", state.Shell, allowed)
+	}
+	return nil
+}
+
+func stampLockTarget(lf *genvfile.LockFile, targetID string) {
+	if lf == nil || targetID == "" {
+		return
+	}
+	lf.Target = targetID
+	lf.GOOS = runtime.GOOS
+}
+
+// appendLockEntry reads the lock at lockPath, appends lp, and writes it back.
+// The read-modify-write runs under LockMutation and re-reads inside the lock,
+// so a concurrent apply, upgrade, or the scheduled worker cannot have its lock
+// snapshot overwritten by this append.
+func appendLockEntry(lockPath string, lp genvfile.LockedPackage, targetID string) int {
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
 		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
 		return exitIO
 	}
 	lf.Packages = append(lf.Packages, lp)
+	stampLockTarget(lf, targetID)
 	if err := genvfile.WriteLock(lockPath, lf); err != nil {
 		fprintf(os.Stderr, "genv: writing lock: %v\n", err)
 		return exitIO
@@ -249,10 +534,10 @@ func appendLockEntry(lockPath string, lp genvfile.LockedPackage) int {
 	return exitOK
 }
 
-// removeFromSpecAndReadLock reads the spec at file, removes id from it, writes
-// it back, then reads and returns the lock file. Returns the lock, the lock
-// path, and an exit code. exitOK means all steps succeeded.
-func removeFromSpecAndReadLock(file, id string) (*genvfile.LockFile, string, int) {
+// prepareRemoveSpec reads the spec at file and removes id in memory.
+// Callers persist with genvfile.Write after the corresponding system change
+// succeeds so a failed uninstall cannot desync the spec from the lock.
+func prepareRemoveSpec(file, id, targetFlag string) (*schema.GenvFile, string, int) {
 	f, err := genvfile.Read(file)
 	if err != nil {
 		if errors.Is(err, genvfile.ErrNotFound) {
@@ -265,25 +550,28 @@ func removeFromSpecAndReadLock(file, id string) (*genvfile.LockFile, string, int
 		}
 		return nil, "", exitIO
 	}
-	if err := commands.Remove(f, id); err != nil {
+	targetID, exit := resolveMutationTarget("remove", file, f, targetFlag)
+	if exit != exitOK {
+		return nil, "", exit
+	}
+	if err := commands.Remove(f, id, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		return nil, "", exitLogic
 	}
+	return f, targetID, exitOK
+}
+
+func writePreparedSpec(file string, f *schema.GenvFile) int {
 	if err := genvfile.Write(file, f); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
-		return nil, "", exitIO
+		return exitIO
 	}
-	lockPath := genvfile.LockPathFrom(file)
-	lf, err := genvfile.ReadLock(lockPath)
-	if err != nil {
-		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
-		return nil, "", exitIO
-	}
-	return lf, lockPath, exitOK
+	return exitOK
 }
 
 // addCmd implements `genv add <id> [flags]`.
-// Adds the package to genv.json and immediately installs it, then updates the lock.
+// Resolves and installs the package first, then records it in genv.json and
+// the lock. Unresolved or failed installs leave the spec unchanged.
 func addCmd(args []string) int {
 	fs := flag.NewFlagSet("add", flag.ContinueOnError)
 	fs.Usage = func() {
@@ -294,13 +582,22 @@ func addCmd(args []string) int {
 	}
 
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
 	version := fs.String("version", "", `version constraint, e.g. "0.10.*" (default: omitted, meaning any)`)
 	prefer := fs.String("prefer", "", "preferred package manager (e.g. brew)")
 	managerFlag := fs.String("manager", "", `manager-specific names, comma-separated mgr:name pairs (e.g. snap:hello,brew:hello)`)
 	noSearch := fs.Bool("no-search", false, "skip interactive package search and use id as-is")
+	noHooks := fs.Bool("no-hooks", false, "skip pre-add and post-add hooks")
+	hookTimeout := fs.Duration("hook-timeout", 0, "per-hook timeout, e.g. 5m or 30s (0 means no timeout)")
+	hostFlag := fs.String("host", "", "host name for host-specific records (defaults to host classification)")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	id, flagArgs := extractPositional(args)
 	if err := fs.Parse(flagArgs); err != nil {
+		return flagParseExit(err)
+	}
+	if *hookTimeout < 0 {
+		fPrintln(os.Stderr, "genv add: --hook-timeout must be non-negative")
 		return exitUsage
 	}
 	if id == "" {
@@ -316,7 +613,11 @@ func addCmd(args []string) int {
 	}
 
 	// Detect available managers once; used by both the search picker (step 0)
-	// and the resolver (step 2).
+	// and the resolver (step 2). Bind spec adapters first so prefer: <custom>
+	// can resolve before the spec is rewritten.
+	if existing, err := genvfile.Read(*file); err == nil {
+		useSpecAdapters(existing)
+	}
 	available := resolver.Detect()
 
 	// 0. When no explicit manager mapping is given and stdin is a terminal,
@@ -342,39 +643,92 @@ func addCmd(args []string) int {
 		}
 	}
 
-	// 1. Update genv.json.
-	if exit := addToSpec(*file, id, *version, *prefer, managers); exit != exitOK {
+	hostName := hostForCommand(*hostFlag)
+	lockPath := lockPathForSpec(*file, *lockFile)
+	lf, _ := genvfile.ReadLock(lockPath)
+	if !*noHooks {
+		hooksCfg, code := materializedHooks("add", *file, *hostFlag, *targetFlag)
+		if code != exitOK {
+			return code
+		}
+		if hooksCfg != nil && len(hooksCfg.PreAdd) > 0 {
+			profileName := ""
+			if lf != nil {
+				profileName = lf.ActiveProfile
+			}
+			errs := runHookPhase(context.Background(), hookPhaseRun{
+				Hooks:   hooksCfg.PreAdd,
+				Context: hookContext{Event: "add", Phase: "pre-add", Host: hostName, Profile: profileName, Installed: []string{id}}.withFiles(*file, lockPath),
+				Timeout: *hookTimeout, Stdout: os.Stdout, Stderr: os.Stderr,
+			})
+			if len(errs) > 0 {
+				fprintf(os.Stderr, "genv add: %s\n", errs[0])
+				return exitLogic
+			}
+		}
+	}
+
+	// 1. Validate and stage the spec in memory. Do not write until install succeeds.
+	prepared, isNew, exit := prepareAddSpec(*file, id, *version, *prefer, managers, *targetFlag)
+	if exit != exitOK {
 		return exit
 	}
 
-	// 2. Resolve and install the package.
+	// 2. Resolve and install. Track-only is `genv adopt`.
 	pkg := schema.Package{ID: id, Version: *version, Prefer: *prefer, Managers: managers}
 	action := resolver.ResolveOne(pkg, available)
 	if !action.Resolved() {
-		fprintf(os.Stdout, "added %s to spec (no manager available to install it now; run 'genv apply' after installing a compatible package manager)\n", id)
-		return exitOK
+		fprintf(os.Stderr, "genv add: no manager available to install %q; spec unchanged (use 'genv adopt' to track without installing)\n", id)
+		return exitLogic
 	}
 
-	fprintf(os.Stdout, "added %s — installing via %s\n", id, action.Manager)
+	fprintf(os.Stdout, "installing %s via %s\n", id, action.Manager)
 	fprintf(os.Stdout, "\n==> %s\n", strings.Join(action.Cmd, " "))
-	cmd := exec.Command(action.Cmd[0], action.Cmd[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		// Installation failure is non-fatal: the spec was already updated.
-		// The user can run 'genv apply' to retry.
-		fprintf(os.Stderr, "genv: installation failed: %v\n", err)
-		fPrintln(os.Stderr, "Package was added to spec. Run 'genv apply' to retry.")
-		return exitOK
+	if err := runForegroundCommand(action.Cmd); err != nil {
+		fprintf(os.Stderr, "genv add: installation failed: %v\n", err)
+		fPrintln(os.Stderr, "Spec unchanged. Fix the install error and retry, or use 'genv adopt' to track an already-installed package.")
+		return exitLogic
 	}
 
-	// 3. Update lock file.
-	return appendLockEntry(genvfile.LockPathFrom(*file), genvfile.LockedPackage{
+	// 3. Persist only after a successful install.
+	if exit := writePreparedAdd(*file, prepared, isNew); exit != exitOK {
+		return exit
+	}
+
+	// 4. Update lock file.
+	targetID, code := resolveMutationTarget("add", *file, prepared, *targetFlag)
+	if code != exitOK {
+		return code
+	}
+	exit = appendLockEntry(lockPath, genvfile.LockedPackage{
 		ID:      action.Pkg.ID,
 		Manager: action.Manager,
 		PkgName: action.PkgName,
+	}, targetID)
+	if exit != exitOK || *noHooks {
+		return exit
+	}
+	hooksCfg, code := materializedHooks("add", *file, *hostFlag, *targetFlag)
+	if code != exitOK {
+		return code
+	}
+	if hooksCfg == nil || len(hooksCfg.PostAdd) == 0 {
+		return exit
+	}
+	profileName := ""
+	if lf != nil {
+		profileName = lf.ActiveProfile
+	}
+	errs := runHookPhase(context.Background(), hookPhaseRun{
+		Hooks:   hooksCfg.PostAdd,
+		Context: hookContext{Event: "add", Phase: "post-add", Host: hostName, Profile: profileName, Installed: []string{id}}.withFiles(*file, lockPath),
+		Timeout: *hookTimeout, Stdout: os.Stdout, Stderr: os.Stderr,
 	})
+	if len(errs) > 0 {
+		fprintf(os.Stderr, "genv add: %s\n", errs[0])
+		return exitLogic
+	}
+	return exit
 }
 
 // removeCmd implements `genv remove <id>`.
@@ -389,8 +743,17 @@ func removeCmd(args []string) int {
 	}
 
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
+	noHooks := fs.Bool("no-hooks", false, "skip pre-remove and post-remove hooks")
+	hookTimeout := fs.Duration("hook-timeout", 0, "per-hook timeout, e.g. 5m or 30s (0 means no timeout)")
+	hostFlag := fs.String("host", "", "host name for host-specific records (defaults to host classification)")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	if err := fs.Parse(args); err != nil {
+		return flagParseExit(err)
+	}
+	if *hookTimeout < 0 {
+		fPrintln(os.Stderr, "genv remove: --hook-timeout must be non-negative")
 		return exitUsage
 	}
 	if fs.NArg() < 1 {
@@ -400,19 +763,39 @@ func removeCmd(args []string) int {
 	}
 	id := fs.Arg(0)
 
-	return runRemove(*file, id)
+	return runRemove(removeOptions{File: *file, ID: id, LockFile: *lockFile, NoHooks: *noHooks, HookTimeout: *hookTimeout, Host: *hostFlag, Target: *targetFlag})
 }
 
-func runRemove(file, id string) int {
+type removeOptions struct {
+	File        string
+	ID          string
+	LockFile    string
+	Host        string
+	Target      string
+	NoHooks     bool
+	HookTimeout time.Duration
+}
+
+func runRemove(opts removeOptions) int {
+	file := opts.File
+	id := opts.ID
 	// 0. When stdin is a terminal and id has no exact match in the spec,
 	//    fall back to substring matching so users can type short names
 	//    (e.g. "firefox" resolving to a tracked id like "org.mozilla.firefox").
 	if isTerminal() {
 		if f, err := genvfile.Read(file); err == nil {
+			packages := f.Packages
+			if schema.IsPortableVersion(f.SchemaVersion) {
+				effective, _, exit := materializeSpecForCommand("remove", file, f, opts.Host, opts.Target)
+				if exit != exitOK {
+					return exit
+				}
+				packages = effective.Packages
+			}
 			idLower := strings.ToLower(id)
 			exact := false
 			var matches []string
-			for _, p := range f.Packages {
+			for _, p := range packages {
 				if p.ID == id {
 					exact = true
 					break
@@ -440,11 +823,47 @@ func runRemove(file, id string) int {
 			}
 		}
 	}
+	hostName := hostForCommand(opts.Host)
+	lockPath := lockPathForSpec(file, opts.LockFile)
+	lfBefore, _ := genvfile.ReadLock(lockPath)
+	if !opts.NoHooks {
+		hooksCfg, code := materializedHooks("remove", file, opts.Host, opts.Target)
+		if code != exitOK {
+			return code
+		}
+		if hooksCfg != nil && len(hooksCfg.PreRemove) > 0 {
+			profileName := ""
+			if lfBefore != nil {
+				profileName = lfBefore.ActiveProfile
+			}
+			errs := runHookPhase(context.Background(), hookPhaseRun{
+				Hooks:   hooksCfg.PreRemove,
+				Context: hookContext{Event: "remove", Phase: "pre-remove", Host: hostName, Profile: profileName, Removed: []string{id}}.withFiles(file, lockPath),
+				Timeout: opts.HookTimeout, Stdout: os.Stdout, Stderr: os.Stderr,
+			})
+			if len(errs) > 0 {
+				fprintf(os.Stderr, "genv remove: %s\n", errs[0])
+				return exitLogic
+			}
+		}
+	}
 
-	// 1. Update genv.json and read lock.
-	lf, lockPath, exit := removeFromSpecAndReadLock(file, id)
+	// 1. Stage the spec removal in memory. Persist only after uninstall
+	//    succeeds so a failed uninstall cannot leave spec and lock desynced.
+	prepared, _, exit := prepareRemoveSpec(file, id, opts.Target)
 	if exit != exitOK {
 		return exit
+	}
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
+	lf, err := genvfile.ReadLock(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+		return exitIO
 	}
 
 	// 2. Find the package in the lock file to know which manager installed it.
@@ -460,51 +879,81 @@ func runRemove(file, id string) int {
 
 	if locked == nil {
 		// Never installed by genv — nothing to uninstall on the system.
+		if exit := writePreparedSpec(file, prepared); exit != exitOK {
+			return exit
+		}
 		fprintf(os.Stdout, "removed %s from spec (was not installed by genv)\n", id)
 		return exitOK
 	}
 
 	// 3. Uninstall from the system using the manager recorded in the lock.
-	mgr := adapter.ByName(locked.Manager)
-	if mgr == nil {
-		fprintf(os.Stderr, "genv: adapter %q no longer registered; cannot uninstall — remove manually\n", locked.Manager)
-		return exitLogic
-	}
+	if locked.Manager == "external" && locked.External != nil {
+		fprintf(os.Stdout, "removed %s from spec — uninstalling via external receipt\n", id)
+		var uninstallErr error
+		if locked.External.Owned {
+			uninstallErr = externalpkg.Remove(locked.External)
+		} else {
+			uninstallErr = externalpkg.RunUninstall(context.Background(), locked.External.Uninstall, os.Stdin, os.Stderr)
+		}
+		if uninstallErr != nil {
+			fprintf(os.Stderr, "genv: uninstall failed: %v\n", uninstallErr)
+			return exitLogic
+		}
+	} else {
+		mgr := adapter.ByName(locked.Manager)
+		if mgr == nil {
+			fprintf(os.Stderr, "genv: adapter %q no longer registered; cannot uninstall — remove manually\n", locked.Manager)
+			return exitLogic
+		}
 
-	uninstallCmd := mgr.PlanUninstall(locked.PkgName)
-	fprintf(os.Stdout, "removed %s from spec — uninstalling via %s\n", id, locked.Manager)
-	fprintf(os.Stdout, "\n==> %s\n", strings.Join(uninstallCmd, " "))
-	cmd := exec.Command(uninstallCmd[0], uninstallCmd[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	uninstallErr := cmd.Run()
-	if uninstallErr != nil {
-		fprintf(os.Stderr, "genv: uninstall failed: %v\n", uninstallErr)
-		// Still update the lock — the package is removed from the spec.
-	}
-
-	// Cache clean.
-	for _, cleanCmd := range mgr.PlanClean() {
-		fprintf(os.Stdout, "\n==> %s\n", strings.Join(cleanCmd, " "))
-		c := exec.Command(cleanCmd[0], cleanCmd[1:]...)
-		c.Stdin = os.Stdin
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
-		if err := c.Run(); err != nil {
-			fprintf(os.Stderr, "genv: cache clean warning: %v\n", err)
+		if !adapter.Absent(mgr, locked.PkgName) {
+			uninstallCmd := mgr.PlanUninstall(locked.PkgName)
+			fprintf(os.Stdout, "removed %s from spec — uninstalling via %s\n", id, locked.Manager)
+			fprintf(os.Stdout, "\n==> %s\n", strings.Join(uninstallCmd, " "))
+			if uninstallErr := runForegroundCommand(uninstallCmd); uninstallErr != nil && !adapter.Absent(mgr, locked.PkgName) {
+				fprintf(os.Stderr, "genv: uninstall failed: %v\n", uninstallErr)
+				return exitLogic
+			}
+			for _, cleanCmd := range mgr.PlanClean() {
+				fprintf(os.Stdout, "\n==> %s\n", strings.Join(cleanCmd, " "))
+				if err := runForegroundCommand(cleanCmd); err != nil {
+					fprintf(os.Stderr, "genv: cache clean warning: %v\n", err)
+				}
+			}
+		} else {
+			fprintf(os.Stdout, "removed %s from spec — already absent via %s\n", id, locked.Manager)
 		}
 	}
 
-	// 4. Update lock file (remove the entry regardless of uninstall success).
+	if exit := writePreparedSpec(file, prepared); exit != exitOK {
+		return exit
+	}
+
 	lf.Packages = remaining
 	if err := genvfile.WriteLock(lockPath, lf); err != nil {
 		fprintf(os.Stderr, "genv: writing lock: %v\n", err)
 		return exitIO
 	}
-
-	if uninstallErr != nil {
-		return exitLogic
+	if !opts.NoHooks {
+		hooksCfg, code := materializedHooks("remove", file, opts.Host, opts.Target)
+		if code != exitOK {
+			return code
+		}
+		if hooksCfg != nil && len(hooksCfg.PostRemove) > 0 {
+			profileName := ""
+			if lfBefore != nil {
+				profileName = lfBefore.ActiveProfile
+			}
+			errs := runHookPhase(context.Background(), hookPhaseRun{
+				Hooks:   hooksCfg.PostRemove,
+				Context: hookContext{Event: "remove", Phase: "post-remove", Host: hostName, Profile: profileName, Removed: []string{id}}.withFiles(file, lockPath),
+				Timeout: opts.HookTimeout, Stdout: os.Stdout, Stderr: os.Stderr,
+			})
+			if len(errs) > 0 {
+				fprintf(os.Stderr, "genv remove: %s\n", errs[0])
+				return exitLogic
+			}
+		}
 	}
 	return exitOK
 }
@@ -522,18 +971,35 @@ func adoptCmd(args []string) int {
 	}
 
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
+	stateDir := fs.String("state-dir", "", "directory for lock and env/shell fragments (default: directory of --file)")
 	version := fs.String("version", "", `version constraint, e.g. "0.10.*" (default: omitted, meaning any)`)
 	prefer := fs.String("prefer", "", "preferred package manager (e.g. brew)")
 	managerFlag := fs.String("manager", "", `manager-specific names, comma-separated mgr:name pairs (e.g. snap:hello,brew:hello)`)
+	hostFlag := fs.String("host", "", "host name for host-specific records (defaults to host classification)")
+	targetFlag := fs.String("target", "", targetFlagHelp)
+	filesOnly := fs.Bool("files", false, "adopt matching files block entries into the lock without changing targets")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON to stdout instead of human-readable text")
 
-	id, flagArgs := extractPositional(args)
-	if err := fs.Parse(flagArgs); err != nil {
-		return exitUsage
+	id := ""
+	if hasBoolFlag(args, "files") {
+		if err := fs.Parse(args); err != nil {
+			return flagParseExit(err)
+		}
+	} else {
+		var flagArgs []string
+		id, flagArgs = extractPositional(args)
+		if err := fs.Parse(flagArgs); err != nil {
+			return flagParseExit(err)
+		}
+		if id == "" {
+			fPrintln(os.Stderr, "genv adopt: missing package id")
+			fs.Usage()
+			return exitUsage
+		}
 	}
-	if id == "" {
-		fPrintln(os.Stderr, "genv adopt: missing package id")
-		fs.Usage()
-		return exitUsage
+	if *filesOnly {
+		return adoptFilesCmd(*file, *lockFile, *stateDir, *hostFlag, *targetFlag, *jsonOut)
 	}
 
 	managers, err := parseManagerFlag(*managerFlag)
@@ -542,42 +1008,188 @@ func adoptCmd(args []string) int {
 		return exitUsage
 	}
 
-	// 1. Resolve to find which manager handles this package.
+	hostName := hostForCommand(*hostFlag)
+	slog.Debug("adopt host", "host", hostName)
+
+	specPkg := schema.Package{ID: id, Version: *version, Prefer: *prefer, Managers: managers}
+	inSpec := false
+	f, err := genvfile.Read(*file)
+	if err != nil {
+		if !errors.Is(err, genvfile.ErrNotFound) {
+			fprintf(os.Stderr, "genv: %v\n", err)
+			if errors.Is(err, genvfile.ErrInvalidFile) {
+				return exitValidation
+			}
+			return exitIO
+		}
+	} else {
+		effective, _, code := materializeSpecForCommand("adopt", *file, f, *hostFlag, *targetFlag)
+		if code != exitOK {
+			return code
+		}
+		for _, p := range effective.Packages {
+			if p.ID != id {
+				continue
+			}
+			inSpec = true
+			if *version == "" {
+				specPkg.Version = p.Version
+			}
+			if *prefer == "" {
+				specPkg.Prefer = p.Prefer
+			}
+			if len(managers) == 0 {
+				specPkg.Managers = p.Managers
+			}
+			specPkg.External = p.External
+			break
+		}
+	}
+
 	available := resolver.Detect()
-	pkg := schema.Package{ID: id, Version: *version, Prefer: *prefer, Managers: managers}
-	action := resolver.ResolveOne(pkg, available)
+	action := resolver.ResolveOne(specPkg, available)
 	if !action.Resolved() {
 		fprintf(os.Stderr, "genv adopt: no available manager for %q — install a compatible package manager first\n", id)
 		return exitLogic
 	}
 
-	// 2. Verify the package is actually installed.
-	mgr := adapter.ByName(action.Manager)
-	installed, err := mgr.Query(action.PkgName)
+	var installedVersion string
+	var externalReceipt *genvfile.ExternalReceipt
+	if specPkg.External != nil {
+		state := externalpkg.InspectLocal(context.Background(), specPkg, nil)
+		if !state.Present {
+			fprintf(os.Stderr, "genv adopt: %q is not detected by its external recipe — use 'genv add %s' to install it\n", id, id)
+			return exitLogic
+		}
+		installedVersion = state.Version
+		recipeDigest, digestErr := externalpkg.RecipeSHA256(specPkg.External)
+		if digestErr != nil {
+			fprintf(os.Stderr, "genv adopt: hashing external recipe: %v\n", digestErr)
+			return exitLogic
+		}
+		externalReceipt = &genvfile.ExternalReceipt{SourceType: specPkg.External.Source.Type, RecipeSHA256: recipeDigest, Owned: false}
+	} else {
+		mgr := adapter.ByName(action.Manager)
+		installed, queryErr := mgr.Query(action.PkgName)
+		if queryErr != nil {
+			fprintf(os.Stderr, "genv adopt: querying %s: %v\n", action.Manager, queryErr)
+			return exitLogic
+		}
+		if !installed {
+			fprintf(os.Stderr, "genv adopt: %q is not installed via %s — use 'genv add %s' to install it\n", id, action.Manager, id)
+			return exitLogic
+		}
+		if v, err := mgr.QueryVersion(action.PkgName); err == nil {
+			installedVersion = v
+		}
+	}
+
+	lockPath := lockPathForState(*file, *stateDir, *lockFile)
+	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
-		fprintf(os.Stderr, "genv adopt: querying %s: %v\n", action.Manager, err)
-		return exitLogic
+		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+		return exitIO
 	}
-	if !installed {
-		fprintf(os.Stderr, "genv adopt: %q is not installed via %s — use 'genv add %s' to install it\n", id, action.Manager, id)
-		return exitLogic
-	}
-
-	// 3. Update genv.json.
-	if exit := addToSpec(*file, id, *version, *prefer, managers); exit != exitOK {
-		return exit
+	for i := range lf.Packages {
+		if lf.Packages[i].ID == id {
+			fprintf(os.Stderr, "genv: package already tracked: %q\n", id)
+			return exitLogic
+		}
 	}
 
-	// 4. Update lock file.
-	if exit := appendLockEntry(genvfile.LockPathFrom(*file), genvfile.LockedPackage{
-		ID:      action.Pkg.ID,
-		Manager: action.Manager,
-		PkgName: action.PkgName,
-	}); exit != exitOK {
+	if !inSpec {
+		if exit := addToSpec(*file, id, *version, *prefer, managers, *targetFlag); exit != exitOK {
+			return exit
+		}
+	}
+
+	targetID := ""
+	if prepared, err := genvfile.Read(*file); err == nil {
+		var code int
+		targetID, code = resolveMutationTarget("adopt", *file, prepared, *targetFlag)
+		if code != exitOK {
+			return code
+		}
+	}
+	if exit := appendLockEntry(lockPath, genvfile.LockedPackage{
+		ID:               action.Pkg.ID,
+		Manager:          action.Manager,
+		PkgName:          action.PkgName,
+		InstalledVersion: installedVersion,
+		External:         externalReceipt,
+	}, targetID); exit != exitOK {
 		return exit
 	}
 
 	fprintf(os.Stdout, "adopted %s — now tracked via %s (already installed)\n", id, action.Manager)
+	return exitOK
+}
+
+func adoptFilesCmd(file, lockFile, stateDir, hostFlag, targetFlag string, jsonOut bool) int {
+	f, err := genvfile.Read(file)
+	if err != nil {
+		if errors.Is(err, genvfile.ErrNotFound) {
+			fprintf(os.Stderr, "genv: %s not found — run 'genv init' to create it\n", file)
+			return exitIO
+		}
+		fprintf(os.Stderr, "genv: %v\n", err)
+		if errors.Is(err, genvfile.ErrInvalidFile) {
+			return exitValidation
+		}
+		return exitIO
+	}
+	hostName := hostForCommand(hostFlag)
+	filtered, _, code := materializeSpecForCommand("adopt", file, f, hostFlag, targetFlag)
+	if code != exitOK {
+		return code
+	}
+	statusCfg := filesConfigWithResolvedSources(filtered.Files, sourceRootForSpec(file, f))
+	res, err := files.StatusWithHashes(statusCfg, hostName, nil)
+	if jsonOut {
+		errs := []string(nil)
+		if err != nil {
+			errs = []string{err.Error()}
+		}
+		code := writeJSON(os.Stdout, output.Envelope{
+			Version: output.SchemaVersion,
+			Command: "adopt",
+			OK:      err == nil && res != nil && res.OK,
+			Data:    output.StatusResult{FileEntries: fileStatusEntries(res)},
+			Errors:  errs,
+		})
+		return code
+	}
+	if err != nil {
+		fprintf(os.Stderr, "genv adopt --files: %v\n", err)
+		return exitLogic
+	}
+	if res == nil || !res.OK {
+		fPrintln(os.Stdout, "files do not match spec:")
+		writeFileStatus(os.Stdout, res)
+		return exitLogic
+	}
+
+	lockPath := lockPathForState(file, stateDir, lockFile)
+	// Read-modify-write under LockMutation: an apply or the scheduled worker
+	// running concurrently must not lose its entries to this write.
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
+	lf, err := genvfile.ReadLock(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+		return exitIO
+	}
+	adopted := lockedFilesFromSpec(filtered.Files, hostName, sourceRootForSpec(file, f))
+	lf.Files = mergeLockedFiles(lf.Files, adopted)
+	if err := genvfile.WriteLock(lockPath, lf); err != nil {
+		fprintf(os.Stderr, "genv: writing lock: %v\n", err)
+		return exitIO
+	}
+	fprintf(os.Stdout, "adopted %d file entry/entries into %s\n", len(adopted), lockPath)
 	return exitOK
 }
 
@@ -594,9 +1206,11 @@ func disownCmd(args []string) int {
 	}
 
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if fs.NArg() < 1 {
 		fPrintln(os.Stderr, "genv disown: missing package id")
@@ -605,13 +1219,45 @@ func disownCmd(args []string) int {
 	}
 	id := fs.Arg(0)
 
-	// 1. Update genv.json and read lock.
-	lf, lockPath, exit := removeFromSpecAndReadLock(*file, id)
+	f, err := genvfile.Read(*file)
+	if err != nil {
+		if errors.Is(err, genvfile.ErrNotFound) {
+			fprintf(os.Stderr, "genv: %s not found\n", *file)
+			return exitLogic
+		}
+		fprintf(os.Stderr, "genv: %v\n", err)
+		if errors.Is(err, genvfile.ErrInvalidFile) {
+			return exitValidation
+		}
+		return exitIO
+	}
+	targetID, exit := resolveMutationTarget("remove", *file, f, *targetFlag)
 	if exit != exitOK {
 		return exit
 	}
+	specErr := commands.Remove(f, id, targetID)
+	if specErr != nil && !errors.Is(specErr, commands.ErrNotTracked) {
+		fprintf(os.Stderr, "genv: %v\n", specErr)
+		return exitLogic
+	}
 
-	// 2. Remove from lock file without uninstalling.
+	lockPath := lockPathForSpec(*file, *lockFile)
+	// A disown during the hourly worker run used to be lost: the worker holds
+	// LockMutation across its whole upgrade and then writes the snapshot it
+	// read at the start, so the removal was undone and the next apply
+	// uninstalled the package again.
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
+	lf, err := genvfile.ReadLock(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+		return exitIO
+	}
+
 	wasTracked := false
 	remaining := make([]genvfile.LockedPackage, 0, len(lf.Packages))
 	for i := range lf.Packages {
@@ -621,13 +1267,28 @@ func disownCmd(args []string) int {
 			remaining = append(remaining, lf.Packages[i])
 		}
 	}
+
+	if specErr != nil && !wasTracked {
+		fprintf(os.Stderr, "genv: %v\n", specErr)
+		return exitLogic
+	}
+
+	if specErr == nil {
+		if err := genvfile.Write(*file, f); err != nil {
+			fprintf(os.Stderr, "genv: %v\n", err)
+			return exitIO
+		}
+	}
+
 	lf.Packages = remaining
 	if err := genvfile.WriteLock(lockPath, lf); err != nil {
 		fprintf(os.Stderr, "genv: writing lock: %v\n", err)
 		return exitIO
 	}
 
-	if wasTracked {
+	if wasTracked && specErr != nil {
+		fprintf(os.Stdout, "disowned %s — removed lock leftover (was not in spec)\n", id)
+	} else if wasTracked {
 		fprintf(os.Stdout, "disowned %s — removed from tracking (package remains installed)\n", id)
 	} else {
 		fprintf(os.Stdout, "disowned %s — removed from spec (was not in lock)\n", id)
@@ -647,12 +1308,13 @@ func listCmd(args []string) int {
 	}
 
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
-	lf, err := genvfile.ReadLock(genvfile.LockPathFrom(*file))
+	lf, err := genvfile.ReadLock(lockPathForSpec(*file, *lockFile))
 	if err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		return exitIO
@@ -672,18 +1334,47 @@ func listCmd(args []string) int {
 	return exitOK
 }
 
+// hostForCommand resolves the host class for a command. The explicit flag
+// takes precedence; otherwise Classify() is used. If Classify() fails, a
+// warning is logged and an empty string is returned, which causes all
+// non-empty host predicates to be treated as non-matching.
+func hostForCommand(hostFlag string) string {
+	if hostFlag != "" {
+		return hostFlag
+	}
+	h, err := host.Classify()
+	if err != nil {
+		slog.Warn("cannot determine host; host-specific records will be skipped", "error", err)
+		return ""
+	}
+	return h
+}
+
 // applyCmd implements `genv apply [--dry-run] [--strict] [--yes] [--json] [--timeout] [--debug]`.
 // Reconciles the system against genv.json by installing added packages and
 // removing packages that were deleted from the spec since the last apply.
 type applyOptions struct {
-	File    string
-	DryRun  bool
-	Strict  bool
-	Yes     bool
-	Quiet   bool
-	JSONOut bool
-	Timeout time.Duration
-	Debug   bool
+	File             string
+	LockFile         string
+	StateDir         string
+	Host             string
+	DryRun           bool
+	Strict           bool
+	Yes              bool
+	Quiet            bool
+	JSONOut          bool
+	Force            bool
+	Backup           bool
+	Timeout          time.Duration
+	Debug            bool
+	TargetProfile    string
+	Target           string
+	ForceNewLock     bool
+	NoHooks          bool
+	HookTimeout      time.Duration
+	SkipPackages     bool
+	SourceRoot       string
+	resolvedStateDir string
 }
 
 func applyCmd(args []string) int {
@@ -691,21 +1382,38 @@ func applyCmd(args []string) int {
 	fs.Usage = func() {
 		fPrintln(os.Stderr, "usage: genv apply [flags]")
 		fPrintln(os.Stderr)
+		fPrintln(os.Stderr, "Lifecycle hooks should check-then-act and print GENV_HOOK_STATUS=changed or GENV_HOOK_STATUS=skipped on stdout or stderr when they exit 0. Exit 0 without a status line is treated as changed. Non-zero exit is error. The hook summary prints changed, skipped (no-op), or error.")
+		fPrintln(os.Stderr)
 		fPrintln(os.Stderr, "flags:")
 		fs.PrintDefaults()
 	}
 
 	opts := applyOptions{}
 	fs.StringVar(&opts.File, "file", defaultSpecPath(), "path to genv.json")
+	fs.StringVar(&opts.LockFile, "lock-file", "", "path to genv lock file")
+	fs.StringVar(&opts.StateDir, "state-dir", "", "directory for lock and env/shell fragments (default: directory of --file)")
 	fs.BoolVar(&opts.DryRun, "dry-run", false, "print the reconcile plan without executing")
+	fs.BoolVar(&opts.Force, "force", false, "overwrite mismatched managed files")
+	fs.BoolVar(&opts.Backup, "backup", false, "back up mismatched files before overwrite (implies keeping originals as *.backup.*)")
 	fs.BoolVar(&opts.Strict, "strict", false, "exit with an error if any package cannot be resolved")
 	fs.BoolVar(&opts.Yes, "yes", false, "skip the confirmation prompt (for CI and scripts)")
 	fs.BoolVar(&opts.Quiet, "quiet", false, "suppress plan output (useful in scripts)")
-	fs.BoolVar(&opts.JSONOut, "json", false, "emit machine-readable JSON to stdout instead of human-readable text")
-	fs.DurationVar(&opts.Timeout, "timeout", 0, "per-subprocess timeout, e.g. 5m or 30s (0 means no timeout)")
+	fs.BoolVar(&opts.JSONOut, "json", false, "emit machine-readable JSON to stdout instead of human-readable text (wet-run requires --yes)")
+	fs.DurationVar(&opts.Timeout, "timeout", 10*time.Minute, "per-subprocess timeout, e.g. 5m or 30s (0 means no timeout; default 10m)")
+	fs.DurationVar(&opts.HookTimeout, "hook-timeout", 0, "per-hook timeout, e.g. 5m or 30s (0 means no timeout)")
+	fs.BoolVar(&opts.NoHooks, "no-hooks", false, "skip lifecycle hooks without skipping apply")
+	fs.BoolVar(&opts.SkipPackages, "skip-packages", false, "skip package install/remove; still apply env, shell, files, and services")
 	fs.BoolVar(&opts.Debug, "debug", false, "emit debug-level structured logs to stderr")
+	fs.StringVar(&opts.Host, "host", "", "host name for host-specific records (defaults to host classification)")
+	fs.StringVar(&opts.Target, "target", "", targetFlagHelpWithDefault)
+	fs.BoolVar(&opts.ForceNewLock, "force-new-lock", false, "back up a foreign lock file and start with a new local lock")
+	fs.StringVar(&opts.SourceRoot, "source-root", "", "resolve files.links/templates and service launchd/systemd template sources relative to this directory instead of the spec file directory")
 
 	if err := fs.Parse(args); err != nil {
+		return flagParseExit(err)
+	}
+	if opts.HookTimeout < 0 {
+		fPrintln(os.Stderr, "genv apply: --hook-timeout must be non-negative")
 		return exitUsage
 	}
 
@@ -716,15 +1424,46 @@ func runApply(opts applyOptions) int {
 	if opts.Debug {
 		logging.Init(true)
 	}
+	if err := validateApplySourceRoot(opts.SourceRoot); err != nil {
+		fprintf(os.Stderr, "genv apply: %v\n", err)
+		return exitIO
+	}
 
 	ctx := context.Background()
 	if opts.Timeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, opts.Timeout)
-		defer cancel()
+		ctx = resolver.WithSubprocessTimeout(ctx, opts.Timeout)
 	}
 
-	f, err := genvfile.Read(opts.File)
+	stateDir, lockPath, err := resolveApplyState(opts)
+	if err != nil {
+		fprintf(os.Stderr, "genv: resolving state paths: %v\n", err)
+		return exitIO
+	}
+	if !opts.DryRun {
+		if err := guardApplyStateWrites(opts, stateDir, lockPath); err != nil {
+			fprintf(os.Stderr, "genv apply: %v\n", err)
+			return exitLogic
+		}
+	}
+	opts.resolvedStateDir = stateDir
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
+	lf, err := genvfile.ReadLock(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+		return exitIO
+	}
+
+	activeProfile := lf.ActiveProfile
+	if opts.TargetProfile != "" {
+		activeProfile = opts.TargetProfile
+	}
+
+	f, err := profile.LoadMerged(opts.File, activeProfile)
 	if err != nil {
 		if errors.Is(err, genvfile.ErrNotFound) {
 			fprintf(os.Stderr, "genv: %s not found — run 'genv add' to create it\n", opts.File)
@@ -740,15 +1479,71 @@ func runApply(opts applyOptions) int {
 		return exitIO
 	}
 
-	lockPath := genvfile.LockPathFrom(opts.File)
-	lf, err := genvfile.ReadLock(lockPath)
-	if err != nil {
-		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
-		return exitIO
-	}
+	return runApplyWithSpecAndLock(ctx, opts, f, lf, lockPath)
+}
 
+func applyLockGate(cmd, lockPath string, lf *genvfile.LockFile, activeTarget string, available map[string]bool, requireMeta, forceNew, dryRun bool, forceHint string) (*genvfile.LockFile, int) {
+	var decision lockgate.Decision
+	if requireMeta {
+		decision = lockgate.CheckStrict(lf, activeTarget, runtime.GOOS, available)
+	} else {
+		decision = lockgate.Check(lf, activeTarget, runtime.GOOS, available)
+	}
+	for _, mgr := range decision.Unavailable {
+		fprintf(os.Stderr, "genv %s: warning: lock uses unavailable manager %q; skipping its packages\n", cmd, mgr)
+	}
+	if !decision.Foreign {
+		return lf, exitOK
+	}
+	if !forceNew {
+		fprintf(os.Stderr, "genv %s: foreign lock refused: %s\n", cmd, decision.Reason)
+		if forceHint != "" {
+			fprintf(os.Stderr, "Back up or remove %s, or rerun with %s to move it aside and create a new local lock.\n", lockPath, forceHint)
+		} else {
+			fprintf(os.Stderr, "Back up or remove %s and rerun.\n", lockPath)
+		}
+		return lf, exitLogic
+	}
+	if !dryRun {
+		if err := genvfile.RotateBackup(lockPath); err != nil {
+			fprintf(os.Stderr, "genv %s: could not back up foreign lock %s: %v\n", cmd, lockPath, err)
+			return lf, exitIO
+		}
+	}
+	return &genvfile.LockFile{SchemaVersion: schema.Version8}, exitOK
+}
+
+func runApplyWithSpecAndLock(ctx context.Context, opts applyOptions, f *schema.GenvFile, lf *genvfile.LockFile, lockPath string) int {
+	useSpecAdapters(f)
 	available := resolver.Detect()
-	result := resolver.Reconcile(f.Packages, lf.Packages, available)
+	if lf == nil {
+		lf = &genvfile.LockFile{SchemaVersion: schema.Version}
+	}
+	isV8 := schema.IsPortableVersion(f.SchemaVersion)
+	effective, activeTarget, code := materializeSpecForCommand("apply", opts.File, f, opts.Host, opts.Target)
+	if code != exitOK {
+		return code
+	}
+	if isV8 {
+		reset, code := applyLockGate("apply", lockPath, lf, activeTarget, available, true, opts.ForceNewLock, opts.DryRun, "--force-new-lock")
+		if code != exitOK {
+			return code
+		}
+		lf = reset
+	}
+	f = effective
+	opts.Target = activeTarget
+	var result resolver.ReconcileResult
+	if !opts.SkipPackages {
+		live, liveWarns := resolver.LoadLiveSetOnly(available, resolver.ManagersToList(f.Packages, lf.Packages, available))
+		for _, w := range liveWarns {
+			fprintf(os.Stderr, "genv apply: warning: %s\n", w)
+		}
+		result = resolver.ReconcileWith(f.Packages, lf.Packages, available, live)
+	}
+	if opts.DryRun {
+		resolver.EnrichExternalPlan(ctx, &result)
+	}
 
 	if opts.JSONOut {
 		return runApplyJSON(ctx, opts, lockPath, f, lf, result)
@@ -757,22 +1552,105 @@ func runApply(opts applyOptions) int {
 }
 
 func runApplyJSON(ctx context.Context, opts applyOptions, lockPath string, f *schema.GenvFile, lf *genvfile.LockFile, result resolver.ReconcileResult) int {
+	printReconcileWarnings(result)
 	planData := buildPlanResult(f, lf, result)
-	if opts.DryRun {
+	state := applyStatePaths(opts.resolvedStateDir, lockPath)
+	planData.State = &state
+	if opts.DryRun || !opts.Yes {
+		// Plan only: when --yes is absent this must not touch the filesystem
+		// either, so the files pass is forced into dry-run.
+		planOpts := opts
+		planOpts.DryRun = true
+		filePlan, filePlanErr := applyFiles(ctx, planOpts, f, lf)
+		planData.Files = filePlanEntries(filePlan)
+		var errs []string
+		if filePlanErr != nil {
+			errs = append(errs, filePlanErr.Error())
+		}
+		// Only refuse when there is actually something to consent to, matching
+		// `genv upgrade --json`: an already-applied spec still reports OK.
+		if !opts.DryRun && applyHasPendingWork(f, lf, result, filePlan) {
+			errs = append(errs, "wet-run requires --yes (pass --dry-run to plan only)")
+		}
 		return writeJSON(os.Stdout, output.Envelope{
 			Version: output.SchemaVersion,
 			Command: "apply",
-			OK:      true,
+			OK:      len(errs) == 0,
 			Data:    planData,
+			Errors:  errs,
 		})
 	}
 
-	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr)
+	hostName := hostForCommand(opts.Host)
+	if !opts.NoHooks {
+		preErrs := runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "pre-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes, Installed: plannedInstallIDs(result), Removed: plannedRemoveIDs(result)}.withFiles(opts.File, lockPath), opts.HookTimeout, true)
+		if len(preErrs) > 0 {
+			return writeJSON(os.Stdout, output.Envelope{Version: output.SchemaVersion, Command: "apply", OK: false, Data: output.ApplyResult{FailedHooks: preErrs}, Errors: preErrs})
+		}
+	}
+	// External installs get the same consent the hooks see, rather than a
+	// hard-coded assume-yes.
+	externalMode := externalpkg.ExecutionInteractive
+	if opts.Yes {
+		externalMode = externalpkg.ExecutionAssumeYes
+	}
+	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stderr, os.Stderr, resolver.ApplyExecutionOptions{ExternalMode: externalMode, SourceRoot: applySourceRoot(opts, f)})
 	errs := errStrings(execResult.Errors)
 
-	envApplied, envRemoved := applyEnvVars(f, lf, false)
-	shellApplied, shellRemoved := applyShellCfg(f, lf, false)
-	writeLockAfterApply(lockPath, lf, result, execResult)
+	var envApplied, envRemoved, shellApplied, shellRemoved []string
+	failedHooks := []string(nil)
+	filePlan := &files.ApplyResult{}
+	filePlanErr := error(nil)
+	var envErr, shellErr error
+	envApplied, envRemoved, envErr = applyEnvVars(f, lf, false, opts.resolvedStateDir)
+	if envErr != nil {
+		errs = append(errs, envErr.Error())
+	}
+	shellApplied, shellRemoved, shellErr = applyShellCfg(f, lf, false, opts.resolvedStateDir)
+	if shellErr != nil {
+		errs = append(errs, shellErr.Error())
+	}
+	_, _, svcErrs := applyServices(ctx, f, lf, false, applySourceRoot(opts, f))
+	if len(svcErrs) > 0 {
+		errs = append(errs, errStrings(svcErrs)...)
+	}
+	filePlan, filePlanErr = applyFiles(ctx, opts, f, lf)
+	if filePlanErr != nil {
+		errs = append(errs, filePlanErr.Error())
+	}
+	if unresolvedFileMismatch(filePlan) {
+		if !opts.NoHooks && hasPostApplyHooks(f) {
+			skipMsg := "skipping post-apply hooks due to unresolved file mismatches"
+			errs = append(errs, skipMsg)
+			fprintf(os.Stderr, "genv apply: %s\n", skipMsg)
+		}
+	} else if !opts.NoHooks {
+		failedHooks = runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "post-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes, Installed: lockedPackageIDs(execResult.Installed), Removed: execResult.Uninstalled, Failed: applyFailedIDs(execResult.Errors)}.withFiles(opts.File, lockPath), opts.HookTimeout, true)
+		errs = append(errs, failedHooks...)
+	}
+	success := len(errs) == 0
+	if err := writeLockAfterApply(lockPath, lf, result, execResult, opts.TargetProfile, opts.Target, opts.SkipPackages, success); err != nil {
+		fprintf(os.Stderr, "genv: writing lock: %v\n", err)
+		errs = append(errs, err.Error())
+		installed := make([]string, len(execResult.Installed))
+		for i, lp := range execResult.Installed {
+			installed[i] = lp.ID
+		}
+		return writeJSON(os.Stdout, output.Envelope{
+			Version: output.SchemaVersion,
+			Command: "apply",
+			OK:      false,
+			Data: output.ApplyResult{
+				Installed:    installed,
+				Uninstalled:  execResult.Uninstalled,
+				EnvApplied:   envApplied,
+				EnvRemoved:   envRemoved,
+				ShellApplied: shellApplied,
+				ShellRemoved: shellRemoved,
+			},
+			Errors: errs,
+		})
+	}
 
 	installed := make([]string, len(execResult.Installed))
 	for i, lp := range execResult.Installed {
@@ -790,17 +1668,52 @@ func runApplyJSON(ctx context.Context, opts applyOptions, lockPath string, f *sc
 			EnvRemoved:   envRemoved,
 			ShellApplied: shellApplied,
 			ShellRemoved: shellRemoved,
+			FilesApplied: append([]string(nil), filePlan.Created...),
+			FilesUpdated: append([]string(nil), filePlan.Updated...),
+			FailedHooks:  failedHooks,
 		},
 		Errors: errs,
 	})
 }
 
+// applyHasPendingWork reports whether an apply would change anything. The
+// JSON gate uses it so a wet run without --yes is refused only when there is
+// something to consent to; an already-applied spec still reports OK, matching
+// `genv upgrade --json`. filePlan is the dry-run file result the caller
+// already computed.
+func applyHasPendingWork(f *schema.GenvFile, lf *genvfile.LockFile, result resolver.ReconcileResult, filePlan *files.ApplyResult) bool {
+	if len(result.ToInstall) > 0 || len(result.ToRemove) > 0 {
+		return true
+	}
+	for _, e := range genvenv.EnvStatus(f.Env, lf.Env) {
+		if e.Kind != genvenv.EnvStatusOK {
+			return true
+		}
+	}
+	for _, e := range shellcfg.ShellStatus(f.Shell, lf.Shell) {
+		if e.Kind != shellcfg.ShellStatusOK {
+			return true
+		}
+	}
+	for _, e := range service.ServiceStatus(f.Services, lf.Services, false, "") {
+		if e.Kind != service.ServiceStatusOK {
+			return true
+		}
+	}
+	if filePlan != nil && len(filePlan.Created)+len(filePlan.Updated)+len(filePlan.Mismatched) > 0 {
+		return true
+	}
+	return false
+}
+
 func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *schema.GenvFile, lf *genvfile.LockFile, result resolver.ReconcileResult) int {
+	printReconcileWarnings(result)
 	planOut := io.Writer(os.Stdout)
 	if opts.Quiet {
 		planOut = io.Discard
 	}
-	toInstall, toRemove, unresolvedCount := resolver.PrintReconcilePlan(result, planOut)
+	printApplyStatePlan(planOut, applyStatePaths(opts.resolvedStateDir, lockPath))
+	toInstall, toRemove, unresolvedCount := printApplyReconcilePlan(planOut, opts.SkipPackages, result)
 
 	var envChanges int
 	for _, e := range genvenv.EnvStatus(f.Env, lf.Env) {
@@ -815,13 +1728,58 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 		}
 	}
 	var serviceChanges int
-	for _, e := range service.ServiceStatus(f.Services, lf.Services) {
+	for _, e := range service.ServiceStatus(f.Services, lf.Services, false, "") {
 		if e.Kind != service.ServiceStatusOK {
 			serviceChanges++
 		}
 	}
+	planOpts := opts
+	planOpts.DryRun = true
+	filePlan, _ := applyFiles(ctx, planOpts, f, lf)
+	fileChanges := 0
+	if filePlan != nil {
+		fileChanges = len(filePlan.Created) + len(filePlan.Updated) + len(filePlan.Mismatched)
+	}
 
-	if toInstall == 0 && toRemove == 0 && envChanges == 0 && shellChanges == 0 && serviceChanges == 0 {
+	if toInstall == 0 && toRemove == 0 && envChanges == 0 && shellChanges == 0 && serviceChanges == 0 && fileChanges == 0 {
+		if !opts.DryRun {
+			// Reconcile the env and shell fragments even when the lock says
+			// nothing changed. The fragments and the rc source lines are
+			// rendered output, so they are legitimately missing on a fresh
+			// clone, and a committed rc template carries whichever host
+			// rendered it last. Skipping this path left both stale: the lock
+			// reported the variable as applied while env.sh did not exist,
+			// and a shared rc file kept another host's absolute path forever
+			// (#217). Both calls are idempotent and write nothing when the
+			// content already matches.
+			if _, _, err := applyEnvVars(f, lf, false, opts.resolvedStateDir); err != nil {
+				fprintf(os.Stderr, "genv: applying env fragment: %v\n", err)
+				return exitIO
+			}
+			if _, _, err := applyShellCfg(f, lf, false, opts.resolvedStateDir); err != nil {
+				fprintf(os.Stderr, "genv: applying shell fragment: %v\n", err)
+				return exitIO
+			}
+			if !opts.NoHooks {
+				hostName := hostForCommand(opts.Host)
+				hookErrs := runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "pre-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes}.withFiles(opts.File, lockPath), opts.HookTimeout, false)
+				hookErrs = append(hookErrs, runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "post-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes}.withFiles(opts.File, lockPath), opts.HookTimeout, false)...)
+				if len(hookErrs) > 0 {
+					// Report hooks before claiming success: a hook error exits
+					// non-zero, and "already up to date." above it would have
+					// been contradicted by the exit code.
+					for _, e := range hookErrs {
+						fprintf(os.Stderr, "genv apply: %s\n", e)
+					}
+					return exitLogic
+				}
+			}
+			refreshLockedFileHashes(f, lf, hostForCommand(opts.Host), applySourceRoot(opts, f))
+			if err := writeLockAfterApply(lockPath, lf, result, resolver.ApplyExecution{}, opts.TargetProfile, opts.Target, opts.SkipPackages, true); err != nil {
+				fprintf(os.Stderr, "genv: writing lock: %v\n", err)
+				return exitIO
+			}
+		}
 		if !opts.Quiet {
 			fPrintln(os.Stdout, "already up to date.")
 		}
@@ -831,6 +1789,10 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 	if unresolvedCount > 0 && opts.Strict {
 		fprintf(os.Stderr, "genv apply: %d package(s) unresolved; aborting (--strict)\n", unresolvedCount)
 		return exitLogic
+	}
+
+	if fileChanges > 0 && !opts.Quiet {
+		writeFilePlan(planOut, filePlan)
 	}
 
 	if opts.DryRun {
@@ -846,37 +1808,79 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 		return exitOK
 	}
 
-	confirmMsg := fmt.Sprintf("This will install %d and remove %d package(s)", toInstall, toRemove)
-	if envChanges > 0 {
-		confirmMsg += fmt.Sprintf(", apply %d env variable(s)", envChanges)
-	}
-	if shellChanges > 0 {
-		confirmMsg += fmt.Sprintf(", apply %d shell config entry/entries", shellChanges)
-	}
-	if serviceChanges > 0 {
-		confirmMsg += fmt.Sprintf(", reconcile %d service(s)", serviceChanges)
-	}
-	confirmMsg += ". Continue? [y/N] "
+	confirmMsg := applyConfirmMessage(opts.SkipPackages, toInstall, toRemove, envChanges, shellChanges, serviceChanges, fileChanges)
 
 	if !opts.Yes && !confirm(confirmMsg) {
 		fPrintln(os.Stdout, "Aborted.")
 		return exitOK
 	}
 
-	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stdout, os.Stderr)
+	hostName := hostForCommand(opts.Host)
+	if !opts.NoHooks {
+		hookErrs := runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "pre-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes, Installed: plannedInstallIDs(result), Removed: plannedRemoveIDs(result)}.withFiles(opts.File, lockPath), opts.HookTimeout, false)
+		if len(hookErrs) > 0 {
+			for _, e := range hookErrs {
+				fprintf(os.Stderr, "genv apply: %s\n", e)
+			}
+			return exitLogic
+		}
+	}
 
-	// Apply env, shell and services (update lf in memory), then write lock once.
-	applyEnvVars(f, lf, !opts.Quiet)
-	applyShellCfg(f, lf, !opts.Quiet)
-	_, _, svcErrs := applyServices(ctx, f, lf, !opts.Quiet)
-	writeLockAfterApply(lockPath, lf, result, execResult)
+	mode := externalpkg.ExecutionInteractive
+	if opts.Yes {
+		mode = externalpkg.ExecutionAssumeYes
+	}
+	execResult := resolver.ExecuteApply(ctx, result, os.Stdin, os.Stdout, os.Stderr, resolver.ApplyExecutionOptions{
+		ExternalMode: mode,
+		AcknowledgeExternal: func(message string) bool {
+			return confirm(message + " [y/N] ")
+		},
+		SourceRoot: applySourceRoot(opts, f),
+	})
 
-	if len(execResult.Errors) > 0 || len(svcErrs) > 0 {
+	var svcErrs []error
+	var fileErrs []error
+	var appliedFiles *files.ApplyResult
+	if _, _, err := applyEnvVars(f, lf, !opts.Quiet, opts.resolvedStateDir); err != nil {
+		fileErrs = append(fileErrs, err)
+	}
+	if _, _, err := applyShellCfg(f, lf, !opts.Quiet, opts.resolvedStateDir); err != nil {
+		fileErrs = append(fileErrs, err)
+	}
+	_, _, svcErrs = applyServices(ctx, f, lf, !opts.Quiet, applySourceRoot(opts, f))
+	var filePlanErr error
+	appliedFiles, filePlanErr = applyFiles(ctx, opts, f, lf)
+	if filePlanErr != nil {
+		fileErrs = append(fileErrs, filePlanErr)
+	}
+	if unresolvedFileMismatch(appliedFiles) {
+		writeFileMismatchGuidance(os.Stderr, appliedFiles)
+		if !opts.NoHooks && hasPostApplyHooks(f) {
+			fPrintln(os.Stderr, "genv apply: skipping post-apply hooks due to unresolved file mismatches")
+		}
+	}
+	var hookErrs []string
+	if !unresolvedFileMismatch(appliedFiles) && !opts.NoHooks {
+		hookErrs = runApplyHookPhase(ctx, f, hookContext{Event: "apply", Phase: "post-apply", Host: hostName, Profile: lf.ActiveProfile, Yes: opts.Yes, Installed: lockedPackageIDs(execResult.Installed), Removed: execResult.Uninstalled, Failed: applyFailedIDs(execResult.Errors)}.withFiles(opts.File, lockPath), opts.HookTimeout, false)
+	}
+	success := len(execResult.Errors) == 0 && len(svcErrs) == 0 && len(fileErrs) == 0 && len(hookErrs) == 0
+	if err := writeLockAfterApply(lockPath, lf, result, execResult, opts.TargetProfile, opts.Target, opts.SkipPackages, success); err != nil {
+		fprintf(os.Stderr, "genv: writing lock: %v\n", err)
+		return exitIO
+	}
+
+	if !success {
 		for _, e := range execResult.Errors {
 			fprintf(os.Stderr, "genv apply: %v\n", e)
 		}
 		for _, e := range svcErrs {
 			fprintf(os.Stderr, "genv apply: %v\n", e)
+		}
+		for _, e := range fileErrs {
+			fprintf(os.Stderr, "genv apply: %v\n", e)
+		}
+		for _, e := range hookErrs {
+			fprintf(os.Stderr, "genv apply: %s\n", e)
 		}
 		return exitLogic
 	}
@@ -884,46 +1888,112 @@ func runApplyText(ctx context.Context, opts applyOptions, lockPath string, f *sc
 	return exitOK
 }
 
-// writeLockAfterApply updates the lock file to reflect what actually succeeded.
-// Called from both the JSON and human-readable paths of applyCmd.
-func writeLockAfterApply(lockPath string, lf *genvfile.LockFile, result resolver.ReconcileResult, execResult resolver.ApplyExecution) {
-	uninstalledSet := make(map[string]bool, len(execResult.Uninstalled))
-	for _, id := range execResult.Uninstalled {
-		uninstalledSet[id] = true
-	}
-	newPkgs := make([]genvfile.LockedPackage, 0, len(result.Unchanged)+len(execResult.Installed))
-	newPkgs = append(newPkgs, result.Unchanged...)
-	newPkgs = append(newPkgs, execResult.Installed...)
-	for _, a := range result.ToRemove {
-		if !uninstalledSet[a.Pkg.ID] {
-			// Removal failed — keep in lock since it's still installed.
-			newPkgs = append(newPkgs, genvfile.LockedPackage{
-				ID:      a.Pkg.ID,
-				Manager: a.Manager,
-				PkgName: a.PkgName,
-			})
-		}
-	}
-	lf.Packages = newPkgs
-	if err := genvfile.WriteLock(lockPath, lf); err != nil {
-		fprintf(os.Stderr, "genv: writing lock: %v\n", err)
+func printReconcileWarnings(result resolver.ReconcileResult) {
+	for _, w := range result.Warnings {
+		fprintf(os.Stderr, "genv apply: warning: %s\n", w)
 	}
 }
 
-// applyEnvVars writes the managed env fragment, updates lf.Env in memory, and
-// returns lists of applied and removed variable names. The caller is responsible
-// for persisting the lock file (avoiding a double-write when packages and env
-// vars are both applied in the same run).
-// If verbose is true, it prints progress lines to stdout.
-func applyEnvVars(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (applied, removed []string) {
-	if len(f.Env) == 0 && len(lf.Env) == 0 {
-		return nil, nil
+func printApplyReconcilePlan(w io.Writer, skipPackages bool, result resolver.ReconcileResult) (toInstall, toRemove, unresolved int) {
+	if skipPackages {
+		fPrintln(w, "Apply plan — files, env, services")
+		fPrintln(w)
+		return 0, 0, 0
 	}
+	return resolver.PrintReconcilePlan(result, w)
+}
 
-	fragPath, err := genvenv.FragmentPath()
-	if err != nil {
-		fprintf(os.Stderr, "genv: cannot determine fragment path: %v\n", err)
-		return nil, nil
+func applyConfirmMessage(skipPackages bool, toInstall, toRemove, envChanges, shellChanges, serviceChanges, fileChanges int) string {
+	var parts []string
+	if !skipPackages {
+		parts = append(parts, fmt.Sprintf("install %d and remove %d package(s)", toInstall, toRemove))
+	}
+	if envChanges > 0 {
+		parts = append(parts, fmt.Sprintf("apply %d env variable(s)", envChanges))
+	}
+	if shellChanges > 0 {
+		parts = append(parts, fmt.Sprintf("apply %d shell config entry/entries", shellChanges))
+	}
+	if serviceChanges > 0 {
+		parts = append(parts, fmt.Sprintf("reconcile %d service(s)", serviceChanges))
+	}
+	if fileChanges > 0 {
+		parts = append(parts, fmt.Sprintf("reconcile %d file entry/entries", fileChanges))
+	}
+	return "This will " + strings.Join(parts, ", ") + ". Continue? [y/N] "
+}
+
+// writeLockAfterApply updates the lock file to reflect what actually succeeded.
+// Called from both the JSON and human-readable paths of applyCmd.
+// skipPackages leaves lock packages untouched so a files/env/services apply
+// cannot rewrite the package inventory.
+func writeLockAfterApply(lockPath string, lf *genvfile.LockFile, result resolver.ReconcileResult, execResult resolver.ApplyExecution, targetProfile, activeTarget string, skipPackages, success bool) error {
+	if success && targetProfile != "" {
+		if targetProfile == "base" {
+			lf.ActiveProfile = ""
+		} else {
+			lf.ActiveProfile = targetProfile
+		}
+	}
+	if success && activeTarget != "" {
+		lf.Target = activeTarget
+		lf.GOOS = runtime.GOOS
+	}
+	if !skipPackages {
+		uninstalledSet := make(map[string]bool, len(execResult.Uninstalled))
+		for _, id := range execResult.Uninstalled {
+			uninstalledSet[id] = true
+		}
+		installedSet := make(map[string]bool, len(execResult.Installed))
+		for _, lp := range execResult.Installed {
+			installedSet[lp.ID] = true
+		}
+		prevByID := make(map[string]genvfile.LockedPackage, len(lf.Packages))
+		for _, lp := range lf.Packages {
+			prevByID[lp.ID] = lp
+		}
+		newPkgs := make([]genvfile.LockedPackage, 0, len(result.Unchanged)+len(result.Adopted)+len(execResult.Installed)+len(result.ToRemove)+len(result.ToInstall))
+		newPkgs = append(newPkgs, result.Unchanged...)
+		newPkgs = append(newPkgs, result.Adopted...)
+		newPkgs = append(newPkgs, execResult.Installed...)
+		for _, a := range result.ToInstall {
+			if installedSet[a.Pkg.ID] {
+				continue
+			}
+			if prev, ok := prevByID[a.Pkg.ID]; ok {
+				newPkgs = append(newPkgs, prev)
+			}
+		}
+		for _, a := range result.ToRemove {
+			if !uninstalledSet[a.Pkg.ID] {
+				if prev, ok := prevByID[a.Pkg.ID]; ok {
+					newPkgs = append(newPkgs, prev)
+				} else {
+					newPkgs = append(newPkgs, genvfile.LockedPackage{
+						ID:      a.Pkg.ID,
+						Manager: a.Manager,
+						PkgName: a.PkgName,
+					})
+				}
+			}
+		}
+		resolver.FillMissingInstalledVersions(newPkgs)
+		lf.Packages = newPkgs
+	}
+	if err := genvfile.WriteLock(lockPath, lf); err != nil {
+		return err
+	}
+	return nil
+}
+
+// applyEnvVars writes managed env fragments via selected profile backends,
+// updates lf.Env in memory, and returns lists of applied and removed variable
+// names. The caller is responsible for persisting the lock file (avoiding a
+// double-write when packages and env vars are both applied in the same run).
+// If verbose is true, it prints progress lines to stdout.
+func applyEnvVars(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool, stateDir string) (applied, removed []string, err error) {
+	if len(f.Env) == 0 && len(lf.Env) == 0 {
+		return nil, nil, nil
 	}
 
 	// Use EnvStatus to determine what changed, avoiding duplicated diff logic.
@@ -936,9 +2006,22 @@ func applyEnvVars(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (appl
 		}
 	}
 
-	if err := genvenv.ApplyEnv(fragPath, f.Env, genvenv.RcFiles()); err != nil {
-		fprintf(os.Stderr, "genv: writing env fragment: %v\n", err)
-		return applied, removed
+	if warn := profilebackend.MissingEngineWarning(runtime.GOOS); warn != "" {
+		fprintf(os.Stderr, "genv: warning: %s\n", warn)
+	}
+
+	backends := profilebackend.SelectBackendsIn(runtime.GOOS, stateDir)
+	var lastFrag string
+	for _, b := range backends {
+		if err := b.ApplyEnv(f.Env); err != nil {
+			fprintf(os.Stderr, "genv: writing env fragment (%s): %v\n", b.Name(), err)
+			return applied, removed, err
+		}
+		lastFrag = b.Name()
+	}
+	if lastFrag == "" && (len(applied) > 0 || len(removed) > 0 || len(f.Env) > 0) {
+		// No backend ran (e.g. Windows without PowerShell and without POSIX rc).
+		fprintf(os.Stderr, "genv: warning: no profile backend available to write env fragment\n")
 	}
 
 	if verbose {
@@ -949,7 +2032,8 @@ func applyEnvVars(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (appl
 			fprintf(os.Stdout, "  env: removed %s\n", name)
 		}
 		if len(applied) > 0 || len(removed) > 0 {
-			fprintf(os.Stdout, "env fragment written to %s\n", fragPath)
+			state := applyStatePaths(stateDir, "")
+			fprintf(os.Stdout, "env fragment written (%s backends) e.g. %s\n", lastFrag, state.Env)
 		}
 	}
 
@@ -964,7 +2048,7 @@ func applyEnvVars(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (appl
 	}
 	lf.Env = newEnv
 
-	return applied, removed
+	return applied, removed, nil
 }
 
 // buildPlanResult converts a ReconcileResult into the stable JSON PlanResult type.
@@ -973,10 +2057,15 @@ func buildPlanResult(f *schema.GenvFile, lf *genvfile.LockFile, result resolver.
 	var unresolved int
 	for _, a := range result.ToInstall {
 		if a.Resolved() {
+			cmd := strings.Join(a.Cmd, " ")
+			if a.Detail != "" {
+				cmd = a.Detail
+			}
 			toInstall = append(toInstall, output.PlanPackage{
-				ID:      a.Pkg.ID,
-				Manager: a.Manager,
-				Cmd:     strings.Join(a.Cmd, " "),
+				ID:       a.Pkg.ID,
+				Manager:  a.Manager,
+				Cmd:      cmd,
+				External: externalOutputDetails(a.Pkg, ""),
 			})
 		} else {
 			unresolved++
@@ -995,9 +2084,13 @@ func buildPlanResult(f *schema.GenvFile, lf *genvfile.LockFile, result resolver.
 	for _, lp := range result.Unchanged {
 		unchanged = append(unchanged, output.PlanPackage{ID: lp.ID, Manager: lp.Manager})
 	}
+	adopted := make([]output.PlanPackage, 0, len(result.Adopted))
+	for _, lp := range result.Adopted {
+		adopted = append(adopted, output.PlanPackage{ID: lp.ID, Manager: lp.Manager})
+	}
 
 	var toStart, toStop []string
-	for _, e := range service.ServiceStatus(f.Services, lf.Services) {
+	for _, e := range service.ServiceStatus(f.Services, lf.Services, false, "") {
 		switch e.Kind {
 		case service.ServiceStatusMissing, service.ServiceStatusModified:
 			toStart = append(toStart, e.Name)
@@ -1010,6 +2103,7 @@ func buildPlanResult(f *schema.GenvFile, lf *genvfile.LockFile, result resolver.
 		ToInstall:       toInstall,
 		ToRemove:        toRemove,
 		Unchanged:       unchanged,
+		Adopted:         adopted,
 		Unresolved:      unresolved,
 		ServicesToStart: toStart,
 		ServicesToStop:  toStop,
@@ -1102,17 +2196,420 @@ func errStrings(errs []error) []string {
 	return s
 }
 
+// sourceRootForSpec returns the directory relative files.links/templates and
+// service assets resolve against.
+//
+// A local repo.url (~/, absolute, or file://) is usable as a source root
+// because it names a real directory on this machine. A remote one is not:
+// `genv pull` copies bundled assets next to the local spec, and
+// filepath.Clean turns "https://github.com/org/repo" into the relative path
+// "https:/github.com/org/repo". For those, the spec directory is the root.
+// --source-root still wins (see applySourceRoot).
+func sourceRootForSpec(file string, f *schema.GenvFile) string {
+	if f != nil && f.Repo != nil && f.Repo.URL != "" {
+		if local, ok := localRepoPath(f.Repo.URL); ok {
+			return local
+		}
+	}
+	return filepath.Dir(file)
+}
+
+// localRepoPath returns the on-disk path a repo.url names, and whether the
+// URL is local at all. Remote schemes (https://, ssh://, git@) return false.
+func localRepoPath(rawURL string) (string, bool) {
+	expanded := expandCLIPath(rawURL)
+	switch {
+	case strings.HasPrefix(strings.ToLower(expanded), "file://"):
+		// Strip the scheme so the result is a path this machine can actually
+		// open. file://host/path is not a local file we can read; only the
+		// empty-host form is accepted.
+		rest := expanded[len("file://"):]
+		if strings.HasPrefix(rest, "/") {
+			return rest, true
+		}
+		return "", false
+	case strings.HasPrefix(strings.ToLower(rawURL), "https://"),
+		strings.HasPrefix(strings.ToLower(rawURL), "ssh://"),
+		strings.HasPrefix(rawURL, "git@"):
+		return "", false
+	case filepath.IsAbs(expanded) || isWindowsAbsPathString(expanded):
+		return expanded, true
+	default:
+		return "", false
+	}
+}
+
+// isWindowsAbsPathString reports whether s looks like a Windows drive path
+// regardless of the host GOOS, so a Linux box evaluating a Windows repo.url
+// still classifies it as absolute.
+func isWindowsAbsPathString(s string) bool {
+	if len(s) < 3 || !((s[0] >= 'A' && s[0] <= 'Z') || (s[0] >= 'a' && s[0] <= 'z')) {
+		return false
+	}
+	return s[1] == ':' && (s[2] == '\\' || s[2] == '/')
+}
+
+// applySourceRoot is the files.links/templates and service template root for apply.
+// --source-root wins so a spec copy can preview against the live tree.
+func applySourceRoot(opts applyOptions, f *schema.GenvFile) string {
+	if opts.SourceRoot != "" {
+		return expandCLIPath(opts.SourceRoot)
+	}
+	return sourceRootForSpec(opts.File, f)
+}
+
+func validateApplySourceRoot(sourceRoot string) error {
+	if sourceRoot == "" {
+		return nil
+	}
+	root := expandCLIPath(sourceRoot)
+	info, err := os.Stat(root)
+	if err != nil {
+		return fmt.Errorf("--source-root %s: %w", root, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("--source-root %s: not a directory", root)
+	}
+	return nil
+}
+
+func expandCLIPath(path string) string {
+	// Only "~", "~/" and "~\" are home-relative. "~name" is a different
+	// user's home and must not resolve to $HOME concatenated with "name"
+	// (Fixes #208). filepath.Join also keeps the separator native, where
+	// string concatenation produced "C:\Users\me/dotfiles" on Windows.
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			path = filepath.Join(home, path[1:])
+		}
+	}
+	return os.Expand(path, os.Getenv)
+}
+
+func lockedFilesFromSpec(cfg *schema.FilesConfig, hostName, sourceRoot string) []genvfile.LockedFile {
+	if cfg == nil {
+		return nil
+	}
+	locked := make([]genvfile.LockedFile, 0, len(cfg.Links)+len(cfg.Templates)+len(cfg.Dirs))
+	for _, l := range cfg.Links {
+		mode := l.Mode
+		if mode == "" {
+			mode = "link"
+		}
+		entry := genvfile.LockedFile{Source: l.Source, Target: l.Target, Mode: mode}
+		if files.HashableLinkMode(mode) {
+			if hash, err := files.HashLinkSource(sourceRoot, l.Source); err == nil {
+				entry.ContentHash = hash
+			}
+		}
+		locked = append(locked, entry)
+	}
+	for _, tmpl := range cfg.Templates {
+		entry := genvfile.LockedFile{Source: tmpl.Source, Target: tmpl.Target, Mode: "copy"}
+		if hash, err := files.HashTemplate(sourceRoot, tmpl.Source, hostName); err == nil {
+			entry.ContentHash = hash
+		}
+		locked = append(locked, entry)
+	}
+	for _, d := range cfg.Dirs {
+		locked = append(locked, genvfile.LockedFile{Target: d.Target, Mode: "dir"})
+	}
+	return locked
+}
+
+func fileLockKey(f genvfile.LockedFile) string {
+	return f.Source + "\x00" + f.Target + "\x00" + f.Mode
+}
+
+func mergeLockedFiles(existing, adopted []genvfile.LockedFile) []genvfile.LockedFile {
+	merged := append([]genvfile.LockedFile(nil), existing...)
+	index := make(map[string]int, len(existing)+len(adopted))
+	for i, f := range existing {
+		index[fileLockKey(f)] = i
+	}
+	for _, f := range adopted {
+		key := fileLockKey(f)
+		if i, ok := index[key]; ok {
+			if f.ContentHash != "" {
+				merged[i].ContentHash = f.ContentHash
+			}
+			continue
+		}
+		index[key] = len(merged)
+		merged = append(merged, f)
+	}
+	return merged
+}
+
+func fileContentHashes(locked []genvfile.LockedFile) map[string]string {
+	if len(locked) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(locked))
+	for _, f := range locked {
+		if f.ContentHash == "" {
+			continue
+		}
+		target, err := files.ExpandTarget(f.Target)
+		if err != nil {
+			continue
+		}
+		out[target] = f.ContentHash
+	}
+	return out
+}
+
+func filesConfigWithResolvedSources(cfg *schema.FilesConfig, sourceRoot string) *schema.FilesConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := &schema.FilesConfig{
+		Links:     append([]schema.FileLink(nil), cfg.Links...),
+		Templates: append([]schema.FileTemplate(nil), cfg.Templates...),
+		Dirs:      append([]schema.FileDir(nil), cfg.Dirs...),
+	}
+	for i := range out.Links {
+		out.Links[i].Source = resolveCLISource(sourceRoot, out.Links[i].Source)
+	}
+	for i := range out.Templates {
+		out.Templates[i].Source = resolveCLISource(sourceRoot, out.Templates[i].Source)
+	}
+	return out
+}
+
+func resolveCLISource(sourceRoot, source string) string {
+	expanded := expandCLIPath(source)
+	// Treat POSIX and Windows absolute paths as absolute even when the host
+	// filepath.IsAbs disagrees (e.g. "/abs" on Windows).
+	if filepath.IsAbs(expanded) || strings.HasPrefix(expanded, "/") || sourceRoot == "" {
+		return expanded
+	}
+	return filepath.Join(sourceRoot, expanded)
+}
+
+func hasBoolFlag(args []string, name string) bool {
+	long := "--" + name
+	for _, arg := range args {
+		if arg == long || strings.HasPrefix(arg, long+"=") {
+			return true
+		}
+	}
+	return false
+}
+
+func writeFileStatus(w io.Writer, res *files.StatusResult) {
+	if res == nil {
+		return
+	}
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, e := range res.Entries {
+		if e.Kind == "ok" {
+			continue
+		}
+		fprintf(tw, "  %s\t%s\t%s\n", e.Kind, e.Target, e.Mode)
+	}
+	_ = tw.Flush()
+}
+
+func writeFilePlan(w io.Writer, res *files.ApplyResult) {
+	if res == nil {
+		return
+	}
+	entries := filePlanEntries(res)
+	if len(entries) == 0 {
+		return
+	}
+	fPrintln(w, "files:")
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	for _, e := range entries {
+		fprintf(tw, "  %s\t%s\n", e.Kind, e.Target)
+	}
+	_ = tw.Flush()
+}
+
+func writeFileMismatchGuidance(w io.Writer, res *files.ApplyResult) {
+	if res == nil || len(res.Mismatched) == 0 {
+		return
+	}
+	for _, target := range res.Mismatched {
+		fprintf(w, "genv apply: mismatch: %s\n", target)
+	}
+	fPrintln(w, "Hint: re-run with genv apply --force to overwrite remaining mismatches. Per-entry backup: true replaces that entry and keeps *.backup.*")
+}
+
+func hasPostApplyHooks(f *schema.GenvFile) bool {
+	return f != nil && f.Hooks != nil && len(f.Hooks.PostApply) > 0
+}
+
+func unresolvedFileMismatch(res *files.ApplyResult) bool {
+	return res != nil && len(res.Mismatched) > 0
+}
+
+func filePlanEntries(res *files.ApplyResult) []output.FilePlanEntry {
+	if res == nil {
+		return nil
+	}
+	entries := make([]output.FilePlanEntry, 0, len(res.Created)+len(res.Updated)+len(res.Skipped)+len(res.Mismatched))
+	for _, target := range res.Created {
+		entries = append(entries, output.FilePlanEntry{Target: target, Kind: "create"})
+	}
+	for _, target := range res.Updated {
+		entries = append(entries, output.FilePlanEntry{Target: target, Kind: "update"})
+	}
+	for _, target := range res.Skipped {
+		entries = append(entries, output.FilePlanEntry{Target: target, Kind: "ok"})
+	}
+	for _, target := range res.Mismatched {
+		entries = append(entries, output.FilePlanEntry{Target: target, Kind: "mismatch"})
+	}
+	return entries
+}
+
+func fileStatusEntries(res *files.StatusResult) []output.FilePlanEntry {
+	if res == nil {
+		return nil
+	}
+	entries := make([]output.FilePlanEntry, 0, len(res.Entries))
+	for _, e := range res.Entries {
+		entries = append(entries, output.FilePlanEntry{Source: e.Source, Target: e.Target, Mode: e.Mode, Kind: e.Kind})
+	}
+	return entries
+}
+
+func applyFiles(ctx context.Context, opts applyOptions, f *schema.GenvFile, lf *genvfile.LockFile) (*files.ApplyResult, error) {
+	hostName := hostForCommand(opts.Host)
+	sourceRoot := applySourceRoot(opts, f)
+	res, err := files.Apply(ctx, f.Files, hostName, files.ApplyOptions{
+		SourceRoot: sourceRoot,
+		Force:      opts.Force,
+		DryRun:     opts.DryRun,
+		Backup:     opts.Backup,
+	})
+	if err == nil && !opts.DryRun {
+		refreshLockedFileHashes(f, lf, hostName, sourceRoot)
+	}
+	return res, err
+}
+
+func refreshLockedFileHashes(f *schema.GenvFile, lf *genvfile.LockFile, hostName, sourceRoot string) {
+	if f == nil || lf == nil {
+		return
+	}
+	lf.Files = lockedFilesFromSpec(f.Files, hostName, sourceRoot)
+}
+
+type upgradeHookOptions struct {
+	Phase    string
+	Host     string
+	Profile  string
+	SpecFile string
+	LockFile string
+	DryRun   bool
+	Yes      bool
+	Timeout  time.Duration
+	Plan     []resolver.UpgradeAction
+	Skipped  []resolver.SkippedPackage
+	Upgraded []genvfile.LockedPackage
+	Failed   []string
+}
+
+func runUpgradeHooks(ctx context.Context, f *schema.GenvFile, opts upgradeHookOptions) []string {
+	if f == nil || f.Hooks == nil {
+		return nil
+	}
+	exec := hooks.NewExecutor(os.Stdout, os.Stderr)
+	exec.SourceRoot = sourceRootForSpec(opts.SpecFile, nil)
+	runOpts := hooks.RunOptions{
+		Host:    opts.Host,
+		DryRun:  opts.DryRun,
+		Env:     upgradeHookEnv(opts),
+		Timeout: opts.Timeout,
+		Stdin:   os.Stdin,
+	}
+	var err error
+	switch opts.Phase {
+	case "pre":
+		if len(f.Hooks.PreUpgrade) > 0 {
+			err = exec.PreUpgradeWithOptions(ctx, f.Hooks.PreUpgrade, runOpts)
+		}
+	case "post":
+		if len(f.Hooks.PostUpgrade) > 0 {
+			err = exec.PostUpgradeWithOptions(ctx, f.Hooks.PostUpgrade, runOpts)
+		}
+	}
+	if err != nil {
+		return []string{err.Error()}
+	}
+	return nil
+}
+
+func upgradeHookEnv(opts upgradeHookOptions) []string {
+	phase := "pre-upgrade"
+	if opts.Phase == "post" {
+		phase = "post-upgrade"
+	}
+	return hookEnv(hookContext{Event: "upgrade", Phase: phase, Host: opts.Host, Profile: opts.Profile, DryRun: opts.DryRun, Yes: opts.Yes, Upgraded: upgradePackageIDs(opts.Upgraded), Failed: opts.Failed, Skipped: upgradeSkippedIDs(opts.Skipped), UpgradeManagers: upgradePlanManagers(opts.Plan)}.withFiles(opts.SpecFile, opts.LockFile))
+}
+
+func upgradePlanManagers(plan []resolver.UpgradeAction) []string {
+	seen := make(map[string]bool, len(plan))
+	var managers []string
+	for _, action := range plan {
+		if len(action.LPs) == 0 {
+			continue
+		}
+		manager := action.LPs[0].Manager
+		if seen[manager] {
+			continue
+		}
+		seen[manager] = true
+		managers = append(managers, manager)
+	}
+	return managers
+}
+
+func upgradePackageIDs(pkgs []genvfile.LockedPackage) []string {
+	ids := make([]string, len(pkgs))
+	for i, pkg := range pkgs {
+		ids[i] = pkg.ID
+	}
+	return ids
+}
+
+func upgradeSkippedIDs(skipped []resolver.SkippedPackage) []string {
+	ids := make([]string, len(skipped))
+	for i, item := range skipped {
+		ids[i] = item.ID
+	}
+	return ids
+}
+
+func upgradeFailedIDs(plan []resolver.UpgradeAction, errs []error) []string {
+	if len(errs) == 0 {
+		return nil
+	}
+	var ids []string
+	for _, action := range plan {
+		if upgradeActionError(action, errs) == "" {
+			continue
+		}
+		for _, pkg := range action.LPs {
+			ids = append(ids, pkg.ID)
+		}
+	}
+	return ids
+}
+
 // envCmd implements `genv env <subcommand>`.
 // Subcommands: set, unset, list.
 func envCmd(args []string) int {
 	if len(args) == 0 {
-		fPrintln(os.Stderr, "usage: genv env <set|unset|list> [flags]")
-		fPrintln(os.Stderr)
-		fPrintln(os.Stderr, "subcommands:")
-		fPrintln(os.Stderr, "  set <NAME> <value> [--sensitive]   Add or update a variable in the spec")
-		fPrintln(os.Stderr, "  unset <NAME>                        Remove a variable from the spec")
-		fPrintln(os.Stderr, "  list [--json]                       Show all declared variables")
+		printEnvUsage()
 		return exitUsage
+	}
+	if isHelpArg(args[0]) {
+		printEnvUsage()
+		return exitOK
 	}
 	switch args[0] {
 	case "set":
@@ -1127,6 +2624,15 @@ func envCmd(args []string) int {
 	}
 }
 
+func printEnvUsage() {
+	fPrintln(os.Stderr, "usage: genv env <set|unset|list> [flags]")
+	fPrintln(os.Stderr)
+	fPrintln(os.Stderr, "subcommands:")
+	fPrintln(os.Stderr, "  set <NAME> <value> [--sensitive]   Add or update a variable in the spec")
+	fPrintln(os.Stderr, "  unset <NAME>                        Remove a variable from the spec")
+	fPrintln(os.Stderr, "  list [--json]                       Show all declared variables")
+}
+
 // envSetCmd implements `genv env set <NAME> <value> [--sensitive] [--file]`.
 func envSetCmd(args []string) int {
 	fs := flag.NewFlagSet("env set", flag.ContinueOnError)
@@ -1138,9 +2644,10 @@ func envSetCmd(args []string) int {
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
 	sensitive := fs.Bool("sensitive", false, "mark value as sensitive (redacted in output and logs)")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if fs.NArg() < 2 {
 		fPrintln(os.Stderr, "genv env set: NAME and value are required")
@@ -1159,7 +2666,11 @@ func envSetCmd(args []string) int {
 		return exitIO
 	}
 
-	if err := commands.EnvSet(f, name, value, *sensitive); err != nil {
+	targetID, exit := resolveMutationTarget("env set", *file, f, *targetFlag)
+	if exit != exitOK {
+		return exit
+	}
+	if err := commands.EnvSet(f, name, value, *sensitive, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		return exitUsage
 	}
@@ -1186,9 +2697,10 @@ func envUnsetCmd(args []string) int {
 		fs.PrintDefaults()
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if fs.NArg() < 1 {
 		fPrintln(os.Stderr, "genv env unset: NAME is required")
@@ -1210,7 +2722,11 @@ func envUnsetCmd(args []string) int {
 		return exitIO
 	}
 
-	if err := commands.EnvUnset(f, name); err != nil {
+	targetID, exit := resolveMutationTarget("env unset", *file, f, *targetFlag)
+	if exit != exitOK {
+		return exit
+	}
+	if err := commands.EnvUnset(f, name, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		if errors.Is(err, commands.ErrEnvNotFound) {
 			return exitLogic
@@ -1238,22 +2754,15 @@ func envListCmd(args []string) int {
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON to stdout")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
-	f, err := genvfile.Read(*file)
-	if err != nil {
-		if errors.Is(err, genvfile.ErrNotFound) {
-			fprintf(os.Stderr, "genv: %s not found — run 'genv env set' to create it\n", *file)
-			return exitIO
-		}
-		fprintf(os.Stderr, "genv: %v\n", err)
-		if errors.Is(err, genvfile.ErrInvalidFile) {
-			return exitValidation
-		}
-		return exitIO
+	f, code := readMaterializedSpec("env list", *file, "", *targetFlag)
+	if code != exitOK {
+		return code
 	}
 
 	lf, err := genvfile.ReadLock(genvfile.LockPathFrom(*file))
@@ -1290,14 +2799,12 @@ func envListCmd(args []string) int {
 // shellCmd implements `genv shell <subcommand>`.
 func shellCmd(args []string) int {
 	if len(args) == 0 {
-		fPrintln(os.Stderr, "usage: genv shell <alias|status|edit> [flags]")
-		fPrintln(os.Stderr)
-		fPrintln(os.Stderr, "subcommands:")
-		fPrintln(os.Stderr, "  alias set <name> <value> [--shell bash|zsh|fish]   Add or update an alias")
-		fPrintln(os.Stderr, "  alias unset <name>                                 Remove an alias")
-		fPrintln(os.Stderr, "  status [--json]                                    Show shell config drift")
-		fPrintln(os.Stderr, "  edit                                               Open genv.json in $EDITOR")
+		printShellUsage()
 		return exitUsage
+	}
+	if isHelpArg(args[0]) {
+		printShellUsage()
+		return exitOK
 	}
 	switch args[0] {
 	case "alias":
@@ -1312,11 +2819,25 @@ func shellCmd(args []string) int {
 	}
 }
 
+func printShellUsage() {
+	fPrintln(os.Stderr, "usage: genv shell <alias|status|edit> [flags]")
+	fPrintln(os.Stderr)
+	fPrintln(os.Stderr, "subcommands:")
+	fPrintln(os.Stderr, "  alias set <name> <value> [--shell bash|zsh|fish]   Add or update an alias")
+	fPrintln(os.Stderr, "  alias unset <name>                                 Remove an alias")
+	fPrintln(os.Stderr, "  status [--json]                                    Show shell config drift")
+	fPrintln(os.Stderr, "  edit                                               Open genv.json in $EDITOR")
+}
+
 // shellAliasCmd dispatches `genv shell alias set|unset`.
 func shellAliasCmd(args []string) int {
 	if len(args) == 0 {
-		fPrintln(os.Stderr, "usage: genv shell alias <set|unset> [flags]")
+		printShellAliasUsage()
 		return exitUsage
+	}
+	if isHelpArg(args[0]) {
+		printShellAliasUsage()
+		return exitOK
 	}
 	switch args[0] {
 	case "set":
@@ -1327,6 +2848,10 @@ func shellAliasCmd(args []string) int {
 		fprintf(os.Stderr, "genv shell alias: unknown subcommand %q\n", args[0])
 		return exitUsage
 	}
+}
+
+func printShellAliasUsage() {
+	fPrintln(os.Stderr, "usage: genv shell alias <set|unset> [flags]")
 }
 
 // shellAliasSetCmd implements `genv shell alias set <name> <value> [--shell] [--file]`.
@@ -1340,9 +2865,10 @@ func shellAliasSetCmd(args []string) int {
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
 	shell := fs.String("shell", "", "target shell: "+schema.ValidShellTargetsMsg)
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if fs.NArg() < 2 {
 		fPrintln(os.Stderr, "genv shell alias set: name and value are required")
@@ -1360,7 +2886,11 @@ func shellAliasSetCmd(args []string) int {
 		return exitIO
 	}
 
-	if err := commands.ShellAliasSet(f, name, value, *shell); err != nil {
+	targetID, exit := resolveMutationTarget("shell alias set", *file, f, *targetFlag)
+	if exit != exitOK {
+		return exit
+	}
+	if err := commands.ShellAliasSet(f, name, value, *shell, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		return exitUsage
 	}
@@ -1391,9 +2921,10 @@ func shellAliasUnsetCmd(args []string) int {
 		fs.PrintDefaults()
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if fs.NArg() < 1 {
 		fPrintln(os.Stderr, "genv shell alias unset: name is required")
@@ -1415,7 +2946,11 @@ func shellAliasUnsetCmd(args []string) int {
 		return exitIO
 	}
 
-	if err := commands.ShellAliasUnset(f, name); err != nil {
+	targetID, exit := resolveMutationTarget("shell alias unset", *file, f, *targetFlag)
+	if exit != exitOK {
+		return exit
+	}
+	if err := commands.ShellAliasUnset(f, name, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		if errors.Is(err, commands.ErrShellAliasNotFound) {
 			return exitLogic
@@ -1443,22 +2978,15 @@ func shellStatusCmd(args []string) int {
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON to stdout")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
-	f, err := genvfile.Read(*file)
-	if err != nil {
-		if errors.Is(err, genvfile.ErrNotFound) {
-			fprintf(os.Stderr, "genv: %s not found — run 'genv shell alias set' to create it\n", *file)
-			return exitIO
-		}
-		fprintf(os.Stderr, "genv: %v\n", err)
-		if errors.Is(err, genvfile.ErrInvalidFile) {
-			return exitValidation
-		}
-		return exitIO
+	f, code := readMaterializedSpec("shell status", *file, "", *targetFlag)
+	if code != exitOK {
+		return code
 	}
 
 	lf, err := genvfile.ReadLock(genvfile.LockPathFrom(*file))
@@ -1507,7 +3035,7 @@ func shellEditCmd(args []string) int {
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
 	editor := os.Getenv("EDITOR")
@@ -1531,18 +3059,12 @@ func shellEditCmd(args []string) int {
 	return exitOK
 }
 
-// applyShellCfg writes the managed shell fragment, updates lf.Shell in memory,
-// and returns lists of applied and removed entry names. The caller writes the lock.
-// If verbose is true, it prints progress lines to stdout.
-func applyShellCfg(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (applied, removed []string) {
+// applyShellCfg writes managed shell fragments via selected profile backends,
+// updates lf.Shell in memory, and returns lists of applied and removed entry
+// names. The caller writes the lock. If verbose is true, it prints progress.
+func applyShellCfg(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool, stateDir string) (applied, removed []string, err error) {
 	if f.Shell == nil && lf.Shell == nil {
-		return nil, nil
-	}
-
-	fragPath, err := shellcfg.FragmentPath()
-	if err != nil {
-		fprintf(os.Stderr, "genv: cannot determine shell fragment path: %v\n", err)
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	// Use ShellStatus to determine what changed, avoiding duplicated diff logic.
@@ -1574,13 +3096,24 @@ func applyShellCfg(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (app
 		}
 	}
 
+	if warn := profilebackend.MissingEngineWarning(runtime.GOOS); warn != "" {
+		// Avoid duplicate warning when applyEnvVars already printed it in the same run;
+		// still useful when only shell is applied.
+		if len(f.Env) == 0 && len(lf.Env) == 0 {
+			fprintf(os.Stderr, "genv: warning: %s\n", warn)
+		}
+	}
+
 	var cfg *schema.ShellConfig
 	if f.Shell != nil {
 		cfg = f.Shell
 	}
-	if err := shellcfg.ApplyShell(fragPath, cfg, genvenv.RcFiles()); err != nil {
-		fprintf(os.Stderr, "genv: writing shell fragment: %v\n", err)
-		return applied, removed
+	backends := profilebackend.SelectBackendsIn(runtime.GOOS, stateDir)
+	for _, b := range backends {
+		if err := b.ApplyShell(cfg); err != nil {
+			fprintf(os.Stderr, "genv: writing shell fragment (%s): %v\n", b.Name(), err)
+			return applied, removed, err
+		}
 	}
 
 	if verbose {
@@ -1591,42 +3124,78 @@ func applyShellCfg(f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (app
 			fprintf(os.Stdout, "  shell: removed %s\n", name)
 		}
 		if len(applied) > 0 || len(removed) > 0 {
-			fprintf(os.Stdout, "shell fragment written to %s\n", fragPath)
+			state := applyStatePaths(stateDir, "")
+			fprintf(os.Stdout, "shell fragment written to %s\n", state.Shell)
 		}
 	}
 	if hasFishEntries {
+		state := applyStatePaths(stateDir, "")
 		fprintf(os.Stdout, "note: fish-specific shell entries are not auto-applied.\n")
-		fprintf(os.Stdout, "      Add '. %s' to ~/.config/fish/config.fish to source them.\n", fragPath)
+		fprintf(os.Stdout, "      Add '. %s' to ~/.config/fish/config.fish to source them.\n", state.Shell)
 	}
 
 	// Update lf.Shell in memory; caller writes the lock once.
 	lf.Shell = shellcfg.SpecToLock(f.Shell)
 
-	return applied, removed
+	return applied, removed, nil
 }
 
 // scanCmd implements `genv scan`.
-// Discovers all packages currently installed via available package managers and
-// bulk-adopts them into genv.json and the lock file. Packages already tracked
-// are skipped. Duplicate names discovered across multiple managers are
-// deduplicated — the first adapter in registry order wins.
+// Discovers packages currently installed via available managers and adopts
+// them into genv.json and the lock file. Use --dry-run to preview; text mode
+// confirms unless --yes is set (JSON writes without a prompt, matching apply).
+var scanGOOS = runtime.GOOS
+
+type scanCandidate struct {
+	id      string
+	manager string
+	pkgName string
+	version string
+}
+
 func scanCmd(args []string) int {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.Usage = func() {
 		fPrintln(os.Stderr, "usage: genv scan [flags]")
 		fPrintln(os.Stderr)
-		fPrintln(os.Stderr, "Discover all installed packages and adopt them into genv.json.")
+		fPrintln(os.Stderr, "Discover user-facing installed packages and adopt them into genv.json.")
+		fPrintln(os.Stderr)
+		fPrintln(os.Stderr, "Default inventory is leaves, not the full dependency tree:")
+		fPrintln(os.Stderr, "  brew/linuxbrew  brew leaves + casks (not brew list)")
+		fPrintln(os.Stderr, "  gem             skip default and bundled Ruby gems")
+		fPrintln(os.Stderr, "  pip-user        packages that are not deps of other user-site")
+		fPrintln(os.Stderr, "                  packages, minus installer/stdlib-like noise")
+		fPrintln(os.Stderr, "  npm/pnpm/yarn   already top-level globals only (--depth=0);")
+		fPrintln(os.Stderr, "                  npm itself is never proposed")
+		fPrintln(os.Stderr, "  uv              tool headers only (not `-` entrypoint bullets)")
+		fPrintln(os.Stderr, "  rustup          skip toolchains (not rustup package ids)")
+		fPrintln(os.Stderr)
+		fPrintln(os.Stderr, "Pass --all (or --deps) to adopt every ListInstalled name,")
+		fPrintln(os.Stderr, "including Homebrew libraries and language stdlib.")
+		fPrintln(os.Stderr, "Preview with --dry-run. Text mode prompts unless --yes is set.")
+		fPrintln(os.Stderr)
+		fPrintln(os.Stderr, "Examples:")
+		fPrintln(os.Stderr, "  genv scan --dry-run")
+		fPrintln(os.Stderr, "  genv scan --dry-run --target macos")
+		fPrintln(os.Stderr, "  genv scan --yes")
+		fPrintln(os.Stderr, "  genv scan --all --dry-run")
 		fPrintln(os.Stderr)
 		fPrintln(os.Stderr, "flags:")
 		fs.PrintDefaults()
 	}
 
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON to stdout instead of human-readable text")
+	dryRun := fs.Bool("dry-run", false, "list packages that would be adopted without writing the spec or lock")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt (for CI and scripts)")
 	debug := fs.Bool("debug", false, "emit debug-level structured logs to stderr")
+	includeAll := fs.Bool("all", false, "include manager dependencies and language stdlib (same as --deps)")
+	includeDeps := fs.Bool("deps", false, "include manager dependencies and language stdlib (same as --all)")
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if *debug {
 		logging.Init(true)
@@ -1640,7 +3209,12 @@ func scanCmd(args []string) int {
 		}
 		return exitIO
 	}
+	targetID, exit := resolveMutationTarget("scan", *file, f, *targetFlag)
+	if exit != exitOK {
+		return exit
+	}
 
+	useSpecAdapters(f)
 	available := resolver.Detect()
 	if len(available) == 0 {
 		if *jsonOut {
@@ -1648,41 +3222,73 @@ func scanCmd(args []string) int {
 				Version: output.SchemaVersion,
 				Command: "scan",
 				OK:      true,
-				Data:    output.ScanResult{Added: 0, Skipped: 0},
+				Data:    output.ScanResult{Added: 0, Skipped: 0, DryRun: *dryRun},
 			})
 		}
 		fPrintln(os.Stdout, "no supported package managers detected.")
 		return exitOK
 	}
 
-	lockPath := genvfile.LockPathFrom(*file)
+	lockPath := lockPathForSpec(*file, *lockFile)
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
 		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
 		return exitIO
 	}
 
-	// Build sets of already-tracked IDs so we can skip them.
-	trackedInSpec := make(map[string]bool, len(f.Packages))
-	for _, p := range f.Packages {
+	// Build sets of already-tracked IDs so we can skip them. Besides the
+	// friendly p.ID, register every manager-specific name from p.Managers:
+	// adapters like mas report installed packages by their manager name
+	// (a numeric App Store product ID) rather than the friendly ID, so a
+	// package tracked as {"id":"xcode","managers":{"mas":"497799835"}} would
+	// otherwise be re-adopted as a duplicate bare-numeric entry.
+	trackedPackages := f.Packages
+	if schema.IsPortableVersion(f.SchemaVersion) {
+		active, err := schema.MergeTarget(f, targetID)
+		if err != nil {
+			fprintf(os.Stderr, "genv scan: %v in %s\n", err, *file)
+			return exitValidation
+		}
+		trackedPackages = active.Packages
+	}
+	trackedInSpec := make(map[string]bool, len(trackedPackages))
+	for _, p := range trackedPackages {
 		trackedInSpec[p.ID] = true
+		for _, managerName := range p.Managers {
+			trackedInSpec[managerName] = true
+		}
 	}
 
-	// Deduplicate across managers using a seen set.
 	seen := make(map[string]bool)
-	var added int
+	var candidates []scanCandidate
 	var skipped int
+	// Managers whose inventory could not be read. A scan that silently drops a
+	// source reports a complete-looking inventory that is not one: on a host
+	// where npm's global list failed to parse, scan proposed zero npm packages,
+	// printed one line to stderr, and exited 0 (#215).
+	var unreadable []string
+	var unreadableHard []string
+	fullInventory := *includeAll || *includeDeps
 
-	for _, a := range adapter.All {
-		if !available[a.Name()] {
-			continue
-		}
-		pkgs, err := a.ListInstalled()
+	for _, a := range scanAdaptersOnGOOS(available, scanGOOS) {
+		pkgs, versions, err := listScanInventory(a, fullInventory)
 		if err != nil {
 			fprintf(os.Stderr, "genv scan: %s: listing packages: %v\n", a.Name(), err)
+			unreadable = append(unreadable, a.Name())
+			// A per-manager deadline is an expected transient, not a defect:
+			// winget's first-run source sync can stall for minutes on Windows
+			// and the scan must not start failing because of it. Every other
+			// failure means the inventory is genuinely unknown, so it is
+			// reported as an error.
+			if !isScanListTimeout(err) {
+				unreadableHard = append(unreadableHard, a.Name())
+			}
 			continue
 		}
 		for _, pkgName := range pkgs {
+			if skipScanPackage(a.Name(), pkgName) {
+				continue
+			}
 			if seen[pkgName] {
 				continue // already handled by a higher-priority manager
 			}
@@ -1690,29 +3296,79 @@ func scanCmd(args []string) int {
 
 			if trackedInSpec[pkgName] {
 				skipped++
-				continue // already in spec
-			}
-
-			// Add to spec.
-			if err := commands.Add(f, pkgName, "", "", nil); err != nil {
-				// ErrAlreadyTracked can race with trackedInSpec; skip silently.
-				skipped++
 				continue
 			}
-			trackedInSpec[pkgName] = true
 
-			// Record in lock with best-effort version capture.
-			lp := genvfile.LockedPackage{
-				ID:      pkgName,
-				Manager: a.Name(),
-				PkgName: pkgName,
+			c := scanCandidate{id: pkgName, manager: a.Name(), pkgName: pkgName}
+			if v, ok := versions[pkgName]; ok {
+				c.version = v
+			} else if v, err := a.QueryVersion(pkgName); err == nil {
+				c.version = v
 			}
-			if v, err := a.QueryVersion(pkgName); err == nil {
-				lp.InstalledVersion = v
-			}
-			lf.Packages = append(lf.Packages, lp)
-			added++
+			candidates = append(candidates, c)
+			trackedInSpec[pkgName] = true // prevent duplicate IDs across managers in this pass
 		}
+	}
+
+	if *dryRun {
+		ids := make([]string, len(candidates))
+		for i, c := range candidates {
+			ids[i] = c.id
+		}
+		if *jsonOut {
+			return scanEnvelope(output.ScanResult{Added: len(candidates), Skipped: skipped, DryRun: true, Packages: ids, Unreadable: unreadable}, unreadableHard)
+		}
+		if len(candidates) == 0 && skipped == 0 {
+			fPrintln(os.Stdout, "no packages found.")
+			return scanExit(unreadable, unreadableHard)
+		}
+		fprintf(os.Stdout, "scan dry-run: would adopt %d package(s), %d already tracked\n", len(candidates), skipped)
+		for _, c := range candidates {
+			fprintf(os.Stdout, "  + %s  via %s\n", c.id, c.manager)
+		}
+		return scanExit(unreadable, unreadableHard)
+	}
+
+	if len(candidates) > 0 && !*jsonOut && !*yes {
+		if !confirm(fmt.Sprintf("This will adopt %d package(s) into genv.json. Continue? [y/N] ", len(candidates))) {
+			fPrintln(os.Stdout, "Aborted.")
+			return exitOK
+		}
+	}
+
+	// Take the lock before touching the lock file so the appended entries are
+	// based on the latest file rather than the snapshot read above: an apply
+	// that finished in between would otherwise be erased by this write.
+	var added int
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
+	lf, err = genvfile.ReadLock(lockPath)
+	if err != nil {
+		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+		return exitIO
+	}
+	for _, c := range candidates {
+		prefer := ""
+		if adapter.SpecName(c.manager) {
+			prefer = c.manager
+		}
+		if err := commands.Add(f, c.id, "", prefer, nil, targetID); err != nil {
+			// ErrAlreadyTracked can race with trackedInSpec; skip silently.
+			skipped++
+			continue
+		}
+		lp := genvfile.LockedPackage{
+			ID:               c.id,
+			Manager:          c.manager,
+			PkgName:          c.pkgName,
+			InstalledVersion: c.version,
+		}
+		lf.Packages = append(lf.Packages, lp)
+		added++
 	}
 
 	if added > 0 {
@@ -1720,6 +3376,7 @@ func scanCmd(args []string) int {
 			fprintf(os.Stderr, "genv: writing spec: %v\n", err)
 			return exitIO
 		}
+		stampLockTarget(lf, targetID)
 		if err := genvfile.WriteLock(lockPath, lf); err != nil {
 			fprintf(os.Stderr, "genv: writing lock: %v\n", err)
 			return exitIO
@@ -1727,23 +3384,117 @@ func scanCmd(args []string) int {
 	}
 
 	if *jsonOut {
-		return writeJSON(os.Stdout, output.Envelope{
-			Version: output.SchemaVersion,
-			Command: "scan",
-			OK:      true,
-			Data:    output.ScanResult{Added: added, Skipped: skipped},
-		})
+		return scanEnvelope(output.ScanResult{
+			Added:      added,
+			Skipped:    skipped,
+			Unreadable: unreadable,
+		}, unreadableHard)
 	}
 
 	if added == 0 && skipped == 0 {
 		fPrintln(os.Stdout, "no packages found.")
-		return exitOK
+		return scanExit(unreadable, unreadableHard)
 	}
 	if isNew && added > 0 {
 		fprintf(os.Stdout, "created %s\n", *file)
 	}
 	fprintf(os.Stdout, "scan complete: %d added, %d already tracked\n", added, skipped)
-	return exitOK
+	return scanExit(unreadable, unreadableHard)
+}
+
+// isScanListTimeout reports whether err is the per-manager inventory deadline
+// rather than a genuine listing failure.
+func isScanListTimeout(err error) bool {
+	return errors.Is(err, resolver.ErrInventoryTimeout)
+}
+
+// scanExit returns the process exit code for a scan that could not read every
+// manager. hard names the failures that were not a deadline, so a transient
+// stall stays a warning while a parse or command failure is reported.
+func scanExit(unreadable, hard []string) int {
+	if len(hard) == 0 {
+		return exitOK
+	}
+	fprintf(os.Stderr, "genv scan: incomplete inventory: could not read %s\n", strings.Join(hard, ", "))
+	return exitLogic
+}
+
+// scanEnvelope writes the scan JSON payload, marking the envelope not-ok and
+// listing the unreadable managers when a source failed.
+func scanEnvelope(data output.ScanResult, hard []string) int {
+	env := output.Envelope{
+		Version: output.SchemaVersion,
+		Command: "scan",
+		OK:      len(hard) == 0,
+		Data:    data,
+	}
+	for _, name := range hard {
+		env.Errors = append(env.Errors, fmt.Sprintf("%s: inventory could not be read", name))
+	}
+	return writeJSON(os.Stdout, env)
+}
+
+// listScanInventory returns the package names (and optional versions) scan
+// should consider for one manager. Default is user-facing installs when the
+// adapter implements ScanLister; --all/--deps keeps the full ListInstalled
+// / VersionLister inventory.
+func listScanInventory(a adapter.Adapter, includeDeps bool) ([]string, map[string]string, error) {
+	if !includeDeps {
+		if sl, ok := a.(adapter.ScanLister); ok {
+			listed, err := resolver.CallTimed(sl.ListForScan, resolver.DefaultLiveListTimeout)
+			if err != nil {
+				return nil, nil, err
+			}
+			var versions map[string]string
+			if versionLister, ok := a.(adapter.VersionLister); ok {
+				if listedVersions, verr := resolver.CallTimed(versionLister.ListInstalledVersions, resolver.DefaultLiveListTimeout); verr == nil {
+					versions = listedVersions
+				}
+			}
+			return listed, versions, nil
+		}
+	}
+
+	// Cap every manager inventory like apply/status do, so one hung
+	// manager (winget's first-run source sync can stall for minutes)
+	// cannot wedge the whole scan.
+	if versionLister, ok := a.(adapter.VersionLister); ok {
+		if listedVersions, err := resolver.CallTimed(versionLister.ListInstalledVersions, resolver.DefaultLiveListTimeout); err == nil {
+			pkgs := make([]string, 0, len(listedVersions))
+			for pkgName := range listedVersions {
+				pkgs = append(pkgs, pkgName)
+			}
+			sort.Strings(pkgs)
+			return pkgs, listedVersions, nil
+		}
+	}
+	listed, err := resolver.CallTimed(a.ListInstalled, resolver.DefaultLiveListTimeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	return listed, nil, nil
+}
+
+// skipScanPackage drops ids that are not installable packages: uv's
+// `-` entrypoint bullet, npm listing itself, and rustup toolchain lines.
+func skipScanPackage(manager, id string) bool {
+	if id == "-" {
+		return true
+	}
+	if manager == "npm" && id == "npm" {
+		return true
+	}
+	return strings.HasPrefix(id, "toolchain:")
+}
+
+func scanAdaptersOnGOOS(available map[string]bool, goos string) []adapter.Adapter {
+	selected := make([]adapter.Adapter, 0, len(adapter.All))
+	for _, a := range adapter.Registered() {
+		if available[a.Name()] && adapter.AutomaticOnGOOS(a.Name(), goos) {
+			selected = append(selected, a)
+		}
+	}
+	return selected
 }
 
 // statusCmd implements `genv status [--json] [--debug]`.
@@ -1756,26 +3507,50 @@ func statusCmd(args []string) int {
 	fs.Usage = func() {
 		fPrintln(os.Stderr, "usage: genv status [flags]")
 		fPrintln(os.Stderr)
-		fPrintln(os.Stderr, "Show the diff between genv.json, the lock file, and recorded versions.")
-		fPrintln(os.Stderr, "Note: status compares spec vs lock data — it does not query the live system.")
-		fPrintln(os.Stderr, "Run 'genv apply' to reconcile any differences shown.")
+		fPrintln(os.Stderr, "Show the diff between genv.json, the lock file, and the live system.")
+		fPrintln(os.Stderr, "Unlocked packages that are already installed are reported as present.")
+		fPrintln(os.Stderr, "Use --offline to compare spec vs lock only.")
+		fPrintln(os.Stderr, "Use --files to check live file topology and content hashes (drifted).")
+		fPrintln(os.Stderr, "Use --verify to query each tracked package's manager instead of trusting the lock.")
+		fPrintln(os.Stderr, "Run 'genv apply' to reconcile any differences shown. File content drift is reported only; apply does not revert bodies.")
 		fPrintln(os.Stderr)
 		fPrintln(os.Stderr, "flags:")
 		fs.PrintDefaults()
 	}
 
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
 	jsonOut := fs.Bool("json", false, "emit machine-readable JSON to stdout instead of human-readable text")
 	debug := fs.Bool("debug", false, "emit debug-level structured logs to stderr")
+	filesOnly := fs.Bool("files", false, "check files block against the live filesystem (topology plus content hashes)")
+	offline := fs.Bool("offline", false, "compare spec vs lock only (skip live manager probe)")
+	verifyLive := fs.Bool("verify", false, "query each tracked package's manager to prove it is installed")
+	hostFlag := fs.String("host", "", "host name for host-specific records (defaults to host classification)")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 
 	if err := fs.Parse(args); err != nil {
+		return flagParseExit(err)
+	}
+	if *verifyLive && *offline {
+		fPrintln(os.Stderr, "genv status: --verify cannot be used with --offline")
+		return exitUsage
+	}
+	if *verifyLive && *filesOnly {
+		fPrintln(os.Stderr, "genv status: --verify cannot be used with --files")
 		return exitUsage
 	}
 	if *debug {
 		logging.Init(true)
 	}
 
-	f, err := genvfile.Read(*file)
+	lockPath := lockPathForSpec(*file, *lockFile)
+	lf, _ := genvfile.ReadLock(lockPath)
+	activeProfile := ""
+	if lf != nil {
+		activeProfile = lf.ActiveProfile
+	}
+
+	f, err := profile.LoadMerged(*file, activeProfile)
 	if err != nil {
 		if errors.Is(err, genvfile.ErrNotFound) {
 			fprintf(os.Stderr, "genv: %s not found — run 'genv add' to create it\n", *file)
@@ -1787,20 +3562,75 @@ func statusCmd(args []string) int {
 		}
 		return exitIO
 	}
+	hostName := hostForCommand(*hostFlag)
+	f, _, code := materializeSpecForCommand("status", *file, f, *hostFlag, *targetFlag)
+	if code != exitOK {
+		return code
+	}
 
-	lf, err := genvfile.ReadLock(genvfile.LockPathFrom(*file))
-	if err != nil {
-		fprintf(os.Stderr, "genv: reading lock: %v\n", err)
-		return exitIO
+	if *filesOnly {
+		statusCfg := filesConfigWithResolvedSources(f.Files, sourceRootForSpec(*file, f))
+		var hashes map[string]string
+		if lf != nil {
+			hashes = fileContentHashes(lf.Files)
+		}
+		res, err := files.StatusWithHashes(statusCfg, hostName, hashes)
+		if *jsonOut {
+			errs := []string(nil)
+			if err != nil {
+				errs = []string{err.Error()}
+			}
+			return writeJSON(os.Stdout, output.Envelope{
+				Version: output.SchemaVersion,
+				Command: "status",
+				OK:      err == nil && res != nil && res.OK,
+				Data:    output.StatusResult{FileEntries: fileStatusEntries(res)},
+				Errors:  errs,
+			})
+		}
+		if err != nil {
+			fprintf(os.Stderr, "genv status --files: %v\n", err)
+			return exitLogic
+		}
+		if res == nil || res.OK {
+			fPrintln(os.Stdout, "files up to date.")
+			return exitOK
+		}
+		writeFileStatus(os.Stdout, res)
+		return exitLogic
+	}
+
+	if lf == nil {
+		lf, err = genvfile.ReadLock(lockPathForSpec(*file, *lockFile))
+		if err != nil {
+			fprintf(os.Stderr, "genv: reading lock: %v\n", err)
+			return exitIO
+		}
 	}
 
 	entries := commands.Status(f, lf)
+	if *verifyLive {
+		available := resolver.Detect()
+		results := verify.Packages(f.Packages, lf.Packages, verify.Options{Available: available})
+		entries = commands.StatusWithVerify(f, lf, results)
+	} else if !*offline {
+		available := resolver.Detect()
+		live, liveWarns := resolver.LoadLiveSetOnly(available, resolver.ManagersToList(f.Packages, lf.Packages, available))
+		for _, w := range liveWarns {
+			fprintf(os.Stderr, "genv status: warning: %s\n", w)
+		}
+		entries = commands.StatusWithLive(f, lf, live)
+	}
 	envEntries := genvenv.EnvStatus(f.Env, lf.Env)
 	shellEntries := shellcfg.ShellStatus(f.Shell, lf.Shell)
-	serviceEntries := service.ServiceStatus(f.Services, lf.Services)
+	serviceEntries := service.ServiceStatus(f.Services, lf.Services, true, sourceRootForSpec(*file, f))
 
 	if *jsonOut {
 		jsonEntries := make([]output.StatusEntry, 0, len(entries))
+		packagesByID := make(map[string]schema.Package, len(f.Packages))
+		for _, pkg := range f.Packages {
+			packagesByID[pkg.ID] = pkg
+		}
 		var hasDrift bool
 		for _, e := range entries {
 			jsonEntries = append(jsonEntries, output.StatusEntry{
@@ -1809,6 +3639,7 @@ func statusCmd(args []string) int {
 				Kind:             string(e.Kind),
 				SpecVersion:      e.SpecVersion,
 				InstalledVersion: e.InstalledVersion,
+				External:         externalOutputDetails(packagesByID[e.ID], e.InstalledVersion),
 			})
 			if e.Kind == commands.StatusDrift || e.Kind == commands.StatusExtra {
 				hasDrift = true
@@ -1837,8 +3668,12 @@ func statusCmd(args []string) int {
 			Version: output.SchemaVersion,
 			Command: "status",
 			OK:      !hasDrift,
-			Data:    output.StatusResult{Entries: jsonEntries, EnvEntries: jsonEnvEntries, ShellEntries: jsonShellEntries, ServiceEntries: jsonServiceEntries},
+			Data:    output.StatusResult{ActiveProfile: activeProfile, Entries: jsonEntries, EnvEntries: jsonEnvEntries, ShellEntries: jsonShellEntries, ServiceEntries: jsonServiceEntries},
 		})
+	}
+
+	if activeProfile != "" && activeProfile != profile.BaseProfileName {
+		fprintf(os.Stdout, "Active profile: %s\n\n", activeProfile)
 	}
 
 	if len(entries) == 0 && len(envEntries) == 0 && len(shellEntries) == 0 && len(serviceEntries) == 0 {
@@ -1859,6 +3694,9 @@ func statusCmd(args []string) int {
 	var parts []string
 	if n := counts[commands.StatusOK]; n > 0 {
 		parts = append(parts, fmt.Sprintf("%d ok", n))
+	}
+	if n := counts[commands.StatusPresent]; n > 0 {
+		parts = append(parts, fmt.Sprintf("%d present", n))
 	}
 	if n := counts[commands.StatusDrift]; n > 0 {
 		parts = append(parts, fmt.Sprintf("%d drift", n))
@@ -1883,17 +3721,31 @@ func statusCmd(args []string) int {
 		}
 		switch e.Kind {
 		case commands.StatusOK:
-			v := e.InstalledVersion
-			if v == "" {
-				v = "*"
-			}
-			fprintf(tw, "  ok\t%s\t%s\t%s\n", e.ID, mgr, v)
+			fprintf(tw, "  ok	%s	%s	%s\n", e.ID, mgr, e.DisplayVersion())
+		case commands.StatusPresent:
+			note := "(installed, not in lock — apply will adopt)"
+			fprintf(tw, "  present	%s	%s	%s\n", e.ID, mgr, note)
 		case commands.StatusDrift:
-			fprintf(tw, "  drift\t%s\t%s\t(spec: %s, installed: %s)\n",
-				e.ID, mgr, e.SpecVersion, e.InstalledVersion)
+			if e.InstalledVersion == "" {
+				note := "(not installed"
+				if mgr != "—" {
+					note += " via " + mgr
+				}
+				note += ")"
+				fprintf(tw, "  drift\t%s\t%s\t%s\n", e.ID, mgr, note)
+			} else {
+				fprintf(tw, "  drift\t%s\t%s\t(spec: %s, installed: %s)\n",
+					e.ID, mgr, e.SpecVersion, e.InstalledVersion)
+			}
 		case commands.StatusMissing:
 			note := "(in spec, not in lock — run 'genv apply')"
 			fprintf(tw, "  missing\t%s\t%s\t%s\n", e.ID, mgr, note)
+		case commands.StatusUnknown:
+			// The lock has an entry but no recorded version, which is what a
+			// failed install leaves behind. Say so rather than implying the
+			// package is installed (#213).
+			note := "(in lock with no recorded version — apply will re-check)"
+			fprintf(tw, "  unknown\t%s\t%s\t%s %s\n", e.ID, mgr, e.DisplayVersion(), note)
 		case commands.StatusExtra:
 			note := "(in lock, not in spec — run 'genv apply' or 'genv disown')"
 			fprintf(tw, "  extra\t%s\t%s\t%s\n", e.ID, mgr, note)
@@ -1992,15 +3844,15 @@ func statusCmd(args []string) int {
 // applyServices reconciles services, updates lf.Services in memory, and
 // returns lists of applied and removed service names. The caller writes the lock.
 // If verbose is true, it prints progress lines to stdout.
-func applyServices(ctx context.Context, f *schema.GenvFile, lf *genvfile.LockFile, verbose bool) (applied, removed []string, errs []error) {
+func applyServices(ctx context.Context, f *schema.GenvFile, lf *genvfile.LockFile, verbose bool, sourceRoot string) (applied, removed []string, errs []error) {
 	if len(f.Services) == 0 && len(lf.Services) == 0 {
 		return nil, nil, nil
 	}
 
-	applied, removed, errs = service.ApplyServices(ctx, f.Services, lf.Services, verbose)
-
-	// Update lf.Services in memory; caller writes the lock once.
-	lf.Services = service.SpecToLock(f.Services)
+	applied, removed, errs = service.ApplyServices(ctx, f.Services, lf.Services, verbose, sourceRoot)
+	if len(errs) == 0 {
+		lf.Services = service.SpecToLock(f.Services, sourceRoot)
+	}
 
 	return applied, removed, errs
 }
@@ -2017,7 +3869,7 @@ func cleanCmd(args []string) int {
 	}
 	dryRun := fs.Bool("dry-run", false, "print the clean commands without executing")
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
 	availableNames := resolver.Detect()
@@ -2056,6 +3908,12 @@ func cleanCmd(args []string) int {
 
 // buildEditorCmd parses the editor string, validates the executable against a
 // whitelist of safe editors, and returns an exec.Cmd ready to run.
+//
+// The allowlist applies to the binary that actually executes, not to its base
+// name. Checking filepath.Base let EDITOR=/tmp/evil/code pass because the base
+// was "code", then ran /tmp/evil/code — the same for vi, vim, nano and emacs.
+// A path with a directory component is therefore resolved through PATH from
+// its base name, or refused outright.
 func buildEditorCmd(editor, file string) (*exec.Cmd, error) {
 	fields := strings.Fields(editor)
 	if len(fields) == 0 {
@@ -2068,6 +3926,18 @@ func buildEditorCmd(editor, file string) (*exec.Cmd, error) {
 		return nil, fmt.Errorf("editor %q is not allowed; must be one of: vi, vim, nano, emacs, code", bin)
 	}
 
+	// A qualified path is only honored when it resolves to the allowlisted
+	// binary on PATH, so "code" and "/opt/homebrew/bin/code" both work but
+	// "/tmp/evil/code" does not become an execution path for a base-name match.
+	execBin := base
+	if bin != base {
+		resolved, err := exec.LookPath(base)
+		if err != nil {
+			return nil, fmt.Errorf("editor %q is not allowed; must be one of: vi, vim, nano, emacs, code", bin)
+		}
+		execBin = resolved
+	}
+
 	for _, arg := range fields[1:] {
 		if !safeFlags[arg] {
 			return nil, fmt.Errorf("editor flag %q is not allowed; only safe flags are permitted", arg)
@@ -2075,7 +3945,85 @@ func buildEditorCmd(editor, file string) (*exec.Cmd, error) {
 	}
 
 	args := append(fields[1:], file)
-	return exec.Command(bin, args...), nil
+	return exec.Command(execBin, args...), nil
+}
+
+func parseCommandWords(input string) ([]string, error) {
+	var words []string
+	var current strings.Builder
+	inSingle := false
+	inDouble := false
+	escaped := false
+
+	for i := 0; i < len(input); i++ {
+		ch := input[i]
+
+		if escaped {
+			current.WriteByte(ch)
+			escaped = false
+			continue
+		}
+
+		if inSingle {
+			if ch == '\'' {
+				inSingle = false
+			} else {
+				current.WriteByte(ch)
+			}
+			continue
+		}
+
+		if inDouble {
+			switch ch {
+			case '"':
+				inDouble = false
+			case '\\':
+				if i+1 < len(input) && strings.ContainsRune(`"$\`, rune(input[i+1])) {
+					i++
+					current.WriteByte(input[i])
+				} else {
+					current.WriteByte(ch)
+				}
+			default:
+				current.WriteByte(ch)
+			}
+			continue
+		}
+
+		switch ch {
+		case '\\':
+			escaped = true
+		case '\'':
+			inSingle = true
+		case '"':
+			inDouble = true
+		case ' ', '\t', '\n', '\r':
+			if current.Len() > 0 {
+				words = append(words, current.String())
+				current.Reset()
+			}
+		default:
+			current.WriteByte(ch)
+		}
+	}
+
+	if escaped {
+		return nil, errors.New("trailing escape")
+	}
+	if inSingle {
+		return nil, errors.New("unterminated single-quoted string")
+	}
+	if inDouble {
+		return nil, errors.New("unterminated double-quoted string")
+	}
+	if current.Len() > 0 {
+		words = append(words, current.String())
+	}
+	if len(words) == 0 {
+		return nil, errors.New("command must not be empty")
+	}
+
+	return words, nil
 }
 
 // editCmd implements `genv edit`.
@@ -2084,7 +4032,7 @@ func editCmd(args []string) int {
 	fs := flag.NewFlagSet("edit", flag.ContinueOnError)
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
 	editor := os.Getenv("VISUAL")
@@ -2111,40 +4059,174 @@ func editCmd(args []string) int {
 	return exitOK
 }
 
-// completionCmd implements `genv completion <shell>`.
-// Prints the shell completion script for bash, zsh, or fish to stdout.
+// completionCmd implements `genv completion <shell>` and
+// `genv completion install [shell]`.
+//
+// Without the install subcommand it prints the shell completion script for
+// bash, zsh, or fish to stdout. With `install` it writes that script into the
+// shell's standard completion directory so completions work with no manual
+// setup.
 func completionCmd(args []string) int {
+	if len(args) > 0 && args[0] == "install" {
+		return completionInstallCmd(args[1:])
+	}
+
 	fs := flag.NewFlagSet("completion", flag.ContinueOnError)
 	fs.Usage = func() {
 		fPrintln(os.Stderr, "usage: genv completion <shell>")
+		fPrintln(os.Stderr, "       genv completion install [shell] [--dir <path>]")
 		fPrintln(os.Stderr)
-		fPrintln(os.Stderr, "  shell   One of: bash, zsh, fish")
+		fPrintln(os.Stderr, "  shell   One of: bash, zsh, fish, powershell")
 		fPrintln(os.Stderr)
 		fPrintln(os.Stderr, "examples:")
 		fPrintln(os.Stderr, "  genv completion bash >> ~/.bashrc")
 		fPrintln(os.Stderr, "  genv completion zsh  > ~/.zsh/completions/_genv")
 		fPrintln(os.Stderr, "  genv completion fish > ~/.config/fish/completions/genv.fish")
+		fPrintln(os.Stderr, "  genv completion powershell > ~/.config/genv/completions/genv.ps1")
+		fPrintln(os.Stderr, "  genv completion install        # auto-detect the current shell")
+		fPrintln(os.Stderr, "  genv completion install zsh    # install for a specific shell")
 	}
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if fs.NArg() < 1 {
-		fPrintln(os.Stderr, "genv completion: missing shell argument (bash, zsh, or fish)")
+		fPrintln(os.Stderr, "genv completion: missing shell argument (bash, zsh, fish, or powershell)")
 		fs.Usage()
 		return exitUsage
 	}
-	switch fs.Arg(0) {
-	case "bash":
-		fprint(os.Stdout, completionBash)
-	case "zsh":
-		fprint(os.Stdout, completionZsh)
-	case "fish":
-		fprint(os.Stdout, completionFish)
-	default:
-		fprintf(os.Stderr, "genv completion: unknown shell %q — supported shells are: bash, zsh, fish\n", fs.Arg(0))
+	script, _, _, err := completionScriptFor(fs.Arg(0))
+	if err != nil {
+		fprintf(os.Stderr, "genv completion: %v\n", err)
 		return exitUsage
 	}
+	fprint(os.Stdout, script)
 	return exitOK
+}
+
+// completionScriptFor maps a shell name to its embedded completion script, the
+// filename that shell expects the script to be installed as, and the default
+// directory that shell auto-loads completions from. An unknown or empty shell
+// name returns an error.
+func completionScriptFor(shell string) (script, filename, defaultDir string, err error) {
+	switch shell {
+	case "bash":
+		// bash-completion sources files named after the command from this dir.
+		return completionBash, "genv", filepath.Join(xdgDataHome(), "bash-completion", "completions"), nil
+	case "zsh":
+		// site-functions is on the default $fpath in modern zsh; compinit binds
+		// the "#compdef genv" tag in the _genv function file.
+		return completionZsh, "_genv", filepath.Join(xdgDataHome(), "zsh", "site-functions"), nil
+	case "fish":
+		return completionFish, "genv.fish", filepath.Join(xdgConfigHome(), "fish", "completions"), nil
+	case "powershell":
+		// Default under the genv config dir; users dot-source from their profile.
+		dir, derr := genvfile.DefaultDir()
+		if derr != nil {
+			dir = filepath.Join(xdgConfigHome(), "genv")
+		}
+		return completionPowerShell, "genv.ps1", filepath.Join(dir, "completions"), nil
+	case "":
+		return "", "", "", fmt.Errorf("missing shell argument (bash, zsh, fish, or powershell)")
+	default:
+		return "", "", "", fmt.Errorf("unknown shell %q — supported shells are: bash, zsh, fish, powershell", shell)
+	}
+}
+
+// completionInstallCmd implements `genv completion install [shell] [--dir <path>]`.
+// It writes the embedded completion script into the shell's standard completion
+// directory (or --dir), creating parent directories as needed. When no shell is
+// given it is detected from $SHELL.
+func completionInstallCmd(args []string) int {
+	fs := flag.NewFlagSet("completion install", flag.ContinueOnError)
+	dir := fs.String("dir", "", "Target directory (overrides the per-shell default)")
+	fs.Usage = func() {
+		fPrintln(os.Stderr, "usage: genv completion install [shell] [--dir <path>]")
+		fPrintln(os.Stderr)
+		fPrintln(os.Stderr, "  shell   One of: bash, zsh, fish, powershell (default: detected from $SHELL)")
+		fPrintln(os.Stderr, "  --dir   Install into this directory instead of the shell default")
+	}
+	shell, flagArgs := extractPositional(args)
+	if err := fs.Parse(flagArgs); err != nil {
+		return flagParseExit(err)
+	}
+	if shell == "" {
+		shell = detectShell()
+		if shell == "" {
+			fPrintln(os.Stderr, "genv completion install: could not detect shell from $SHELL; pass one of: bash, zsh, fish, powershell")
+			return exitUsage
+		}
+	}
+
+	script, filename, defaultDir, err := completionScriptFor(shell)
+	if err != nil {
+		fprintf(os.Stderr, "genv completion install: %v\n", err)
+		return exitUsage
+	}
+
+	target := *dir
+	if target == "" {
+		target = defaultDir
+	}
+	if err := os.MkdirAll(target, 0o755); err != nil {
+		fprintf(os.Stderr, "genv completion install: %v\n", err)
+		return exitIO
+	}
+	path := filepath.Join(target, filename)
+	if err := os.WriteFile(path, []byte(script), 0o644); err != nil {
+		fprintf(os.Stderr, "genv completion install: %v\n", err)
+		return exitIO
+	}
+
+	fprintf(os.Stdout, "Installed %s completion to %s\n", shell, path)
+	if shell == "zsh" && *dir == "" {
+		fprintf(os.Stdout, "Ensure %s is on your $fpath before compinit runs, then restart your shell.\n", target)
+	}
+	if shell == "powershell" {
+		fprintf(os.Stdout, "Add this line to your PowerShell profile to enable completions:\n")
+		fprintf(os.Stdout, "  . %s\n", path)
+	}
+	return exitOK
+}
+
+// detectShell returns "bash", "zsh", "fish", or "powershell" based on the
+// basename of $SHELL, or "" when it is unset or unrecognized.
+func detectShell() string {
+	switch filepath.Base(os.Getenv("SHELL")) {
+	case "bash":
+		return "bash"
+	case "zsh":
+		return "zsh"
+	case "fish":
+		return "fish"
+	case "pwsh", "powershell":
+		return "powershell"
+	default:
+		return ""
+	}
+}
+
+// xdgDataHome returns $XDG_DATA_HOME or ~/.local/share.
+func xdgDataHome() string {
+	if x := os.Getenv("XDG_DATA_HOME"); x != "" {
+		return x
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".local/share"
+	}
+	return filepath.Join(home, ".local", "share")
+}
+
+// xdgConfigHome returns $XDG_CONFIG_HOME or ~/.config.
+func xdgConfigHome() string {
+	if x := os.Getenv("XDG_CONFIG_HOME"); x != "" {
+		return x
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ".config"
+	}
+	return filepath.Join(home, ".config")
 }
 
 // completeInternalCmd implements the hidden `genv __complete <topic>` command
@@ -2154,6 +4236,7 @@ func completionCmd(args []string) int {
 // Topics:
 //   - packages [--file <path>]  — IDs from genv.json (for remove/disown/upgrade)
 //   - managers                  — available package manager names (for --prefer)
+//   - repo-packages [prefix]    — repository package names (for add/adopt)
 func completeInternalCmd(args []string) int {
 	if len(args) == 0 {
 		return exitUsage
@@ -2168,15 +4251,31 @@ func completeInternalCmd(args []string) int {
 		if err != nil {
 			return exitOK // silent: no spec yet is not an error during completion
 		}
-		for _, p := range f.Packages {
+		effective, _, err := resolveEffectiveSpec(f, hostForCommand(""), "")
+		if err != nil {
+			return exitOK
+		}
+		for _, p := range effective.Packages {
 			fPrintln(os.Stdout, p.ID)
 		}
 	case "managers":
+		if spec, err := genvfile.Read(defaultSpecPath()); err == nil {
+			useSpecAdapters(spec)
+		}
 		available := resolver.Detect()
-		for _, a := range adapter.All {
+		for _, a := range adapter.Registered() {
 			if available[a.Name()] {
 				fPrintln(os.Stdout, a.Name())
 			}
+		}
+	case "repo-packages":
+		prefix := ""
+		if len(args) > 1 {
+			prefix = args[1]
+		}
+		available := resolver.Detect()
+		for _, name := range complete.RepoPackages(prefix, available) {
+			fPrintln(os.Stdout, name)
 		}
 	default:
 		return exitUsage
@@ -2185,18 +4284,21 @@ func completeInternalCmd(args []string) int {
 }
 
 // validateCmd implements `genv validate`.
-// Reads and validates genv.json, exiting 0 on success and 3 on any error.
+// Reads and validates genv.json, then fails if any genv-managed launchd/systemd
+// agent points at a missing or non-executable ProgramArguments[0]/ExecStart.
 func validateCmd(args []string) int {
 	fs := flag.NewFlagSet("validate", flag.ContinueOnError)
 	fs.Usage = func() {
 		fPrintln(os.Stderr, "usage: genv validate [flags]")
+		fPrintln(os.Stderr)
+		fPrintln(os.Stderr, "Validates genv.json and checks genv-managed supervisor agents for dangling executables.")
 		fPrintln(os.Stderr)
 		fPrintln(os.Stderr, "flags:")
 		fs.PrintDefaults()
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
 	_, err := genvfile.Read(*file)
@@ -2209,92 +4311,721 @@ func validateCmd(args []string) int {
 		return exitValidation
 	}
 	fprintf(os.Stdout, "%s is valid.\n", *file)
+	if home, homeErr := managedAgentHomeDir(); homeErr == nil {
+		if issues := service.ListManagedAgentProgramIssues(home); len(issues) > 0 {
+			for _, issue := range issues {
+				fprintf(os.Stderr, "genv validate: %s\n", issue.Detail)
+			}
+			fPrintln(os.Stderr, "Hint: re-run genv updates start (and re-apply services) so supervisor artifacts point at a live executable")
+			return exitValidation
+		}
+	}
 	return exitOK
 }
 
-// upgradeCmd implements `genv upgrade [--dry-run] [--yes] [--debug]`.
-// Upgrades all packages tracked in the lock file using their recorded manager.
+// upgradeCmd implements `genv upgrade [--dry-run] [--yes] [--no-hooks] [--debug] [--all] [id ...]`.
+// By default plans only packages with a detected update; pass --all to plan every
+// unconstrained tracked package without outdated filtering.
 func upgradeCmd(args []string) int {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	fs.Usage = func() {
-		fPrintln(os.Stderr, "usage: genv upgrade [flags]")
+		fPrintln(os.Stderr, "usage: genv upgrade [flags] [id ...]")
+		fPrintln(os.Stderr)
+		fPrintln(os.Stderr, "Leftover package IDs are treated as --only.")
 		fPrintln(os.Stderr)
 		fPrintln(os.Stderr, "flags:")
 		fs.PrintDefaults()
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	lockFile := fs.String("lock-file", "", "path to genv lock file")
 	dryRun := fs.Bool("dry-run", false, "print the upgrade commands without executing")
-	yes := fs.Bool("yes", false, "skip the confirmation prompt")
+	yes := fs.Bool("yes", false, "skip the confirmation prompt (required to execute with --json)")
+	noHooks := fs.Bool("no-hooks", false, "skip pre-upgrade and post-upgrade hooks")
+	jsonOut := fs.Bool("json", false, "emit machine-readable JSON to stdout instead of human-readable text (wet-run requires --yes)")
 	debug := fs.Bool("debug", false, "emit debug-level structured logs to stderr")
+	hostFlag := fs.String("host", "", "host name for host-specific records (defaults to host classification)")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
+	onlyFlag := fs.String("only", "", "comma-separated list of package IDs or names to upgrade (positional IDs are also --only)")
+	skipFlag := fs.String("skip", "", "comma-separated list of package IDs or names to skip")
+	onlyManagerFlag := fs.String("only-manager", "", "comma-separated list of managers to upgrade")
+	skipManagerFlag := fs.String("skip-manager", "", "comma-separated list of managers to skip")
+	all := fs.Bool("all", false, "upgrade every unconstrained tracked package (skip outdated detection)")
+	hookTimeoutFlag := fs.String("hook-timeout", "", "per-hook deadline, e.g. 5m or 30s (default: no hook timeout)")
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if *debug {
 		logging.Init(true)
 	}
+	hookTimeout, err := parseOptionalDuration(*hookTimeoutFlag)
+	if err != nil {
+		fprintf(os.Stderr, "genv upgrade: invalid --hook-timeout %q: %v\n", *hookTimeoutFlag, err)
+		return exitUsage
+	}
 
-	lockPath := genvfile.LockPathFrom(*file)
+	hostName := hostForCommand(*hostFlag)
+	lockPath := lockPathForSpec(*file, *lockFile)
+	lfPreview, _ := genvfile.ReadLock(lockPath)
+	profileName := ""
+	if lfPreview != nil {
+		profileName = lfPreview.ActiveProfile
+	}
+	f, err := profile.LoadMerged(*file, profileName)
+	if err != nil {
+		if errors.Is(err, genvfile.ErrNotFound) {
+			if *jsonOut {
+				return writeJSON(os.Stdout, output.Envelope{
+					Version: output.SchemaVersion,
+					Command: "upgrade",
+					OK:      false,
+					Errors:  []string{err.Error()},
+				})
+			}
+			fprintf(os.Stderr, "genv upgrade: %s not found — run 'genv init' to create one\n", *file)
+			return exitIO
+		}
+		if *jsonOut {
+			code := exitIO
+			if errors.Is(err, genvfile.ErrInvalidFile) {
+				code = exitValidation
+			}
+			_ = writeJSON(os.Stdout, output.Envelope{
+				Version: output.SchemaVersion,
+				Command: "upgrade",
+				OK:      false,
+				Errors:  []string{err.Error()},
+			})
+			return code
+		}
+		fprintf(os.Stderr, "genv upgrade: %v\n", err)
+		if errors.Is(err, genvfile.ErrInvalidFile) {
+			return exitValidation
+		}
+		return exitIO
+	}
+	f, activeTarget, code := materializeSpecForCommand("upgrade", *file, f, *hostFlag, *targetFlag)
+	if code != exitOK {
+		return code
+	}
+
+	unlock, err := genvfile.LockMutation(lockPath)
+	if err != nil {
+		if *jsonOut {
+			_ = writeJSON(os.Stdout, output.Envelope{
+				Version: output.SchemaVersion,
+				Command: "upgrade",
+				OK:      false,
+				Errors:  []string{err.Error()},
+			})
+			return exitIO
+		}
+		fprintf(os.Stderr, "genv upgrade: locking %s: %v\n", lockPath, err)
+		return exitIO
+	}
+	defer unlock()
+
 	lf, err := genvfile.ReadLock(lockPath)
 	if err != nil {
+		if *jsonOut {
+			_ = writeJSON(os.Stdout, output.Envelope{
+				Version: output.SchemaVersion,
+				Command: "upgrade",
+				OK:      false,
+				Errors:  []string{err.Error()},
+			})
+			return exitIO
+		}
 		fprintf(os.Stderr, "genv upgrade: reading lock: %v\n", err)
 		return exitIO
 	}
-	if len(lf.Packages) == 0 {
-		fPrintln(os.Stdout, "no packages tracked — run 'genv add' or 'genv scan' first.")
-		return exitOK
+	if schema.IsPortableVersion(f.SchemaVersion) {
+		available := resolver.Detect()
+		_, code := applyLockGate("upgrade", lockPath, lf, activeTarget, available, true, false, *dryRun, "")
+		if code != exitOK {
+			if *jsonOut {
+				_ = writeJSON(os.Stdout, output.Envelope{
+					Version: output.SchemaVersion,
+					Command: "upgrade",
+					OK:      false,
+					Errors:  []string{"foreign lock refused"},
+				})
+			}
+			return code
+		}
+	}
+	only := parseCommaList(*onlyFlag)
+	only = append(only, fs.Args()...)
+	skip := parseCommaList(*skipFlag)
+	onlyManager := parseCommaList(*onlyManagerFlag)
+	skipManager := parseCommaList(*skipManagerFlag)
+
+	for _, m := range onlyManager {
+		if !schema.KnownManagers[m] {
+			fprintf(os.Stderr, "genv upgrade: unknown manager %q in --only-manager\n", m)
+			return exitUsage
+		}
+	}
+	for _, m := range skipManager {
+		if !schema.KnownManagers[m] {
+			fprintf(os.Stderr, "genv upgrade: unknown manager %q in --skip-manager\n", m)
+			return exitUsage
+		}
 	}
 
-	plan, skipped := resolver.PlanUpgrade(lf.Packages)
+	filters := output.UpgradeFilters{
+		Only:         only,
+		Skip:         skip,
+		OnlyManager:  onlyManager,
+		SkipManager:  skipManager,
+		HooksSkipped: *noHooks,
+		All:          *all,
+	}
+
+	planResult, err := upgrade.BuildUpgradePlan(upgrade.UpgradeOptions{
+		Spec:    f,
+		Lock:    lf,
+		Filters: filters,
+		Stdin:   os.Stdin,
+	})
+	if err != nil {
+		fprintf(os.Stderr, "genv upgrade: %v\n", err)
+		return exitUsage
+	}
+	plan := planResult.Actions
+	skipped := planResult.Skipped
+	runnerEnv := upgradeRunnerEnv(activeTarget)
+	extraPlan := planExtraUpgrade(runnerEnv)
+	extraJSON := extraUpgradeJSON{
+		steps: jsonUpgradeSteps(extraPlan),
+		apply: extraApplyForJSON(runnerEnv),
+	}
+
+	for _, w := range planResult.Warnings {
+		if !*jsonOut {
+			fprintf(os.Stderr, "genv upgrade: %s\n", w)
+		}
+	}
+
+	if *jsonOut {
+		return upgradeJSON(*dryRun, *yes, hostName, *file, lockPath, hookTimeout, f, lf, plan, skipped, planResult.Refresh, filters, extraJSON)
+	}
+
 	for _, s := range skipped {
-		fprintf(os.Stderr, "genv upgrade: adapter %q not registered for %s — skipping\n", s.Manager, s.ID)
+		if s.Reason != "" {
+			fprintf(os.Stderr, "genv upgrade: %s for %s — skipping\n", s.Reason, s.ID)
+		} else {
+			fprintf(os.Stderr, "genv upgrade: adapter %q not registered for %s — skipping\n", s.Manager, s.ID)
+		}
 	}
 
-	if len(plan) == 0 {
+	hasExtra := extraUpgradeHasCommands(extraPlan)
+	if len(plan) > 0 || len(planResult.Refresh) > 0 || hasExtra || len(extraPlan) > 0 {
+		fPrintln(os.Stdout, "upgrade plan:")
+		printRefreshLines(os.Stdout, planResult.Refresh)
+		for _, a := range plan {
+			ids := make([]string, len(a.LPs))
+			for i, lp := range a.LPs {
+				ids[i] = lp.ID
+			}
+			detail := strings.Join(a.Cmd, " ")
+			if a.External != nil {
+				detail = "managed external release"
+				if a.RemoteVersion != "" {
+					detail += " " + a.RemoteVersion
+				}
+			}
+			fprintf(os.Stdout, "  %s  via %s  ==> %s\n", strings.Join(ids, ", "), a.LPs[0].Manager, detail)
+		}
+		printExtraUpgradePlan(os.Stdout, extraPlan)
+	}
+
+	if len(plan) == 0 && !hasExtra {
+		if !*dryRun && !*noHooks {
+			ctx := context.Background()
+			hookOpts := upgradeHookOptions{Host: hostName, Profile: lf.ActiveProfile, SpecFile: *file, LockFile: lockPath, Yes: *yes, Timeout: hookTimeout, Plan: plan, Skipped: skipped}
+			hookOpts.Phase = "pre"
+			failedHooks := runUpgradeHooks(ctx, f, hookOpts)
+			hookOpts.Phase = "post"
+			failedHooks = append(failedHooks, runUpgradeHooks(ctx, f, hookOpts)...)
+			if len(failedHooks) > 0 {
+				for _, e := range failedHooks {
+					fprintf(os.Stderr, "genv upgrade: %s\n", e)
+				}
+				return exitLogic
+			}
+		}
 		fPrintln(os.Stdout, "no upgradeable packages found.")
 		return exitOK
-	}
-
-	fPrintln(os.Stdout, "upgrade plan:")
-	for _, a := range plan {
-		fprintf(os.Stdout, "  %s  via %s  ==> %s\n", a.LP.ID, a.LP.Manager, strings.Join(a.Cmd, " "))
 	}
 
 	if *dryRun {
 		return exitOK
 	}
 
-	if !*yes && !confirm(fmt.Sprintf("\nUpgrade %d package(s)? [y/N] ", len(plan))) {
-		fPrintln(os.Stdout, "Aborted.")
-		return exitOK
+	if !*yes {
+		prompt := upgradeConfirmPrompt(len(plan), hasExtra)
+		if !confirm(prompt) {
+			fPrintln(os.Stdout, "Aborted.")
+			return exitOK
+		}
 	}
 
-	execResult := resolver.ExecuteUpgrade(context.Background(), plan, os.Stdin, os.Stdout, os.Stderr)
+	ctx := context.Background()
+	if !*noHooks {
+		preHookOpts := upgradeHookOptions{Phase: "pre", Host: hostName, Profile: lf.ActiveProfile, SpecFile: *file, LockFile: lockPath, Yes: *yes, Timeout: hookTimeout, Plan: plan, Skipped: skipped}
+		failedHooks := runUpgradeHooks(ctx, f, preHookOpts)
+		if len(failedHooks) > 0 {
+			for _, e := range failedHooks {
+				fprintf(os.Stderr, "genv upgrade: %s\n", e)
+			}
+			return exitLogic
+		}
+	}
+
+	var runResult upgrade.UpgradeRunResult
+	if len(plan) > 0 {
+		mode := externalpkg.ExecutionInteractive
+		if *yes {
+			mode = externalpkg.ExecutionAssumeYes
+		}
+		runResult = upgrade.RunUpgrade(ctx, upgrade.UpgradeRunOptions{
+			Plan:                upgrade.UpgradePlan{Actions: plan, Skipped: skipped, Warnings: planResult.Warnings},
+			Lock:                lf,
+			LockPath:            lockPath,
+			Stdin:               os.Stdin,
+			Stdout:              os.Stdout,
+			Stderr:              os.Stderr,
+			ExternalMode:        mode,
+			AcknowledgeExternal: func(message string) bool { return confirm(message + " [y/N] ") },
+			SourceRoot:          sourceRootForSpec(*file, f),
+		})
+	}
 
 	exitCode := exitOK
-	if len(execResult.Errors) > 0 {
-		for _, err := range execResult.Errors {
+	if len(runResult.Errors) > 0 {
+		for _, err := range runResult.Errors {
 			fprintf(os.Stderr, "genv upgrade: %v\n", err)
 		}
 		exitCode = exitLogic
 	}
 
-	// Build an ID→index map so each version update is O(1), not O(n).
-	lockIndex := make(map[string]int, len(lf.Packages))
-	for i, lp := range lf.Packages {
-		lockIndex[lp.ID] = i
+	extraResult := applyExtraUpgrade(ctx, runnerEnv, os.Stdin, os.Stdout, os.Stderr)
+	for _, err := range extraStepErrors(extraResult) {
+		fprintf(os.Stderr, "genv upgrade: %v\n", err)
+		exitCode = exitLogic
 	}
-	for _, upgraded := range execResult.Upgraded {
-		if idx, ok := lockIndex[upgraded.ID]; ok {
-			lf.Packages[idx].InstalledVersion = upgraded.InstalledVersion
+
+	if !*noHooks {
+		postHookErrs := runUpgradeHooks(ctx, f, upgradeHookOptions{
+			Phase:    "post",
+			Host:     hostName,
+			Profile:  lf.ActiveProfile,
+			SpecFile: *file,
+			LockFile: lockPath,
+			Yes:      *yes,
+			Timeout:  hookTimeout,
+			Plan:     plan,
+			Skipped:  skipped,
+			Upgraded: runResult.Upgraded,
+			Failed:   upgradeFailedIDs(plan, runResult.Errors),
+		})
+		if len(postHookErrs) > 0 {
+			for _, e := range postHookErrs {
+				fprintf(os.Stderr, "genv upgrade: %s\n", e)
+			}
+			exitCode = exitLogic
 		}
 	}
 
-	if err := genvfile.WriteLock(lockPath, lf); err != nil {
-		fprintf(os.Stderr, "genv upgrade: writing lock: %v\n", err)
+	if runResult.LockWriteError != nil {
+		fprintf(os.Stderr, "genv upgrade: %v\n", runResult.LockWriteError)
 		return exitIO
 	}
+	if exitCode == exitOK {
+		adviseUpdatesReregister(os.Stdout, runResult.Upgraded)
+	}
 	return exitCode
+}
+
+func upgradeConfirmPrompt(planBatches int, hasExtra bool) string {
+	switch {
+	case planBatches > 0 && hasExtra:
+		return fmt.Sprintf("\nUpgrade %d package(s) and apply OS/firmware updates? [y/N] ", planBatches)
+	case hasExtra:
+		return "\nApply OS/firmware updates? [y/N] "
+	default:
+		return fmt.Sprintf("\nUpgrade %d package(s)? [y/N] ", planBatches)
+	}
+}
+
+// upgradeBatchFromAction builds a machine-readable batch descriptor from a
+// resolved upgrade action, with the given lifecycle status.
+func printRefreshLines(w io.Writer, refresh []resolver.RefreshAction) {
+	for _, r := range refresh {
+		fprintf(w, "  %s  ==> %s\n", r.Manager, strings.Join(r.Cmd, " "))
+	}
+}
+
+func refreshBatches(refresh []resolver.RefreshAction) []output.UpgradeBatch {
+	if len(refresh) == 0 {
+		return nil
+	}
+	out := make([]output.UpgradeBatch, len(refresh))
+	for i, r := range refresh {
+		out[i] = output.UpgradeBatch{
+			Manager: r.Manager,
+			Cmd:     strings.Join(r.Cmd, " "),
+			Status:  "refreshed",
+		}
+	}
+	return out
+}
+
+func upgradeBatchFromAction(a resolver.UpgradeAction, status string) output.UpgradeBatch {
+	ids := make([]string, len(a.LPs))
+	pkgNames := make([]string, len(a.LPs))
+	for i, lp := range a.LPs {
+		ids[i] = lp.ID
+		pkgNames[i] = lp.PkgName
+	}
+	manager := ""
+	if len(a.LPs) > 0 {
+		manager = a.LPs[0].Manager
+	}
+	batch := output.UpgradeBatch{
+		Manager:  manager,
+		IDs:      ids,
+		PkgNames: pkgNames,
+		Cmd:      strings.Join(a.Cmd, " "),
+		Status:   status,
+	}
+	if a.External != nil {
+		batch.External = externalOutputDetails(*a.External, a.RemoteVersion)
+	}
+	return batch
+}
+
+func externalOutputDetails(pkg schema.Package, releaseVersion string) *output.ExternalDetails {
+	if pkg.External == nil {
+		return nil
+	}
+	details := &output.ExternalDetails{
+		SourceType: pkg.External.Source.Type, Repository: pkg.External.Source.Repository, Version: releaseVersion,
+		AllowBackgroundExecution: pkg.External.AllowBackgroundExecution,
+	}
+	for _, verification := range pkg.External.Verify {
+		details.Verification = append(details.Verification, verification.Type)
+	}
+	if platform, err := externalpkg.SelectPlatform(pkg.External.Platforms, externalpkg.CurrentHost()); err == nil {
+		details.InstallType = platform.Install.Type
+		details.Scope = platform.Install.Scope
+		if details.Scope == "" {
+			details.Scope = "user"
+		}
+	}
+	return details
+}
+
+// upgradeSkippedEntries converts resolver skip records into JSON payload entries.
+func upgradeSkippedEntries(skipped []resolver.SkippedPackage) []output.UpgradeSkipped {
+	if len(skipped) == 0 {
+		return nil
+	}
+	out := make([]output.UpgradeSkipped, len(skipped))
+	for i, s := range skipped {
+		out[i] = output.UpgradeSkipped{
+			ID:      s.ID,
+			Manager: s.Manager,
+			Reason:  s.Reason,
+		}
+	}
+	return out
+}
+
+// upgradeJSON emits a single JSON envelope for `genv upgrade --json`. In dry-run
+// it plans only — no hooks, subprocesses, or lock write. Wet-run with work
+// requires --yes (JSON cannot prompt); without it the envelope stays planned
+// and exits nonzero. With --yes it routes all subprocess and hook output to
+// stderr so stdout stays one JSON object, then reports executed batches,
+// refreshed versions, and failed hooks while preserving the human path's exit
+// codes.
+func upgradeJSON(dryRun, yes bool, hostName, specFile, lockPath string, hookTimeout time.Duration, f *schema.GenvFile, lf *genvfile.LockFile, plan []resolver.UpgradeAction, skipped []resolver.SkippedPackage, refresh []resolver.RefreshAction, filters output.UpgradeFilters, extras extraUpgradeJSON) int {
+	skippedEntries := upgradeSkippedEntries(skipped)
+
+	if dryRun {
+		batches := make([]output.UpgradeBatch, 0, len(plan))
+		for _, a := range plan {
+			batches = append(batches, upgradeBatchFromAction(a, "planned"))
+		}
+		return writeJSON(os.Stdout, output.Envelope{
+			Version: output.SchemaVersion,
+			Command: "upgrade",
+			OK:      true,
+			Data: output.UpgradeResult{
+				DryRun:  true,
+				Refresh: refreshBatches(refresh),
+				Batches: batches,
+				Steps:   extras.steps,
+				Skipped: skippedEntries,
+				Filters: filters,
+			},
+		})
+	}
+
+	if !yes && (len(plan) > 0 || extraJSONHasCommands(extras.steps)) {
+		batches := make([]output.UpgradeBatch, 0, len(plan))
+		for _, a := range plan {
+			batches = append(batches, upgradeBatchFromAction(a, "planned"))
+		}
+		return writeJSON(os.Stdout, output.Envelope{
+			Version: output.SchemaVersion,
+			Command: "upgrade",
+			OK:      false,
+			Data: output.UpgradeResult{
+				DryRun:  false,
+				Refresh: refreshBatches(refresh),
+				Batches: batches,
+				Steps:   extras.steps,
+				Skipped: skippedEntries,
+				Filters: filters,
+			},
+			Errors: []string{"wet-run requires --yes (pass --dry-run to plan only)"},
+		})
+	}
+
+	if len(plan) == 0 && !extraJSONHasCommands(extras.steps) {
+		ctx := context.Background()
+		var failedHooks []output.UpgradeHookResult
+		if !filters.HooksSkipped {
+			hookOpts := upgradeHookOptions{Host: hostName, Profile: lf.ActiveProfile, SpecFile: specFile, LockFile: lockPath, Yes: yes, Timeout: hookTimeout, Plan: plan, Skipped: skipped}
+			hookOpts.Phase = "pre"
+			failedHooks = runUpgradeHooksJSON(ctx, f, hookOpts)
+			hookOpts.Phase = "post"
+			failedHooks = append(failedHooks, runUpgradeHooksJSON(ctx, f, hookOpts)...)
+		}
+		return writeJSON(os.Stdout, output.Envelope{
+			Version: output.SchemaVersion,
+			Command: "upgrade",
+			OK:      len(failedHooks) == 0,
+			Data: output.UpgradeResult{
+				DryRun:      false,
+				Refresh:     refreshBatches(refresh),
+				Batches:     []output.UpgradeBatch{},
+				Steps:       extras.steps,
+				Skipped:     skippedEntries,
+				FailedHooks: failedHooks,
+				Filters:     filters,
+			},
+			Errors: upgradeHookErrorStrings(failedHooks),
+		})
+	}
+
+	ctx := context.Background()
+	var errs []string
+	var preHooks []output.UpgradeHookResult
+	if !filters.HooksSkipped {
+		preHooks = runUpgradeHooksJSON(ctx, f, upgradeHookOptions{Phase: "pre", Host: hostName, Profile: lf.ActiveProfile, SpecFile: specFile, LockFile: lockPath, Yes: yes, Timeout: hookTimeout, Plan: plan, Skipped: skipped})
+	}
+	if len(preHooks) > 0 {
+		errs = append(errs, upgradeHookErrorStrings(preHooks)...)
+		return writeJSON(os.Stdout, output.Envelope{
+			Version: output.SchemaVersion,
+			Command: "upgrade",
+			OK:      false,
+			Data: output.UpgradeResult{
+				DryRun:      false,
+				Refresh:     refreshBatches(refresh),
+				Batches:     []output.UpgradeBatch{},
+				Steps:       extras.steps,
+				Skipped:     skippedEntries,
+				FailedHooks: preHooks,
+				Filters:     filters,
+			},
+			Errors: errs,
+		})
+	}
+
+	var runResult upgrade.UpgradeRunResult
+	if len(plan) > 0 {
+		// Route subprocess stdout+stderr to stderr so stdout stays one JSON object.
+		runResult = upgrade.RunUpgrade(ctx, upgrade.UpgradeRunOptions{
+			Plan:         upgrade.UpgradePlan{Actions: plan, Skipped: skipped},
+			Lock:         lf,
+			LockPath:     lockPath,
+			Stdin:        os.Stdin,
+			Stdout:       os.Stderr,
+			Stderr:       os.Stderr,
+			ExternalMode: externalpkg.ExecutionAssumeYes,
+			SourceRoot:   sourceRootForSpec(specFile, f),
+		})
+	}
+	batches := make([]output.UpgradeBatch, 0, len(plan))
+	for _, a := range plan {
+		status := "ok"
+		if actionErr := upgradeActionError(a, runResult.Errors); actionErr != "" {
+			status = "failed"
+			batch := upgradeBatchFromAction(a, status)
+			batch.Error = actionErr
+			batches = append(batches, batch)
+			continue
+		}
+		batches = append(batches, upgradeBatchFromAction(a, status))
+	}
+	if len(runResult.Errors) > 0 {
+		errs = append(errs, errStrings(runResult.Errors)...)
+	}
+
+	appliedSteps := extras.steps
+	if extras.apply != nil && extraJSONHasCommands(extras.steps) {
+		appliedSteps = extras.apply(ctx)
+		errs = append(errs, extraJSONErrorStrings(appliedSteps)...)
+	}
+
+	var postHooks []output.UpgradeHookResult
+	if !filters.HooksSkipped {
+		postHooks = runUpgradeHooksJSON(ctx, f, upgradeHookOptions{
+			Phase:    "post",
+			Host:     hostName,
+			Profile:  lf.ActiveProfile,
+			SpecFile: specFile,
+			LockFile: lockPath,
+			Yes:      yes,
+			Timeout:  hookTimeout,
+			Plan:     plan,
+			Skipped:  skipped,
+			Upgraded: runResult.Upgraded,
+			Failed:   upgradeFailedIDs(plan, runResult.Errors),
+		})
+	}
+	errs = append(errs, upgradeHookErrorStrings(postHooks)...)
+	if runResult.LockWriteError != nil {
+		errs = append(errs, runResult.LockWriteError.Error())
+	}
+
+	updated := make([]output.UpgradePackage, 0, len(runResult.Upgraded))
+	for _, u := range runResult.Upgraded {
+		updated = append(updated, output.UpgradePackage{
+			ID:         u.ID,
+			Manager:    u.Manager,
+			NewVersion: u.InstalledVersion,
+		})
+	}
+
+	if len(errs) == 0 {
+		adviseUpdatesReregister(os.Stderr, runResult.Upgraded)
+	}
+
+	return writeJSON(os.Stdout, output.Envelope{
+		Version: output.SchemaVersion,
+		Command: "upgrade",
+		OK:      len(errs) == 0,
+		Data: output.UpgradeResult{
+			DryRun:      false,
+			Refresh:     refreshBatches(refresh),
+			Batches:     batches,
+			Steps:       appliedSteps,
+			Updated:     updated,
+			Skipped:     skippedEntries,
+			FailedHooks: postHooks,
+			Filters:     filters,
+		},
+		Errors: errs,
+	})
+}
+
+// runUpgradeHooksJSON runs upgrade hooks for one phase with all hook output
+// routed to stderr, returning a structured result per failed phase so the
+// caller can embed it in the JSON payload.
+func runUpgradeHooksJSON(ctx context.Context, f *schema.GenvFile, opts upgradeHookOptions) []output.UpgradeHookResult {
+	if f == nil || f.Hooks == nil {
+		return nil
+	}
+	exec := hooks.NewExecutor(os.Stderr, os.Stderr)
+	exec.SourceRoot = filepath.Dir(absHookPath(opts.SpecFile))
+	runOpts := hooks.RunOptions{
+		Host:    opts.Host,
+		Env:     upgradeHookEnv(opts),
+		Timeout: opts.Timeout,
+		Stdin:   os.Stdin,
+	}
+	var err error
+	switch opts.Phase {
+	case "pre":
+		if len(f.Hooks.PreUpgrade) > 0 {
+			err = exec.PreUpgradeWithOptions(ctx, f.Hooks.PreUpgrade, runOpts)
+		}
+	case "post":
+		if len(f.Hooks.PostUpgrade) > 0 {
+			err = exec.PostUpgradeWithOptions(ctx, f.Hooks.PostUpgrade, runOpts)
+		}
+	}
+	if err != nil {
+		return []output.UpgradeHookResult{{Phase: opts.Phase, Error: err.Error()}}
+	}
+	return nil
+}
+
+// upgradeHookErrorStrings flattens hook results to the envelope-level errors slice.
+func upgradeHookErrorStrings(results []output.UpgradeHookResult) []string {
+	if len(results) == 0 {
+		return nil
+	}
+	out := make([]string, len(results))
+	for i, r := range results {
+		out[i] = r.Error
+	}
+	return out
+}
+
+// upgradeActionError returns the first execution error naming this action.
+func upgradeActionError(a resolver.UpgradeAction, errs []error) string {
+	needle := upgradeActionIDKey(a)
+	for _, e := range errs {
+		if strings.Contains(e.Error(), needle) {
+			return e.Error()
+		}
+	}
+	return ""
+}
+
+// upgradeActionIDKey reproduces the %q-formatted id slice ExecuteUpgrade uses in
+// its wrapped errors, so a batch can be correlated to its failure.
+func upgradeActionIDKey(a resolver.UpgradeAction) string {
+	ids := make([]string, len(a.LPs))
+	for i, lp := range a.LPs {
+		ids[i] = lp.ID
+	}
+	return fmt.Sprintf("%q", ids)
+}
+
+func parseCommaList(s string) []string {
+	if s == "" {
+		return nil
+	}
+	parts := strings.Split(s, ",")
+	var out []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func parseOptionalDuration(raw string) (time.Duration, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, err
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("duration must be non-negative")
+	}
+	return d, nil
 }
 
 // initCmd implements `genv init`.
@@ -2309,7 +5040,7 @@ func initCmd(args []string) int {
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
 	// Refuse to overwrite an existing valid spec.
@@ -2324,6 +5055,11 @@ func initCmd(args []string) int {
 	fPrintln(os.Stdout)
 
 	f := genvfile.New()
+	targetID, err := target.Resolve("")
+	if err != nil {
+		fprintf(os.Stderr, "genv init: %v\n", err)
+		return exitUsage
+	}
 	reader := bufio.NewReader(os.Stdin)
 	for {
 		fprint(os.Stdout, "  package id (or Enter to finish): ")
@@ -2332,7 +5068,7 @@ func initCmd(args []string) int {
 		if id == "" {
 			break
 		}
-		if err := commands.Add(f, id, "", "", nil); err != nil {
+		if err := commands.Add(f, id, "", "", nil, targetID); err != nil {
 			if errors.Is(err, commands.ErrAlreadyTracked) {
 				fprintf(os.Stdout, "  (skipping %q — already added)\n", id)
 				continue
@@ -2343,16 +5079,19 @@ func initCmd(args []string) int {
 		fprintf(os.Stdout, "  added %s\n", id)
 	}
 
-	if len(f.Packages) == 0 {
+	n := 0
+	if b := f.Targets[targetID]; b != nil {
+		n = len(b.Packages)
+	}
+	if n == 0 {
 		fPrintln(os.Stdout, "\nNo packages entered. Run 'genv add <id>' to add packages later.")
-		// Still write an empty spec so the file exists.
 	}
 
 	if err := genvfile.Write(*file, f); err != nil {
 		fprintf(os.Stderr, "genv init: %v\n", err)
 		return exitIO
 	}
-	fprintf(os.Stdout, "\ncreated %s with %d package(s).\n", *file, len(f.Packages))
+	fprintf(os.Stdout, "\ncreated %s with %d package(s).\n", *file, n)
 	if len(f.Packages) > 0 {
 		fPrintln(os.Stdout, "Run 'genv apply' to install them.")
 	}
@@ -2369,7 +5108,7 @@ func extractPositional(args []string) (positional string, flagArgs []string) {
 		if strings.HasPrefix(arg, "-") {
 			flagArgs = append(flagArgs, arg)
 			// "--flag=value" carries its value inline; no extra arg to consume.
-			if !strings.Contains(arg, "=") && i+1 < len(args) {
+			if !strings.Contains(arg, "=") && !positionalBoolFlag(arg) && i+1 < len(args) {
 				i++
 				flagArgs = append(flagArgs, args[i])
 			}
@@ -2381,6 +5120,16 @@ func extractPositional(args []string) (positional string, flagArgs []string) {
 	return
 }
 
+func positionalBoolFlag(arg string) bool {
+	name := strings.TrimLeft(arg, "-")
+	switch name {
+	case "no-search", "no-hooks", "dry-run", "force", "strict", "yes", "quiet", "json", "debug", "files", "sensitive":
+		return true
+	default:
+		return false
+	}
+}
+
 // parseManagerFlag parses a comma-separated "mgr:name" list into a map.
 // An empty input returns nil, nil.
 func parseManagerFlag(s string) (map[string]string, error) {
@@ -2388,7 +5137,7 @@ func parseManagerFlag(s string) (map[string]string, error) {
 		return nil, nil
 	}
 	result := make(map[string]string)
-	for _, token := range strings.Split(s, ",") {
+	for token := range strings.SplitSeq(s, ",") {
 		token = strings.TrimSpace(token)
 		if token == "" {
 			continue
@@ -2418,14 +5167,23 @@ Commands:
   disown <id> Stop tracking a package in genv.json without uninstalling it
   list        List all packages installed by genv                   (alias: ls)
   apply       Reconcile system state with genv.json (install added, remove deleted)
-  scan        Discover all installed packages and bulk-adopt them into genv.json
+  scan        Discover user-facing installs and bulk-adopt them (use --dry-run / --yes; --all for full trees)
   status      Show diff between genv.json, the lock file, and recorded versions
   clean       Clear the cache of all detected package managers
   edit        Open genv.json in $EDITOR
   env         Manage shell environment variables (set, unset, list)
-  completion  Print the shell completion script (bash, zsh, or fish)
+  shell       Manage shell aliases and shell config drift
+  service     Manage user-space services
+  files       Adopt a live file into a managed link (adopt)
+  pull        Fetch genv.json from the configured spec repository
+  migrate     Convert legacy host predicates to portable targets
+  completion  Print or install the shell completion script (bash, zsh, fish, or powershell)
   validate    Validate genv.json against the schema
-  upgrade     Upgrade all tracked packages to their latest versions
+  upgrade     Upgrade tracked packages plus OS vendor updates (--all for every unconstrained package)
+  updates     Check for available updates to genv-tracked packages
+  export      Build a single-target portable snapshot and report
+  map         Print assist-only manager mapping suggestions for a target
+  profile     Named overlays (list/create/switch; refused on portable specs)
   init        Create a new genv.json interactively
   version     Show genv build version information
   help        Show this help text
@@ -2433,11 +5191,18 @@ Commands:
 Flags common to all commands:
   --file <path>   Path to genv.json (default: $XDG_CONFIG_HOME/genv/genv.json or ~/.config/genv/genv.json, falling back to ./genv.json)
 
+Host-specific flags (used by apply, status, upgrade, updates check/start, adopt):
+  --host <name>   Legacy host filter for v1–v7 records (default: host classification, not hostname)
+  --target <id>   Portable target id for current schemaVersion specs (default: $GENV_TARGET or host classification)
+
 Add/Adopt-specific flags:
   --version <ver>              Version constraint, e.g. "0.10.*"
   --prefer <mgr>               Preferred manager, e.g. brew
   --manager <mgr:name,...>     Manager-specific package names, e.g.
                                snap:hello,brew:hello
+  --no-hooks                   Skip add lifecycle hooks without skipping install
+  --hook-timeout <duration>    Per-hook timeout, e.g. 5m or 30s
+  --target <id>                Portable target id for current schemaVersion specs
 
 Apply-specific flags:
   --dry-run            Print the reconcile plan without executing
@@ -2445,21 +5210,79 @@ Apply-specific flags:
   --yes                Skip the confirmation prompt (for CI and scripts)
   --quiet              Suppress plan output (useful in scripts)
   --json               Emit machine-readable JSON to stdout
-  --timeout <duration> Per-subprocess timeout, e.g. 5m or 30s (0 = none)
+  --timeout <duration> Per-subprocess timeout, e.g. 5m or 30s (0 = none; default 10m)
+  --no-hooks           Skip apply lifecycle hooks without skipping apply
+  --skip-packages      Skip package install/remove; still apply env, shell, files, services
+  --hook-timeout <duration> Per-hook timeout, e.g. 5m or 30s
   --debug              Emit debug-level structured logs to stderr
+  --target <id>        Portable target id for current schemaVersion specs
+  --force-new-lock     Back up a foreign lock and start a new local lock
+  --state-dir <dir>    Directory for lock and env/shell fragments (default: directory of --file)
+  --source-root <dir>  Resolve files.links/templates and service template sources relative to this directory
+
+Apply hooks (check-then-act):
+  Print GENV_HOOK_STATUS=changed or GENV_HOOK_STATUS=skipped when exiting 0.
+  Exit 0 without a status line is treated as changed. Non-zero exit is error.
+  The hook summary prints changed, skipped (no-op), or error.
+
+Export-specific flags:
+  --target <id>        Target id to export
+  --out <dir>          Directory to write genv.json, report.json, and report.md
+  --strict             Exit nonzero if the report contains errors
+  --from-v7            Migrate v1-v7 input to a portable spec in memory first
+  --verify             Query live managers to prove each exported package is installed
+
+Map-specific flags:
+  --target <id>        Destination target id for suggestions
+
+Remove-specific flags:
+  --no-hooks                Skip remove lifecycle hooks without skipping uninstall
+  --hook-timeout <duration> Per-hook timeout, e.g. 5m or 30s
+  --target <id>             Portable target id for current schemaVersion specs
 
 Upgrade-specific flags:
-  --dry-run   Print the upgrade commands without executing
-  --yes       Skip the confirmation prompt
-  --debug     Emit debug-level structured logs to stderr
+  --dry-run                 Print the upgrade commands without executing
+  --yes                     Skip the confirmation prompt (required for --json wet-run)
+  --all                     Upgrade every unconstrained tracked package (skip outdated detection)
+  --no-hooks                Skip pre-upgrade and post-upgrade hooks
+  --json                    Emit machine-readable JSON to stdout (wet-run requires --yes)
+  --only <ids>              Comma-separated package IDs or names to upgrade (positional IDs also apply)
+  --skip <ids>              Comma-separated package IDs or names to skip
+  --only-manager <mgrs>     Comma-separated managers to upgrade
+  --skip-manager <mgrs>     Comma-separated managers to skip
+  --hook-timeout <duration> Per-hook timeout, e.g. 5m or 30s
+  --debug                   Emit debug-level structured logs to stderr
+  --target <id>             Portable target id for current schemaVersion specs
+
+Updates-specific flags:
+  check                         Plan available updates for genv-tracked packages only
+  start                         Register the managed background checker (no auto-apply unless updates.autoApply:true)
+  stop                          Stop and unregister the managed background checker
+  status                        Show managed background checker status
+  check --json                  Emit machine-readable dry-run JSON to stdout
+  check --only <ids>            Comma-separated package IDs or names to check
+  check --skip <ids>            Comma-separated package IDs or names to skip
+  check --only-manager <mgrs>   Comma-separated managers to check
+  check --skip-manager <mgrs>   Comma-separated managers to skip
+  check --host <name>           Host name for host-specific records
+  check --target <id>           Portable target id for current schemaVersion specs
+  check --lock-file <path>      Path to genv lock file
+  start --target <id>           Portable target id for current schemaVersion specs
 
 Status-specific flags:
-  --json    Emit machine-readable JSON to stdout
-  --debug   Emit debug-level structured logs to stderr
+  --json     Emit machine-readable JSON to stdout
+  --debug    Emit debug-level structured logs to stderr
+  --offline  Compare spec vs lock only (skip live manager probe)
+  --files    Check files block against the live filesystem only
+  --verify   Query each tracked package's manager to prove it is installed
 
 Scan-specific flags:
-  --json    Emit machine-readable JSON to stdout
-  --debug   Emit debug-level structured logs to stderr
+  --dry-run   List packages that would be adopted without writing
+  --yes       Skip the confirmation prompt
+  --all       Include manager dependencies and language stdlib (same as --deps)
+  --deps      Include manager dependencies and language stdlib (same as --all)
+  --json      Emit machine-readable JSON to stdout
+  --debug     Emit debug-level structured logs to stderr
 
 Clean-specific flags:
   --dry-run   Print the clean commands without executing
@@ -2484,16 +5307,12 @@ func printVersion() {
 // serviceCmd implements `genv service <subcommand>`.
 func serviceCmd(args []string) int {
 	if len(args) == 0 {
-		fPrintln(os.Stderr, "usage: genv service <add|remove|list|start|stop|status> [flags]")
-		fPrintln(os.Stderr)
-		fPrintln(os.Stderr, "subcommands:")
-		fPrintln(os.Stderr, "  add <name> --start <cmd> [--stop <cmd>] [--restart <cmd>] [--status <cmd>]   Add or update a service")
-		fPrintln(os.Stderr, "  remove <name>                                                              Remove a service from the spec")
-		fPrintln(os.Stderr, "  list                                                                        Show all declared services")
-		fPrintln(os.Stderr, "  start <name>                                                               Start a service")
-		fPrintln(os.Stderr, "  stop <name>                                                                Stop a service")
-		fPrintln(os.Stderr, "  status <name>                                                              Show service running status")
+		printServiceUsage()
 		return exitUsage
+	}
+	if isHelpArg(args[0]) {
+		printServiceUsage()
+		return exitOK
 	}
 	switch args[0] {
 	case "add":
@@ -2514,11 +5333,29 @@ func serviceCmd(args []string) int {
 	}
 }
 
+func printServiceUsage() {
+	fPrintln(os.Stderr, "usage: genv service <add|remove|list|start|stop|status> [flags]")
+	fPrintln(os.Stderr)
+	fPrintln(os.Stderr, "subcommands:")
+	fPrintln(os.Stderr, "  add <name> --start <cmd> [--stop <cmd>] [--restart <cmd>] [--status <cmd>]   Add or update a service (raw commands)")
+	fPrintln(os.Stderr, "  add <name> --brew-formula <formula>                                          Add a brew-managed service (macOS)")
+	fPrintln(os.Stderr, "  add <name> --launchd-plist <path>                                            Add a launchd user agent from a plist template")
+	fPrintln(os.Stderr, "  add <name> --systemd-unit <path>                                             Add a systemd --user unit from a unit template")
+	fPrintln(os.Stderr, "  remove <name>                                                              Remove a service from the spec")
+	fPrintln(os.Stderr, "  list                                                                        Show all declared services")
+	fPrintln(os.Stderr, "  start <name>                                                               Start a service")
+	fPrintln(os.Stderr, "  stop <name>                                                                Stop a service")
+	fPrintln(os.Stderr, "  status <name>                                                              Show service running status")
+}
+
 // serviceAddCmd implements `genv service add <name> --start <cmd> [--stop <cmd>] [--restart <cmd>] [--status <cmd>]`.
 func serviceAddCmd(args []string) int {
 	fs := flag.NewFlagSet("service add", flag.ContinueOnError)
 	fs.Usage = func() {
 		fPrintln(os.Stderr, "usage: genv service add <name> --start <cmd> [flags]")
+		fPrintln(os.Stderr, "       genv service add <name> --brew-formula <formula> [flags]")
+		fPrintln(os.Stderr, "       genv service add <name> --launchd-plist <path> [flags]")
+		fPrintln(os.Stderr, "       genv service add <name> --systemd-unit <path> [flags]")
 		fPrintln(os.Stderr)
 		fPrintln(os.Stderr, "flags:")
 		fs.PrintDefaults()
@@ -2528,18 +5365,22 @@ func serviceAddCmd(args []string) int {
 	stop := fs.String("stop", "", "command to stop the service")
 	restart := fs.String("restart", "", "command to restart the service")
 	status := fs.String("status", "", "command to check service status")
+	brewFormula := fs.String("brew-formula", "", "homebrew formula to manage via `brew services` (macOS only)")
+	launchdPlist := fs.String("launchd-plist", "", "LaunchAgent plist template (rendered like files.templates)")
+	systemdUnit := fs.String("systemd-unit", "", "systemd --user unit template (rendered like files.templates)")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	name, flagArgs := extractPositional(args)
 	if err := fs.Parse(flagArgs); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if name == "" {
 		fPrintln(os.Stderr, "genv service add: missing service name")
 		fs.Usage()
 		return exitUsage
 	}
-	if *start == "" {
-		fPrintln(os.Stderr, "genv service add: --start command is required")
+	if *start == "" && *brewFormula == "" && *launchdPlist == "" && *systemdUnit == "" {
+		fPrintln(os.Stderr, "genv service add: either --start, --brew-formula, --launchd-plist, or --systemd-unit is required")
 		fs.Usage()
 		return exitUsage
 	}
@@ -2553,19 +5394,55 @@ func serviceAddCmd(args []string) int {
 		return exitIO
 	}
 
-	startCmd := strings.Fields(*start)
+	var startCmd []string
+	if *start != "" {
+		startCmd, err = parseCommandWords(*start)
+		if err != nil {
+			fprintf(os.Stderr, "genv service add: invalid --start command: %v\n", err)
+			return exitUsage
+		}
+	}
 	var stopCmd, restartCmd, statusCmd []string
 	if *stop != "" {
-		stopCmd = strings.Fields(*stop)
+		stopCmd, err = parseCommandWords(*stop)
+		if err != nil {
+			fprintf(os.Stderr, "genv service add: invalid --stop command: %v\n", err)
+			return exitUsage
+		}
 	}
 	if *restart != "" {
-		restartCmd = strings.Fields(*restart)
+		restartCmd, err = parseCommandWords(*restart)
+		if err != nil {
+			fprintf(os.Stderr, "genv service add: invalid --restart command: %v\n", err)
+			return exitUsage
+		}
 	}
 	if *status != "" {
-		statusCmd = strings.Fields(*status)
+		statusCmd, err = parseCommandWords(*status)
+		if err != nil {
+			fprintf(os.Stderr, "genv service add: invalid --status command: %v\n", err)
+			return exitUsage
+		}
 	}
 
-	if err := commands.ServiceAdd(f, name, startCmd, stopCmd, restartCmd, statusCmd); err != nil {
+	targetID, exit := resolveMutationTarget("service add", *file, f, *targetFlag)
+	if exit != exitOK {
+		return exit
+	}
+	svc := schema.Service{
+		Start:       startCmd,
+		Stop:        stopCmd,
+		Restart:     restartCmd,
+		Status:      statusCmd,
+		BrewFormula: *brewFormula,
+	}
+	if *launchdPlist != "" {
+		svc.Launchd = &schema.LaunchdSpec{Plist: *launchdPlist}
+	}
+	if *systemdUnit != "" {
+		svc.Systemd = &schema.SystemdSpec{Unit: *systemdUnit}
+	}
+	if err := commands.ServicePut(f, name, svc, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		return exitUsage
 	}
@@ -2592,10 +5469,11 @@ func serviceRemoveCmd(args []string) int {
 		fs.PrintDefaults()
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	targetFlag := fs.String("target", "", targetFlagHelp)
 
 	name, flagArgs := extractPositional(args)
 	if err := fs.Parse(flagArgs); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if name == "" {
 		fPrintln(os.Stderr, "genv service remove: name is required")
@@ -2616,7 +5494,11 @@ func serviceRemoveCmd(args []string) int {
 		return exitIO
 	}
 
-	if err := commands.ServiceRemove(f, name); err != nil {
+	targetID, exit := resolveMutationTarget("service remove", *file, f, *targetFlag)
+	if exit != exitOK {
+		return exit
+	}
+	if err := commands.ServiceRemove(f, name, targetID); err != nil {
 		fprintf(os.Stderr, "genv: %v\n", err)
 		if errors.Is(err, commands.ErrServiceNotFound) {
 			return exitLogic
@@ -2643,22 +5525,15 @@ func serviceListCmd(args []string) int {
 		fs.PrintDefaults()
 	}
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 
 	if err := fs.Parse(args); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 
-	f, err := genvfile.Read(*file)
-	if err != nil {
-		if errors.Is(err, genvfile.ErrNotFound) {
-			fprintf(os.Stderr, "genv: %s not found — run 'genv service add' to create one\n", *file)
-			return exitIO
-		}
-		fprintf(os.Stderr, "genv: %v\n", err)
-		if errors.Is(err, genvfile.ErrInvalidFile) {
-			return exitValidation
-		}
-		return exitIO
+	f, code := readMaterializedSpec("service list", *file, "", *targetFlag)
+	if code != exitOK {
+		return code
 	}
 
 	commands.ServiceList(f, os.Stdout)
@@ -2669,20 +5544,20 @@ func serviceListCmd(args []string) int {
 func serviceStartCmd(args []string) int {
 	fs := flag.NewFlagSet("service start", flag.ContinueOnError)
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 
 	name, flagArgs := extractPositional(args)
 	if err := fs.Parse(flagArgs); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if name == "" {
 		fPrintln(os.Stderr, "genv service start: name is required")
 		return exitUsage
 	}
 
-	f, err := genvfile.Read(*file)
-	if err != nil {
-		fprintf(os.Stderr, "genv: %v\n", err)
-		return exitIO
+	f, code := readMaterializedSpec("service start", *file, "", *targetFlag)
+	if code != exitOK {
+		return code
 	}
 
 	// Debug: print what services we found
@@ -2697,11 +5572,16 @@ func serviceStartCmd(args []string) int {
 		return exitLogic
 	}
 
-	fprintf(os.Stdout, "Starting service %q: %s\n", name, strings.Join(svc.Start, " "))
-	cmd := exec.Command(svc.Start[0], svc.Start[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if svc.DeclaresLaunchd() {
+		fprintf(os.Stdout, "Starting service %q via launchd\n", name)
+	} else if svc.DeclaresSystemd() {
+		fprintf(os.Stdout, "Starting service %q via systemd --user\n", name)
+	} else if svc.BrewFormula != "" {
+		fprintf(os.Stdout, "Starting service %q via brew services: %s\n", name, svc.BrewFormula)
+	} else {
+		fprintf(os.Stdout, "Starting service %q: %s\n", name, strings.Join(svc.Start, " "))
+	}
+	if err := service.StartDeclared(context.Background(), name, svc, sourceRootForSpec(*file, f)); err != nil {
 		fprintf(os.Stderr, "genv: failed to start service %q: %v\n", name, err)
 		if service.IsSystemdAvailable() {
 			fprintf(os.Stderr, "Tip: to view logs run: %s\n", service.SystemdLogsHint(name))
@@ -2715,20 +5595,20 @@ func serviceStartCmd(args []string) int {
 func serviceStopCmd(args []string) int {
 	fs := flag.NewFlagSet("service stop", flag.ContinueOnError)
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 
 	name, flagArgs := extractPositional(args)
 	if err := fs.Parse(flagArgs); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if name == "" {
 		fPrintln(os.Stderr, "genv service stop: name is required")
 		return exitUsage
 	}
 
-	f, err := genvfile.Read(*file)
-	if err != nil {
-		fprintf(os.Stderr, "genv: %v\n", err)
-		return exitIO
+	f, code := readMaterializedSpec("service stop", *file, "", *targetFlag)
+	if code != exitOK {
+		return code
 	}
 
 	svc, ok := f.Services[name]
@@ -2737,16 +5617,19 @@ func serviceStopCmd(args []string) int {
 		return exitLogic
 	}
 
-	if len(svc.Stop) == 0 {
+	if svc.DeclaresLaunchd() {
+		fprintf(os.Stdout, "Stopping service %q via launchd\n", name)
+	} else if svc.DeclaresSystemd() {
+		fprintf(os.Stdout, "Stopping service %q via systemd --user\n", name)
+	} else if svc.BrewFormula != "" {
+		fprintf(os.Stdout, "Stopping service %q via brew services: %s\n", name, svc.BrewFormula)
+	} else if len(svc.Stop) == 0 {
 		fprintf(os.Stderr, "genv: no stop command defined for service %q\n", name)
 		return exitLogic
+	} else {
+		fprintf(os.Stdout, "Stopping service %q: %s\n", name, strings.Join(svc.Stop, " "))
 	}
-
-	fprintf(os.Stdout, "Stopping service %q: %s\n", name, strings.Join(svc.Stop, " "))
-	cmd := exec.Command(svc.Stop[0], svc.Stop[1:]...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
+	if err := service.StopDeclared(context.Background(), name, svc, sourceRootForSpec(*file, f)); err != nil {
 		fprintf(os.Stderr, "genv: failed to stop service %q: %v\n", name, err)
 		return exitLogic
 	}
@@ -2757,20 +5640,20 @@ func serviceStopCmd(args []string) int {
 func serviceStatusCmd(args []string) int {
 	fs := flag.NewFlagSet("service status", flag.ContinueOnError)
 	file := fs.String("file", defaultSpecPath(), "path to genv.json")
+	targetFlag := fs.String("target", "", targetFlagHelpWithDefault)
 
 	name, flagArgs := extractPositional(args)
 	if err := fs.Parse(flagArgs); err != nil {
-		return exitUsage
+		return flagParseExit(err)
 	}
 	if name == "" {
 		fPrintln(os.Stderr, "genv service status: name is required")
 		return exitUsage
 	}
 
-	f, err := genvfile.Read(*file)
-	if err != nil {
-		fprintf(os.Stderr, "genv: %v\n", err)
-		return exitIO
+	f, code := readMaterializedSpec("service status", *file, "", *targetFlag)
+	if code != exitOK {
+		return code
 	}
 
 	svc, ok := f.Services[name]
@@ -2779,16 +5662,15 @@ func serviceStatusCmd(args []string) int {
 		return exitLogic
 	}
 
-	if len(svc.Status) == 0 {
+	if !svc.DeclaresLaunchd() && !svc.DeclaresSystemd() && svc.BrewFormula == "" && len(svc.Status) == 0 && !service.IsSystemdAvailable() && !service.IsLaunchdAvailable() {
 		fprintf(os.Stderr, "genv: no status command defined for service %q\n", name)
 		return exitLogic
 	}
 
-	cmd := exec.Command(svc.Status[0], svc.Status[1:]...)
-	if err := cmd.Run(); err != nil {
-		fprintf(os.Stdout, "service %q is NOT running\n", name)
-		return exitLogic
+	if service.ProbeRunning(context.Background(), name, svc, sourceRootForSpec(*file, f)) {
+		fprintf(os.Stdout, "service %q is running\n", name)
+		return exitOK
 	}
-	fprintf(os.Stdout, "service %q is running\n", name)
-	return exitOK
+	fprintf(os.Stdout, "service %q is NOT running\n", name)
+	return exitLogic
 }

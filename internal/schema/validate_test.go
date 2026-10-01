@@ -1,8 +1,12 @@
 package schema
 
 import (
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseAndValidate_Valid(t *testing.T) {
@@ -196,6 +200,38 @@ func TestParseAndValidate_SyntaxError(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "line") {
 		t.Errorf("expected error to contain line info, got: %v", err)
+	}
+}
+
+func TestParseAndValidate_InvalidWindowsPathDoesNotHang(t *testing.T) {
+	// Unescaped backslashes in a Windows path are invalid JSON and used to
+	// hang locateFields via Decoder.More() before unmarshal ran.
+	input := `{"schemaVersion":"6","packages":[],"repo":{"url":"C:\Users\runneradmin\AppData\Local\Temp\x"}}`
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ParseAndValidate([]byte(input))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected syntax error for unescaped Windows path")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ParseAndValidate hung on invalid Windows-path JSON")
+	}
+}
+
+func TestLocateFields_InvalidEscapeDoesNotHang(t *testing.T) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		locateFields([]byte(`{"repo":{"url":"C:\Users\x"}}`), map[string]Position{})
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("locateFields hung on invalid escape")
 	}
 }
 
@@ -471,6 +507,7 @@ func TestParseAndValidate_MultipleValidPackages(t *testing.T) {
 	}
 	if f == nil {
 		t.Fatal("ParseAndValidate returned nil")
+		return
 	}
 	if len(f.Packages) != 3 {
 		t.Fatalf("expected 3 packages, got %d", len(f.Packages))
@@ -499,6 +536,14 @@ func TestParseAndValidate_PackageWithAllKnownManagers(t *testing.T) {
 	}
 	if len(errs) > 0 {
 		t.Fatalf("unexpected validation errors for all-known managers: %v", errs)
+	}
+}
+
+func TestParseAndValidate_ExternalManagerAccepted(t *testing.T) {
+	input := `{"schemaVersion":"1","packages":[{"id":"hermes-desktop","prefer":"external","managers":{"external":"hermes"}}]}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil || len(errs) > 0 {
+		t.Fatalf("err=%v errs=%v", err, errs)
 	}
 }
 
@@ -534,7 +579,7 @@ func TestParseAndValidate_MultipleDuplicates(t *testing.T) {
 // TestParseAndValidate_MultipleUnknownManagers verifies that each unknown
 // manager key in the managers map produces its own validation error.
 func TestParseAndValidate_MultipleUnknownManagers(t *testing.T) {
-	input := `{"schemaVersion":"1","packages":[{"id":"git","managers":{"yum":"git","choco":"git"}}]}`
+	input := `{"schemaVersion":"1","packages":[{"id":"git","managers":{"yum":"git","zypper":"git"}}]}`
 	_, errs, err := ParseAndValidate([]byte(input))
 	if err != nil {
 		t.Fatalf("unexpected fatal error: %v", err)
@@ -565,5 +610,1308 @@ func TestLocateFields_NestedManagers(t *testing.T) {
 	key := "packages[0].managers.brew"
 	if _, ok := pos[key]; !ok {
 		t.Errorf("expected position for %q to be tracked; got keys: %v", key, pos)
+	}
+}
+
+func TestParseAndValidate_RejectsShellSourceMetacharacters(t *testing.T) {
+	input := `{
+		"schemaVersion":"3",
+		"packages":[],
+		"shell":{"source":["/tmp/env.sh; rm -rf /"]}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "shell.source[0]" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected shell source validation error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_AcceptsSafeAliasName(t *testing.T) {
+	input := `{"schemaVersion":"3","packages":[],"shell":{"aliases":{"ll":{"value":"ls"}}}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil || len(errs) != 0 {
+		t.Fatalf("safe alias rejected: err=%v errs=%v", err, errs)
+	}
+}
+
+func TestParseAndValidate_RejectsUnsafeAliasName(t *testing.T) {
+	input := `{
+		"schemaVersion":"3",
+		"packages":[],
+		"shell":{"aliases":{"foo;rm":{"value":"ls"}}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Field, "aliases") && strings.Contains(e.Message, "invalid") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected invalid alias name error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_RejectsShellFunctionMetacharacters(t *testing.T) {
+	input := `{
+		"schemaVersion":"3",
+		"packages":[],
+		"shell":{"functions":{"bad":{"body":"echo hi; rm -rf /"}}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "shell.functions.bad.body" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected shell function validation error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_RejectsServiceNewlineInjection(t *testing.T) {
+	input := `{
+		"schemaVersion":"4",
+		"packages":[],
+		"services":{
+			"svc\nbad":{"start":["echo","ok"]},
+			"ok":{"start":["echo","hello\nworld"]}
+		}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) == 0 {
+		t.Fatal("expected newline validation errors")
+	}
+}
+
+func TestParseAndValidate_V5FilesAndHooks(t *testing.T) {
+	input := `{
+		"schemaVersion": "5",
+		"packages": [{"id": "git", "host": ["arch", "wsl2"]}],
+		"env": {"EDITOR": {"value": "nvim"}},
+		"shell": {"aliases": {"ll": {"value": "ls -lh", "shell": "zsh"}}},
+		"files": {
+			"links": [{"source": "a", "target": "~/b", "mode": "managed-link", "host": "macos"}],
+			"templates": [{"source": "c", "target": "~/d"}],
+			"dirs": [{"target": "~/.config/foo"}]
+		},
+		"hooks": {
+			"preUpgrade": [{"command": "brew upgrade", "host": "macos"}],
+			"postApply": [{"command": "echo done"}],
+			"postUpgrade": [{"command": "echo upgraded"}]
+		},
+		"repo": {"url": "~/terminal-config", "ref": "main"}
+	}`
+	f, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	if f.SchemaVersion != Version5 {
+		t.Errorf("schemaVersion = %q, want %q", f.SchemaVersion, Version5)
+	}
+	if f.Files == nil || len(f.Files.Links) != 1 || len(f.Files.Templates) != 1 || len(f.Files.Dirs) != 1 {
+		t.Errorf("files block not parsed: %+v", f.Files)
+	}
+	if f.Hooks == nil || len(f.Hooks.PreUpgrade) != 1 || len(f.Hooks.PostApply) != 1 || len(f.Hooks.PostUpgrade) != 1 {
+		t.Errorf("hooks block not parsed: %+v", f.Hooks)
+	}
+	if f.Repo == nil || f.Repo.URL == "" {
+		t.Errorf("repo block not parsed: %+v", f.Repo)
+	}
+	if len(f.Packages[0].Host) != 2 {
+		t.Errorf("package host predicate = %v, want 2 entries", f.Packages[0].Host)
+	}
+	if f.Env["EDITOR"].Value != "nvim" {
+		t.Errorf("v5 env block not parsed: %+v", f.Env)
+	}
+	if f.Shell == nil || f.Shell.Aliases["ll"].Value != "ls -lh" {
+		t.Errorf("v5 shell block not parsed: %+v", f.Shell)
+	}
+}
+
+func TestParseAndValidate_V5OldHookArraysRemainValid(t *testing.T) {
+	// Given: an existing v5 spec using only the original hook arrays.
+	input := `{"schemaVersion":"5","packages":[],"hooks":{"preUpgrade":[{"command":"echo pre"}],"postApply":[{"command":"echo apply"}],"postUpgrade":[{"command":"echo post"}]}}`
+
+	// When
+	f, errs, err := ParseAndValidate([]byte(input))
+
+	// Then
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	if f.Hooks == nil || len(f.Hooks.PreUpgrade) != 1 || len(f.Hooks.PostApply) != 1 || len(f.Hooks.PostUpgrade) != 1 {
+		t.Fatalf("old hook arrays not parsed: %+v", f.Hooks)
+	}
+}
+
+func TestParseAndValidate_V6LifecycleHooksAndFiles(t *testing.T) {
+	// Given: a v6 spec using every lifecycle hook phase and a script-file hook.
+	input := `{
+		"schemaVersion":"6",
+		"packages":[],
+		"hooks":{
+			"preApply":[{"command":"echo pre-apply"}],
+			"postApply":[{"file":"~/.config/genv/hooks/post-apply.sh"}],
+			"preAdd":[{"command":"echo pre-add"}],
+			"postAdd":[{"command":"echo post-add"}],
+			"preRemove":[{"command":"echo pre-remove"}],
+			"postRemove":[{"command":"echo post-remove"}],
+			"preUpgrade":[{"command":"echo pre-upgrade"}],
+			"postUpgrade":[{"command":"echo post-upgrade"}]
+		}
+	}`
+
+	// When
+	f, errs, err := ParseAndValidate([]byte(input))
+
+	// Then
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	if f.Hooks == nil || len(f.Hooks.PreApply) != 1 || len(f.Hooks.PostApply) != 1 || f.Hooks.PostApply[0].File == "" || len(f.Hooks.PreAdd) != 1 || len(f.Hooks.PostRemove) != 1 {
+		t.Fatalf("v6 lifecycle hooks not parsed: %+v", f.Hooks)
+	}
+}
+
+func TestParseAndValidate_NewHooksRequireV6(t *testing.T) {
+	// Given: a v5 spec using a new lifecycle phase.
+	input := `{"schemaVersion":"5","packages":[],"hooks":{"preApply":[{"command":"echo pre"}]}}`
+
+	// When
+	_, errs, err := ParseAndValidate([]byte(input))
+
+	// Then
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if !hasValidationField(errs, "hooks.preApply") {
+		t.Fatalf("expected hooks.preApply v6 validation error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_HookNameAndContinueOnError(t *testing.T) {
+	input := `{"schemaVersion":"6","packages":[],"hooks":{"postApply":[{"name":"selftest","command":"true","continueOnError":true}]}}`
+
+	f, errs, err := ParseAndValidate([]byte(input))
+
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("name and continueOnError should validate, got: %v", errs)
+	}
+	if f.Hooks == nil || len(f.Hooks.PostApply) != 1 {
+		t.Fatalf("postApply not parsed: %+v", f.Hooks)
+	}
+	got := f.Hooks.PostApply[0]
+	if got.Name != "selftest" {
+		t.Fatalf("Name = %q, want selftest", got.Name)
+	}
+	if !got.ContinueOnError {
+		t.Fatal("ContinueOnError = false, want true")
+	}
+}
+
+func TestParseAndValidate_HookCommandOrFileExactlyOne(t *testing.T) {
+	tests := []struct {
+		name  string
+		hook  string
+		field string
+	}{
+		{name: "both command and file", hook: `{"command":"echo hi","file":"~/hook.sh"}`, field: "hooks.postApply[0]"},
+		{name: "neither command nor file", hook: `{}`, field: "hooks.postApply[0]"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Given
+			input := `{"schemaVersion":"6","packages":[],"hooks":{"postApply":[` + tc.hook + `]}}`
+
+			// When
+			_, errs, err := ParseAndValidate([]byte(input))
+
+			// Then
+			if err != nil {
+				t.Fatalf("unexpected fatal error: %v", err)
+			}
+			if !hasValidationField(errs, tc.field) {
+				t.Fatalf("expected %s validation error, got: %v", tc.field, errs)
+			}
+		})
+	}
+}
+
+func hasValidationField(errs []ValidationError, field string) bool {
+	for _, e := range errs {
+		if e.Field == field {
+			return true
+		}
+	}
+	return false
+}
+
+func TestParseAndValidate_MergeDirModeAccepted(t *testing.T) {
+	input := `{
+		"schemaVersion": "5",
+		"packages": [],
+		"files": {
+			"links": [
+				{"source": "zsh/common", "target": "~/.config/zsh", "mode": "merge-dir"},
+				{"source": "zsh/arch", "target": "~/.config/zsh", "mode": "merge-dir", "host": "arch"}
+			]
+		}
+	}`
+	f, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	if len(f.Files.Links) != 2 || f.Files.Links[0].Mode != "merge-dir" {
+		t.Errorf("merge-dir links not parsed: %+v", f.Files.Links)
+	}
+}
+
+func TestParseAndValidate_InvalidLinkModeRejected(t *testing.T) {
+	input := `{
+		"schemaVersion": "5",
+		"packages": [],
+		"files": {
+			"links": [{"source": "a", "target": "~/b", "mode": "bogus-mode"}]
+		}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "files.links[0].mode" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected files.links[0].mode validation error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_V4StillValid(t *testing.T) {
+	input := `{"schemaVersion":"4","packages":[],"services":{"svc":{"start":["true"]}}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("v4 spec should still validate: %v", errs)
+	}
+}
+
+func TestParseAndValidate_LaunchdAndSystemdTemplates(t *testing.T) {
+	input := `{
+		"schemaVersion":"8",
+		"defaults":{},
+		"targets":{"macos":{"services":{
+			"agent":{"launchd":{"plist":"agents/com.example.agent.plist"}},
+			"both":{"launchd":{"plist":"agents/foo.plist"},"systemd":{"unit":"units/foo.service"}}
+		}}}
+	}`
+	f, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("launchd/systemd templates should validate: %v", errs)
+	}
+	got := f.Targets["macos"].Services["agent"]
+	if got == nil || !got.DeclaresLaunchd() || got.Launchd.Plist != "agents/com.example.agent.plist" {
+		t.Fatalf("macos agent launchd = %+v", got)
+	}
+}
+
+func TestParseAndValidate_LaunchdExclusiveWithStart(t *testing.T) {
+	input := `{"schemaVersion":"4","packages":[],"services":{"svc":{"start":["true"],"launchd":{"plist":"a.plist"}}}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "services.svc" && strings.Contains(e.Message, "mutually exclusive") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected exclusivity error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_LaunchdEmptyPlistRejected(t *testing.T) {
+	input := `{"schemaVersion":"4","packages":[],"services":{"svc":{"launchd":{}}}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) == 0 {
+		t.Fatal("expected empty launchd.plist to fail validation")
+	}
+}
+
+func TestParseAndValidate_UnknownLaunchdFieldRejected(t *testing.T) {
+	input := `{"schemaVersion":"4","packages":[],"services":{"svc":{"launchd":{"plist":"a.plist","program":"x"}}}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "services.svc.launchd.program" && strings.Contains(e.Message, "unknown field") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected unknown launchd field, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_AcceptsV7(t *testing.T) {
+	input := `{"schemaVersion":"7","packages":[]}`
+	f, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("expected no validation errors for v7, got: %v", errs)
+	}
+	if f.SchemaVersion != Version7 {
+		t.Errorf("SchemaVersion = %q, want %q", f.SchemaVersion, Version7)
+	}
+}
+
+func TestParseAndValidate_AcceptsPowerShellShellTarget(t *testing.T) {
+	input := `{
+		"schemaVersion":"7",
+		"packages":[],
+		"shell":{
+			"aliases":{"ll":{"value":"Get-ChildItem","shell":"powershell"}},
+			"functions":{"greet":{"body":"Write-Host hi","shell":"powershell"}}
+		}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("expected no validation errors, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_PowerShellRequiresV7(t *testing.T) {
+	input := `{
+		"schemaVersion":"3",
+		"packages":[],
+		"shell":{"aliases":{"ll":{"value":"Get-ChildItem","shell":"powershell"}}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "shell.aliases.ll.shell" && strings.Contains(e.Message, "schemaVersion") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected powershell target rejected on v3, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_V8RejectsTopLevelPackages(t *testing.T) {
+	raw := `{"schemaVersion":"8","packages":[{"id":"git"}],"targets":{"arch":{"packages":[]}}}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(errs) == 0 {
+		t.Fatal("expected validation error for top-level packages on v8")
+	}
+}
+
+func TestParseAndValidate_V8AcceptsDefaultsAndTargets(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "defaults":{"env":{"EDITOR":{"value":"nvim"}}},
+	  "targets":{
+	    "arch":{"packages":[{"id":"git","prefer":"pacman"}],"env":{"EDITOR":null}},
+	    "macos":{"packages":[{"id":"git","prefer":"brew"}]}
+	  }
+	}`
+	f, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil || len(errs) > 0 {
+		t.Fatalf("unexpected: err=%v errs=%v", err, errs)
+	}
+	if f.Targets["arch"].Env["EDITOR"] != nil {
+		t.Fatal("expected tombstone nil pointer for EDITOR on arch")
+	}
+}
+
+func TestParseAndValidate_V8RejectsUnknownEnvTombstone(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "defaults":{"env":{"EDITOR":{"value":"nvim"}}},
+	  "targets":{"arch":{"env":{"EDTIOR":null}}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasValidationField(errs, "targets.arch.env.EDTIOR") {
+		t.Fatalf("expected unknown env tombstone validation error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_V8RejectsUnknownAliasTombstone(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "defaults":{"shell":{"aliases":{"ll":{"value":"ls -la"}}}},
+	  "targets":{"arch":{"shell":{"aliases":{"sl":null}}}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasValidationField(errs, "targets.arch.shell.aliases.sl") {
+		t.Fatalf("expected unknown alias tombstone validation error, got: %v", errs)
+	}
+}
+
+func TestV8JSONSchemaSeparatesDefaultAndTargetTombstones(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", "..", "schema", "v8", "genv.json"))
+	if err != nil {
+		t.Fatalf("ReadFile schema: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("Unmarshal schema: %v", err)
+	}
+	properties := doc["properties"].(map[string]any)
+	defaults := properties["defaults"].(map[string]any)
+	if defaults["$ref"] != "#/$defs/defaultBundle" {
+		t.Fatalf("defaults ref = %v, want defaultBundle", defaults["$ref"])
+	}
+	targets := properties["targets"].(map[string]any)
+	targetAdditional := targets["additionalProperties"].(map[string]any)
+	if targetAdditional["$ref"] != "#/$defs/targetBundle" {
+		t.Fatalf("targets additionalProperties ref = %v, want targetBundle", targetAdditional["$ref"])
+	}
+
+	defs := doc["$defs"].(map[string]any)
+	defaultBundle := defs["defaultBundle"].(map[string]any)
+	defaultProps := defaultBundle["properties"].(map[string]any)
+	for _, field := range []string{"env", "services"} {
+		cfg := defaultProps[field].(map[string]any)
+		additional := cfg["additionalProperties"].(map[string]any)
+		if schemaContainsNull(additional) {
+			t.Fatalf("defaults.%s allows null tombstones: %#v", field, additional)
+		}
+	}
+
+	targetBundle := defs["targetBundle"].(map[string]any)
+	targetProps := targetBundle["properties"].(map[string]any)
+	for _, field := range []string{"env", "services"} {
+		cfg := targetProps[field].(map[string]any)
+		additional := cfg["additionalProperties"].(map[string]any)
+		if !schemaContainsNull(additional) {
+			t.Fatalf("targets.*.%s should allow null tombstones: %#v", field, additional)
+		}
+	}
+}
+
+func schemaContainsNull(v any) bool {
+	switch x := v.(type) {
+	case map[string]any:
+		if x["type"] == "null" {
+			return true
+		}
+		for _, child := range x {
+			if schemaContainsNull(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range x {
+			if schemaContainsNull(child) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestParseAndValidate_V8RejectsHostOnPackage(t *testing.T) {
+	raw := `{"schemaVersion":"8","targets":{"arch":{"packages":[{"id":"git","host":["arch"]}]}}}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(errs) == 0 {
+		t.Fatal("expected error for host on v8 package")
+	}
+}
+
+func TestParseAndValidate_FilesBlockRequiresV5(t *testing.T) {
+	input := `{"schemaVersion":"4","packages":[],"files":{"links":[]}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "files" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected files block rejected on v4, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_FilesRejectsEmptySource(t *testing.T) {
+	input := `{"schemaVersion":"5","packages":[],"files":{"links":[{"source":"","target":"~/x"}]}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "files.links[0].source" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected empty source error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_FilesRejectsInvalidLinkMode(t *testing.T) {
+	input := `{"schemaVersion":"5","packages":[],"files":{"links":[{"source":"a","target":"~/x","mode":"copy"}]}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "files.links[0].mode" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected invalid mode error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_FilesAcceptsOctalPerm(t *testing.T) {
+	input := `{
+		"schemaVersion": "5",
+		"packages": [],
+		"files": {
+			"links": [{"source": "a", "target": "~/b", "mode": "managed-link", "perm": "0600"}],
+			"templates": [{"source": "c", "target": "~/d", "perm": "644"}],
+			"dirs": [{"target": "~/.gnupg", "perm": "0700"}]
+		}
+	}`
+	f, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	if f.Files == nil {
+		t.Fatal("files block not parsed")
+	}
+	if got := f.Files.Links[0].Perm; got != "0600" {
+		t.Errorf("links[0].perm = %q, want 0600", got)
+	}
+	if got := f.Files.Templates[0].Perm; got != "644" {
+		t.Errorf("templates[0].perm = %q, want 644", got)
+	}
+	if got := f.Files.Dirs[0].Perm; got != "0700" {
+		t.Errorf("dirs[0].perm = %q, want 0700", got)
+	}
+}
+
+func TestParseAndValidate_V8FilesAcceptsPerm(t *testing.T) {
+	input := `{
+		"schemaVersion": "8",
+		"targets": {
+			"macos": {
+				"files": {
+					"links": [{"source": "gpg/gpg.conf", "target": "~/.gnupg/gpg.conf", "mode": "managed-link", "perm": "0600"}],
+					"templates": [{"source": "snowflake.toml", "target": "~/.snowflake/config.toml", "perm": "0600"}],
+					"dirs": [{"target": "~/.gnupg", "perm": "0700"}]
+				}
+			}
+		}
+	}`
+	f, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	files := f.Targets["macos"].Files
+	if files == nil {
+		t.Fatal("targets.macos.files not parsed")
+	}
+	if files.Links[0].Perm != "0600" || files.Templates[0].Perm != "0600" || files.Dirs[0].Perm != "0700" {
+		t.Fatalf("v8 perm not parsed: %+v", files)
+	}
+}
+
+func TestParseAndValidate_FilesRejectsNonOctalPerm(t *testing.T) {
+	tests := []struct {
+		name  string
+		json  string
+		field string
+	}{
+		{
+			name:  "letters on dir",
+			json:  `{"schemaVersion":"5","packages":[],"files":{"dirs":[{"target":"~/.gnupg","perm":"rwx"}]}}`,
+			field: "files.dirs[0].perm",
+		},
+		{
+			name:  "digit 8 on link",
+			json:  `{"schemaVersion":"5","packages":[],"files":{"links":[{"source":"a","target":"~/b","perm":"0800"}]}}`,
+			field: "files.links[0].perm",
+		},
+		{
+			name:  "0o prefix on template",
+			json:  `{"schemaVersion":"5","packages":[],"files":{"templates":[{"source":"a","target":"~/b","perm":"0o700"}]}}`,
+			field: "files.templates[0].perm",
+		},
+		{
+			name:  "too short",
+			json:  `{"schemaVersion":"5","packages":[],"files":{"dirs":[{"target":"~/.gnupg","perm":"70"}]}}`,
+			field: "files.dirs[0].perm",
+		},
+		{
+			name:  "too long",
+			json:  `{"schemaVersion":"8","targets":{"macos":{"files":{"dirs":[{"target":"~/.gnupg","perm":"00700"}]}}}}`,
+			field: "targets.macos.files.dirs[0].perm",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, errs, err := ParseAndValidate([]byte(tc.json))
+			if err != nil {
+				t.Fatalf("unexpected fatal error: %v", err)
+			}
+			found := false
+			for _, e := range errs {
+				if e.Field == tc.field && strings.Contains(e.Message, "octal") {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected %s octal validation error, got: %v", tc.field, errs)
+			}
+		})
+	}
+}
+
+func TestHostPredicate_UnmarshalString(t *testing.T) {
+	var hp HostPredicate
+	if err := hp.UnmarshalJSON([]byte(`"macos"`)); err != nil {
+		t.Fatalf("unmarshal string: %v", err)
+	}
+	if len(hp) != 1 || hp[0] != "macos" {
+		t.Errorf("got %v, want [macos]", hp)
+	}
+}
+
+func TestHostPredicate_UnmarshalArray(t *testing.T) {
+	var hp HostPredicate
+	if err := hp.UnmarshalJSON([]byte(`["arch","wsl2"]`)); err != nil {
+		t.Fatalf("unmarshal array: %v", err)
+	}
+	want := []string{"arch", "wsl2"}
+	if len(hp) != len(want) {
+		t.Fatalf("got %v, want %v", hp, want)
+	}
+	for i, w := range want {
+		if hp[i] != w {
+			t.Errorf("hp[%d] = %q, want %q", i, hp[i], w)
+		}
+	}
+}
+
+func TestHostPredicate_RejectsInt(t *testing.T) {
+	var hp HostPredicate
+	if err := hp.UnmarshalJSON([]byte(`42`)); err == nil {
+		t.Error("expected error for numeric host predicate")
+	}
+}
+
+// ─── Updates block (v6) tests ────────────────────────────────────────────────
+
+// TestParseAndValidate_V6MinimalUpdates verifies that a minimal updates block on
+// schemaVersion "6" loads and round-trips through marshal/unmarshal unchanged.
+func TestParseAndValidate_V6MinimalUpdates(t *testing.T) {
+	input := `{
+		"schemaVersion": "6",
+		"packages": [],
+		"updates": {
+			"enabled": true,
+			"interval": "24h",
+			"autoApply": false,
+			"notify": true
+		}
+	}`
+	f, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("unexpected validation errors: %v", errs)
+	}
+	if f.Updates == nil {
+		t.Fatal("expected updates block to be parsed")
+	}
+	if !f.Updates.Enabled || f.Updates.Interval != "24h" || f.Updates.AutoApply || !f.Updates.Notify {
+		t.Errorf("updates block not parsed correctly: %+v", f.Updates)
+	}
+
+	// Round-trip: marshal then re-parse and confirm the same values survive and
+	// still validate cleanly.
+	data, err := json.Marshal(f)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	rt, rtErrs, rtErr := ParseAndValidate(data)
+	if rtErr != nil {
+		t.Fatalf("round-trip fatal error: %v", rtErr)
+	}
+	if len(rtErrs) > 0 {
+		t.Fatalf("round-trip validation errors: %v", rtErrs)
+	}
+	if rt.Updates == nil || rt.Updates.Interval != "24h" || !rt.Updates.Enabled || !rt.Updates.Notify {
+		t.Errorf("round-trip lost updates data: %+v", rt.Updates)
+	}
+}
+
+// TestParseAndValidate_UpdatesBlockRequiresV6 verifies the updates block is
+// rejected on schema versions below v6.
+func TestParseAndValidate_UpdatesBlockRequiresV6(t *testing.T) {
+	input := `{"schemaVersion":"5","packages":[],"updates":{"enabled":false}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "updates" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected updates block rejected on v5, got: %v", errs)
+	}
+}
+
+// TestParseAndValidate_UpdatesInvalidInterval verifies an unparseable interval
+// yields a validation error with an actionable hint.
+func TestParseAndValidate_UpdatesInvalidInterval(t *testing.T) {
+	input := `{"schemaVersion":"6","packages":[],"updates":{"enabled":true,"interval":"soon"}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	var found *ValidationError
+	for i := range errs {
+		if errs[i].Field == "updates.interval" {
+			found = &errs[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("expected updates.interval validation error, got: %v", errs)
+		return
+	}
+	if !strings.Contains(found.Message, "24h") {
+		t.Errorf("expected corrective hint mentioning a valid duration, got: %q", found.Message)
+	}
+}
+
+// TestParseAndValidate_UpdatesNegativeInterval verifies a zero or negative
+// interval is rejected when the checker is enabled.
+func TestParseAndValidate_UpdatesNegativeInterval(t *testing.T) {
+	tests := []struct {
+		name     string
+		interval string
+	}{
+		{"zero", "0s"},
+		{"negative", "-1h"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			input := `{"schemaVersion":"6","packages":[],"updates":{"enabled":true,"interval":"` + tc.interval + `"}}`
+			_, errs, err := ParseAndValidate([]byte(input))
+			if err != nil {
+				t.Fatalf("unexpected fatal error: %v", err)
+			}
+			found := false
+			for _, e := range errs {
+				if e.Field == "updates.interval" {
+					found = true
+				}
+			}
+			if !found {
+				t.Errorf("expected updates.interval error for %q, got: %v", tc.interval, errs)
+			}
+		})
+	}
+}
+
+// TestParseAndValidate_UpdatesMissingIntervalWhenEnabled verifies an enabled
+// checker with no interval is rejected.
+func TestParseAndValidate_UpdatesMissingIntervalWhenEnabled(t *testing.T) {
+	input := `{"schemaVersion":"6","packages":[],"updates":{"enabled":true}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "updates.interval" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected updates.interval required error, got: %v", errs)
+	}
+}
+
+// TestParseAndValidate_UpdatesDisabledSkipsIntervalCheck verifies that when the
+// checker is disabled, an absent or invalid interval is tolerated (nothing runs).
+func TestParseAndValidate_UpdatesDisabledSkipsIntervalCheck(t *testing.T) {
+	input := `{"schemaVersion":"6","packages":[],"updates":{"enabled":false}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("disabled updates block should validate with no interval: %v", errs)
+	}
+}
+
+// TestParseAndValidate_UpdatesUnknownManager verifies filter arrays reject
+// unknown manager names.
+func TestParseAndValidate_UpdatesUnknownManager(t *testing.T) {
+	input := `{"schemaVersion":"6","packages":[],"updates":{"enabled":true,"interval":"24h","onlyManagers":["yum"]}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "updates.onlyManagers[0]" && strings.Contains(e.Message, "yum") {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected unknown manager error, got: %v", errs)
+	}
+}
+
+// TestParseAndValidate_V1ThroughV5StillLoadWithoutUpdates confirms adding v6 did
+// not regress loading of older specs that never carry an updates block.
+func TestParseAndValidate_V1ThroughV5StillLoadWithoutUpdates(t *testing.T) {
+	specs := []string{
+		`{"schemaVersion":"1","packages":[{"id":"git"}]}`,
+		`{"schemaVersion":"2","packages":[],"env":{"FOO":{"value":"bar"}}}`,
+		`{"schemaVersion":"3","packages":[],"shell":{"aliases":{"ll":{"value":"ls -lah"}}}}`,
+		`{"schemaVersion":"4","packages":[],"services":{"svc":{"start":["true"]}}}`,
+		`{"schemaVersion":"5","packages":[],"files":{"dirs":[{"target":"~/.config/foo"}]}}`,
+	}
+	for _, s := range specs {
+		f, errs, err := ParseAndValidate([]byte(s))
+		if err != nil {
+			t.Fatalf("unexpected fatal error for %s: %v", s, err)
+		}
+		if len(errs) > 0 {
+			t.Fatalf("v1-v5 spec should still validate (%s): %v", s, errs)
+		}
+		if f.Updates != nil {
+			t.Errorf("did not expect updates block for %s: %+v", s, f.Updates)
+		}
+	}
+}
+
+func TestParseAndValidate_V6Additive(t *testing.T) {
+	input := `{
+		"schemaVersion": "6",
+		"packages": [],
+		"env": {"FOO": {"value": "bar"}},
+		"shell": {"aliases": {"ll": {"value": "ls -lah"}}},
+		"services": {"svc": {"start": ["true"]}},
+		"files": {"dirs": [{"target": "~/.config/foo"}]},
+		"hooks": {"postApply": [{"command": "echo done"}]},
+		"repo": {"url": "https://github.com/example/dotfiles"},
+		"updates": {
+			"enabled": true,
+			"interval": "24h"
+		}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("v6 additive spec should validate with zero errors, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_UpdatesDisabledUnknownManager(t *testing.T) {
+	input := `{"schemaVersion":"6","packages":[],"updates":{"enabled":false,"onlyManagers":["yum"]}}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "updates.onlyManagers[0]" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected unknown manager error even when disabled, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_UnknownField(t *testing.T) {
+	tests := []struct {
+		name      string
+		json      string
+		wantField string
+		wantKey   string
+	}{
+		{
+			name:      "top-level typo",
+			json:      `{"schemaVersion":"1","packages":[],"enviroment":{"FOO":{"value":"x"}}}`,
+			wantField: "enviroment",
+			wantKey:   "enviroment",
+		},
+		{
+			name:      "package typo",
+			json:      `{"schemaVersion":"1","packages":[{"id":"git","idd":"git"}]}`,
+			wantField: "packages[0].idd",
+			wantKey:   "idd",
+		},
+		{
+			name:      "nested defaults typo",
+			json:      `{"schemaVersion":"8","defaults":{"packges":[]},"targets":{"macos":{"packages":[{"id":"git"}]}}}`,
+			wantField: "defaults.packges",
+			wantKey:   "packges",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, errs, err := ParseAndValidate([]byte(tc.json))
+			if err != nil {
+				t.Fatalf("unexpected fatal error: %v", err)
+			}
+			found := false
+			for _, e := range errs {
+				if e.Field == tc.wantField && strings.Contains(e.Message, tc.wantKey) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				t.Fatalf("expected unknown field %q, got: %v", tc.wantField, errs)
+			}
+		})
+	}
+}
+
+func TestParseAndValidate_DollarSchemaAllowed(t *testing.T) {
+	input := `{"$schema":"https://github.com/ks1686/genv/schema/v8/genv.json","schemaVersion":"1","packages":[]}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	if len(errs) > 0 {
+		t.Fatalf("$schema should be allowed, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_V8EnvTombstoneNotUnknown(t *testing.T) {
+	input := `{
+		"schemaVersion":"8",
+		"defaults":{"env":{"EDITOR":{"value":"vim"}}},
+		"targets":{"macos":{"packages":[{"id":"git"}],"env":{"EDITOR":null}}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	for _, e := range errs {
+		if strings.Contains(e.Message, "unknown field") {
+			t.Fatalf("tombstone should not be unknown field, got: %v", errs)
+		}
+	}
+}
+
+func TestParseAndValidate_LeadingDashPackageID(t *testing.T) {
+	input := `{"schemaVersion":"1","packages":[{"id":"--asdeps"}]}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "packages[0].id" && strings.Contains(e.Message, "invalid package id") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected invalid package id, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_LeadingDashManagerValue(t *testing.T) {
+	input := `{"schemaVersion":"1","packages":[{"id":"git","managers":{"pacman":"--help"}}]}`
+	_, errs, err := ParseAndValidate([]byte(input))
+	if err != nil {
+		t.Fatalf("unexpected fatal error: %v", err)
+	}
+	found := false
+	for _, e := range errs {
+		if e.Field == "packages[0].managers.pacman" && strings.Contains(e.Message, "invalid package name") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("expected invalid package name, got: %v", errs)
+	}
+}
+
+func TestValidPackageName(t *testing.T) {
+	tests := []struct {
+		name string
+		ok   bool
+	}{
+		{"git", true},
+		{"@scope/pkg", true},
+		{"441258766", true},
+		{"python3.12", true},
+		{"--asdeps", false},
+		{"-h", false},
+		{"", false},
+		{"has space", false},
+		{"git\n", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ValidPackageName(tc.name); got != tc.ok {
+				t.Fatalf("ValidPackageName(%q)=%v, want %v", tc.name, got, tc.ok)
+			}
+		})
+	}
+}
+
+func TestValidAdapterName(t *testing.T) {
+	tests := []struct {
+		name string
+		ok   bool
+	}{
+		{"claude-plugin", true},
+		{"gh-extension", true},
+		{"a", true},
+		{"a1", true},
+		{"", false},
+		{"Brew", false},
+		{"1gh", false},
+		{"gh_extension", false},
+		{"gh extension", false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ValidAdapterName(tc.name); got != tc.ok {
+				t.Fatalf("ValidAdapterName(%q)=%v, want %v", tc.name, got, tc.ok)
+			}
+		})
+	}
+}
+
+func TestParseAndValidate_V8AdaptersAcceptCustomPrefer(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "adapters":{
+	    "claude-plugin":{
+	      "list":"claude plugin list --json",
+	      "install":"claude plugin install {{id}} --scope user",
+	      "remove":"claude plugin uninstall {{id}}",
+	      "upgrade":"claude plugin update {{id}}",
+	      "idField":"name",
+	      "versionField":"version"
+	    }
+	  },
+	  "targets":{
+	    "macos":{
+	      "packages":[{"id":"slack@claude-plugins-official","prefer":"claude-plugin"}]
+	    }
+	  }
+	}`
+	f, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil || len(errs) > 0 {
+		t.Fatalf("unexpected: err=%v errs=%v", err, errs)
+	}
+	if _, ok := f.Adapters["claude-plugin"]; !ok {
+		t.Fatal("expected claude-plugin adapter")
+	}
+	if !KnownManager(f, "claude-plugin") {
+		t.Fatal("KnownManager should accept spec adapter")
+	}
+	if KnownManager(f, "not-a-manager") {
+		t.Fatal("KnownManager should reject unknown names")
+	}
+}
+
+func TestParseAndValidate_AdaptersRequireV8(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"7",
+	  "packages":[],
+	  "adapters":{
+	    "claude-plugin":{
+	      "list":"claude plugin list",
+	      "install":"claude plugin install {{id}}",
+	      "remove":"claude plugin uninstall {{id}}"
+	    }
+	  }
+	}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasValidationField(errs, "adapters") {
+		t.Fatalf("expected adapters to require v8, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_AdapterRejectsBuiltinName(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "adapters":{
+	    "brew":{
+	      "list":"brew list",
+	      "install":"brew install {{id}}",
+	      "remove":"brew uninstall {{id}}"
+	    }
+	  },
+	  "targets":{"macos":{"packages":[]}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasValidationField(errs, "adapters.brew") {
+		t.Fatalf("expected collision error, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_AdapterRequiresCommands(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "adapters":{"gh-extension":{"list":"","install":"gh extension install {{id}}"}},
+	  "targets":{"macos":{"packages":[]}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasValidationField(errs, "adapters.gh-extension.list") {
+		t.Fatalf("expected missing list, got: %v", errs)
+	}
+	if !hasValidationField(errs, "adapters.gh-extension.remove") {
+		t.Fatalf("expected missing remove, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_AdapterUnknownField(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "adapters":{
+	    "gh-extension":{
+	      "list":"gh extension list",
+	      "install":"gh extension install {{id}}",
+	      "remove":"gh extension remove {{id}}",
+	      "shell":"true"
+	    }
+	  },
+	  "targets":{"macos":{"packages":[]}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasValidationField(errs, "adapters.gh-extension.shell") {
+		t.Fatalf("expected unknown field, got: %v", errs)
+	}
+}
+
+func TestParseAndValidate_AdapterInvalidListMatch(t *testing.T) {
+	raw := `{
+	  "schemaVersion":"8",
+	  "adapters":{
+	    "gh-extension":{
+	      "list":"gh extension list",
+	      "install":"gh extension install {{id}}",
+	      "remove":"gh extension remove {{id}}",
+	      "listMatch":"("
+	    }
+	  },
+	  "targets":{"macos":{"packages":[]}}
+	}`
+	_, errs, err := ParseAndValidate([]byte(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasValidationField(errs, "adapters.gh-extension.listMatch") {
+		t.Fatalf("expected invalid listMatch, got: %v", errs)
 	}
 }

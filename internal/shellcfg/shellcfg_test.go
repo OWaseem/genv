@@ -3,6 +3,7 @@ package shellcfg
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -19,6 +20,8 @@ func TestSingleQuote(t *testing.T) {
 	}{
 		{"simple", "'simple'"},
 		{"it's a test", `'it'\''s a test'`},
+		{"'leading", `''\''leading'`},
+		{"trailing'", `'trailing'\'''`},
 		{"", "''"},
 	}
 	for _, c := range cases {
@@ -44,6 +47,15 @@ func TestWriteFragment_Aliases(t *testing.T) {
 	if err := WriteFragment(path, cfg); err != nil {
 		t.Fatalf("WriteFragment: %v", err)
 	}
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		if got := info.Mode().Perm(); got != 0o600 {
+			t.Fatalf("fragment mode = %o, want 0600", got)
+		}
+	}
 
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -59,6 +71,28 @@ func TestWriteFragment_Aliases(t *testing.T) {
 	}
 	if !strings.Contains(content, "'ls -la'") {
 		t.Error("expected single-quoted value for ll")
+	}
+}
+
+func TestWriteFragment_SourceQuoted(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shell.sh")
+	cfg := &schema.ShellConfig{
+		Source: []string{`/tmp/source';echo pwned #.sh`},
+	}
+	if err := WriteFragment(path, cfg); err != nil {
+		t.Fatalf("WriteFragment: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("ReadFile: %v", err)
+	}
+	content := string(data)
+	if strings.Contains(content, ". /tmp/source';echo pwned #.sh") {
+		t.Fatalf("source path should be quoted, got:\n%s", content)
+	}
+	if !strings.Contains(content, ". '/tmp/source'\\'';echo pwned #.sh'") {
+		t.Fatalf("missing quoted source line, got:\n%s", content)
 	}
 }
 
@@ -138,7 +172,7 @@ func TestWriteFragment_Source(t *testing.T) {
 	}
 
 	data, _ := os.ReadFile(path)
-	if !strings.Contains(string(data), ". /path/to/script.sh") {
+	if !strings.Contains(string(data), ". '/path/to/script.sh'") {
 		t.Error("expected source line in fragment")
 	}
 }
@@ -162,6 +196,44 @@ func TestWriteFragment_Empty_RemovesFile(t *testing.T) {
 	}
 }
 
+func TestWriteFragment_SkipsPowerShellTargets(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "shell.sh")
+	cfg := &schema.ShellConfig{
+		Aliases: map[string]schema.ShellAlias{
+			"ll": {Value: "Get-ChildItem", Shell: "powershell"},
+			"gs": {Value: "git status"},
+		},
+	}
+	if err := WriteFragment(path, cfg); err != nil {
+		t.Fatalf("WriteFragment: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := string(data)
+	if strings.Contains(got, "Get-ChildItem") || strings.Contains(got, "powershell") {
+		t.Errorf("powershell alias leaked into POSIX fragment:\n%s", got)
+	}
+	if !strings.Contains(got, "alias gs=") {
+		t.Errorf("missing POSIX alias:\n%s", got)
+	}
+
+	// PowerShell-only config should remove the fragment.
+	cfg = &schema.ShellConfig{
+		Aliases: map[string]schema.ShellAlias{
+			"ll": {Value: "Get-ChildItem", Shell: "powershell"},
+		},
+	}
+	if err := WriteFragment(path, cfg); err != nil {
+		t.Fatalf("WriteFragment PS-only: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Error("expected PS-only fragment to be removed")
+	}
+}
+
 func TestWriteFragment_Deterministic(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "shell.sh")
@@ -182,7 +254,7 @@ func TestWriteFragment_Deterministic(t *testing.T) {
 	iAAA := strings.Index(content, "alias aaa=")
 	iMMM := strings.Index(content, "alias mmm=")
 	iZZZ := strings.Index(content, "alias zzz=")
-	if !(iAAA < iMMM && iMMM < iZZZ) {
+	if iAAA >= iMMM || iMMM >= iZZZ {
 		t.Errorf("fragment not sorted: aaa@%d mmm@%d zzz@%d", iAAA, iMMM, iZZZ)
 	}
 }
@@ -290,6 +362,7 @@ func TestSpecToLock_Roundtrip(t *testing.T) {
 	lsc := SpecToLock(spec)
 	if lsc == nil {
 		t.Fatal("expected non-nil LockedShellConfig")
+		return
 	}
 	if len(lsc.Aliases) != 1 || lsc.Aliases[0].Name != "ll" || lsc.Aliases[0].Value != "ls -la" {
 		t.Errorf("alias roundtrip failed: %+v", lsc.Aliases)
@@ -337,7 +410,7 @@ func TestApplyShell_Success(t *testing.T) {
 			t.Errorf("ReadFile(%s): %v", rc, err)
 			continue
 		}
-		if !strings.Contains(string(data), ". "+fragPath) {
+		if !strings.Contains(string(data), ". '"+fragPath+"'") {
 			t.Errorf("rc file %s does not contain injected source line", rc)
 		}
 	}

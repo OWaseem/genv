@@ -3,13 +3,75 @@ package resolver
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
+	"os/exec"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ks1686/genv/internal/adapter"
 	"github.com/ks1686/genv/internal/genvfile"
 	"github.com/ks1686/genv/internal/schema"
+	"github.com/ks1686/genv/internal/testutil"
 )
+
+func cheapSuccessCmd() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"cmd", "/c", "exit", "0"}
+	}
+	return []string{"true"}
+}
+
+func TestRunSubcmd_EmptyArgv(t *testing.T) {
+	err := runSubcmd(context.Background(), nil, nil, &bytes.Buffer{}, &bytes.Buffer{})
+	if err == nil {
+		t.Fatal("expected empty argv to fail")
+	}
+	if !strings.Contains(err.Error(), "empty command") {
+		t.Fatalf("error = %v, want empty command", err)
+	}
+}
+
+func TestRunSubcmd_PerSpawnTimeout(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not in PATH")
+	}
+	ctx := WithSubprocessTimeout(context.Background(), 2*time.Second)
+	err := runSubcmd(ctx, []string{"sleep", "5"}, nil, io.Discard, io.Discard)
+	if err == nil {
+		t.Fatal("expected sleep to hit per-spawn timeout")
+	}
+	// Do not use `go env` here: parallel `go test ./...` can lock the
+	// toolchain, and Windows then reports a killed spawn as exit status 1.
+	// `true` is also unreliable on Windows CI (LookPath can find a non-POSIX
+	// true.exe that exits 1).
+	if err := runSubcmd(ctx, cheapSuccessCmd(), nil, io.Discard, io.Discard); err != nil {
+		t.Fatalf("later command after a timed-out spawn: %v", err)
+	}
+}
+
+func TestExecuteApply_TimeoutDoesNotSkipLaterPackages(t *testing.T) {
+	if _, err := exec.LookPath("sleep"); err != nil {
+		t.Skip("sleep not in PATH")
+	}
+	ctx := WithSubprocessTimeout(context.Background(), 2*time.Second)
+	result := ReconcileResult{
+		ToInstall: []Action{
+			{Pkg: schema.Package{ID: "hang"}, Manager: "test", PkgName: "hang", Cmd: []string{"sleep", "20"}},
+			{Pkg: schema.Package{ID: "ok"}, Manager: "test", PkgName: "ok", Cmd: cheapSuccessCmd()},
+		},
+	}
+	got := ExecuteApply(ctx, result, nil, io.Discard, io.Discard)
+	if len(got.Errors) == 0 {
+		t.Fatal("expected hang to error")
+	}
+	if len(got.Installed) != 1 || got.Installed[0].ID != "ok" {
+		t.Fatalf("Installed=%+v, want ok after hang", got.Installed)
+	}
+}
 
 func TestPlan_PreferredManagerAvailable(t *testing.T) {
 	f := &schema.GenvFile{
@@ -178,7 +240,7 @@ func TestPrintPlan_ShowsInstallCommand(t *testing.T) {
 			{ID: "git"},
 		},
 	}
-	actions := Plan(f, map[string]bool{"brew": true})
+	actions := planOnGOOS(f, map[string]bool{"brew": true}, "darwin")
 	var sb strings.Builder
 	PrintPlan(actions, &sb)
 	out := sb.String()
@@ -237,6 +299,308 @@ func TestPlanInstall_AllManagers(t *testing.T) {
 		if args[len(args)-1] != tc.pkg {
 			t.Errorf("PlanInstall(%q, %q): last arg = %q, want pkg name", tc.mgr, tc.pkg, args[len(args)-1])
 		}
+	}
+}
+
+func TestPlanUpgrade_SkipsUnavailableManagers(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	packages := []genvfile.LockedPackage{
+		{ID: "git", Manager: "brew", PkgName: "git"},
+	}
+
+	plan, skipped := PlanUpgrade(packages)
+
+	if len(plan) != 0 {
+		t.Fatalf("expected no upgrade actions for unavailable brew, got %v", plan)
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("expected 1 skipped package, got %d", len(skipped))
+	}
+	if skipped[0].ID != "git" || skipped[0].Manager != "brew" {
+		t.Fatalf("skipped = %#v, want git via brew", skipped[0])
+	}
+	if skipped[0].Reason != `manager "brew" is not available` {
+		t.Fatalf("skipped reason = %q, want manager not available", skipped[0].Reason)
+	}
+}
+
+func TestPlanUpgrade_SkipsMissingManagers(t *testing.T) {
+	testutil.InstallFakeBinary(t, "brew", "exit 0")
+	packages := []genvfile.LockedPackage{
+		{ID: "git", Manager: "brew", PkgName: "git"},
+		{ID: "legacy", Manager: "yum", PkgName: "legacy"},
+	}
+
+	plan, skipped := PlanUpgrade(packages)
+
+	if len(plan) != 1 {
+		t.Fatalf("expected 1 upgrade action, got %d", len(plan))
+	}
+	if len(skipped) != 1 {
+		t.Fatalf("expected 1 skipped package, got %d", len(skipped))
+	}
+	if len(plan[0].LPs) != 1 || plan[0].LPs[0].ID != "git" {
+		t.Fatalf("expected git upgrade action, got %v", plan[0].LPs)
+	}
+	if got := skipped[0].ID; got != "legacy" {
+		t.Fatalf("expected legacy to be skipped, got %q", got)
+	}
+}
+
+func TestPlanUpgrade_BatchesSameManager(t *testing.T) {
+	testutil.InstallFakeBinary(t, "brew", "exit 0")
+	testutil.InstallFakeBinary(t, "uv", "exit 0")
+	packages := []genvfile.LockedPackage{
+		{ID: "git", Manager: "brew", PkgName: "git"},
+		{ID: "neovim", Manager: "brew", PkgName: "neovim"},
+		{ID: "ruff", Manager: "uv", PkgName: "ruff"},
+	}
+
+	plan, skipped := PlanUpgrade(packages)
+	if len(skipped) != 0 {
+		t.Fatalf("expected no skipped packages, got %v", skipped)
+	}
+	if len(plan) != 2 {
+		t.Fatalf("expected 2 upgrade actions (brew batch + uv single), got %d", len(plan))
+	}
+
+	// Brew packages should be batched into one action.
+	brewAction := plan[0]
+	if len(brewAction.LPs) != 2 {
+		t.Fatalf("expected brew action with 2 packages, got %d", len(brewAction.LPs))
+	}
+	if brewAction.LPs[0].ID != "git" || brewAction.LPs[1].ID != "neovim" {
+		t.Errorf("expected brew action ids [git neovim], got %v", brewAction.LPs)
+	}
+	want := []string{"brew", "upgrade", "git", "neovim"}
+	if len(brewAction.Cmd) != len(want) {
+		t.Fatalf("brew command: got %v, want %v", brewAction.Cmd, want)
+	}
+	for i, w := range want {
+		if brewAction.Cmd[i] != w {
+			t.Errorf("brew command[%d] = %q, want %q", i, brewAction.Cmd[i], w)
+		}
+	}
+
+	// uv is not a BatchUpgrader, so it stays single-package.
+	uvAction := plan[1]
+	if len(uvAction.LPs) != 1 || uvAction.LPs[0].ID != "ruff" {
+		t.Fatalf("expected uv action with [ruff], got %v", uvAction.LPs)
+	}
+	if len(uvAction.Cmd) == 0 || uvAction.Cmd[0] != "uv" {
+		t.Fatalf("expected uv upgrade command, got %v", uvAction.Cmd)
+	}
+}
+
+func TestPlanUpgrade_PreservesManagerOrder(t *testing.T) {
+	testutil.InstallFakeBinary(t, "snap", "exit 0")
+	testutil.InstallFakeBinary(t, "brew", "exit 0")
+	packages := []genvfile.LockedPackage{
+		{ID: "a", Manager: "snap", PkgName: "a"},
+		{ID: "b", Manager: "brew", PkgName: "b"},
+		{ID: "c", Manager: "snap", PkgName: "c"},
+	}
+
+	plan, _ := PlanUpgrade(packages)
+	if len(plan) != 2 {
+		t.Fatalf("expected 2 actions, got %d", len(plan))
+	}
+	if plan[0].Mgr.Name() != "snap" {
+		t.Errorf("expected first action manager snap, got %q", plan[0].Mgr.Name())
+	}
+	if plan[1].Mgr.Name() != "brew" {
+		t.Errorf("expected second action manager brew, got %q", plan[1].Mgr.Name())
+	}
+}
+
+func TestExecuteUpgrade_BatchUsesVersionLister(t *testing.T) {
+	mgr := &testBatchVersionListerMgr{versions: map[string]string{"git": "2.45.0", "neovim": "0.10.0"}}
+	plan := []UpgradeAction{
+		{
+			LPs: []genvfile.LockedPackage{
+				{ID: "git", Manager: "batchmgr", PkgName: "git", InstalledVersion: "2.44.0"},
+				{ID: "neovim", Manager: "batchmgr", PkgName: "neovim", InstalledVersion: "0.9.0"},
+			},
+			Mgr: mgr,
+			Cmd: []string{"true"},
+		},
+	}
+
+	out := ExecuteUpgrade(context.Background(), plan, nil, &bytes.Buffer{}, &bytes.Buffer{})
+	if len(out.Errors) != 0 {
+		t.Fatalf("expected no errors, got %v", out.Errors)
+	}
+	if len(out.Upgraded) != 2 {
+		t.Fatalf("expected 2 upgraded packages, got %d", len(out.Upgraded))
+	}
+	if mgr.listCalls != 1 {
+		t.Fatalf("expected 1 ListInstalledVersions call, got %d", mgr.listCalls)
+	}
+	versions := map[string]string{}
+	for _, lp := range out.Upgraded {
+		versions[lp.ID] = lp.InstalledVersion
+	}
+	if versions["git"] != "2.45.0" {
+		t.Errorf("git version = %q, want %q", versions["git"], "2.45.0")
+	}
+	if versions["neovim"] != "0.10.0" {
+		t.Errorf("neovim version = %q, want %q", versions["neovim"], "0.10.0")
+	}
+}
+
+func TestExecuteUpgrade_PartialFailureStillUpdatesChangedVersions(t *testing.T) {
+	// Given: a failed batch command whose version query shows one package changed anyway.
+	mgr := &testBatchVersionListerMgr{versions: map[string]string{"git": "2.45.0", "neovim": "0.9.0"}}
+	plan := []UpgradeAction{
+		{
+			LPs: []genvfile.LockedPackage{
+				{ID: "git", Manager: "batchmgr", PkgName: "git", InstalledVersion: "2.44.0"},
+				{ID: "neovim", Manager: "batchmgr", PkgName: "neovim", InstalledVersion: "0.9.0"},
+			},
+			Mgr: mgr,
+			Cmd: []string{"false"},
+		},
+	}
+
+	// When: the batch executes.
+	out := ExecuteUpgrade(context.Background(), plan, nil, &bytes.Buffer{}, &bytes.Buffer{})
+
+	// Then: the legacy error and typed action failure are both retained.
+	if len(out.Errors) != 1 {
+		t.Fatalf("expected 1 error, got %d", len(out.Errors))
+	}
+	if len(out.Failures) != 1 {
+		t.Fatalf("expected 1 typed failure, got %d", len(out.Failures))
+	}
+	if !slices.Equal(out.Failures[0].IDs, []string{"git", "neovim"}) {
+		t.Fatalf("failure IDs = %v, want [git neovim]", out.Failures[0].IDs)
+	}
+	if out.Failures[0].Err == nil || out.Failures[0].Err.Error() != out.Errors[0].Error() {
+		t.Fatalf("typed failure error = %v, legacy error = %v", out.Failures[0].Err, out.Errors[0])
+	}
+	if len(out.Upgraded) != 1 {
+		t.Fatalf("expected 1 upgraded package (git), got %d", len(out.Upgraded))
+	}
+	if out.Upgraded[0].ID != "git" || out.Upgraded[0].InstalledVersion != "2.45.0" {
+		t.Errorf("expected upgraded git 2.45.0, got %v", out.Upgraded[0])
+	}
+}
+
+// testBatchVersionListerMgr is a minimal adapter implementing BatchUpgrader and
+// VersionLister for resolver-level upgrade tests.
+type testBatchVersionListerMgr struct {
+	versions  map[string]string
+	listCalls int
+}
+
+func (m *testBatchVersionListerMgr) Name() string { return "batchmgr" }
+
+func (m *testBatchVersionListerMgr) Available() bool { return true }
+
+func (m *testBatchVersionListerMgr) NormalizeID(id string, _ map[string]string) (string, bool) {
+	return id, false
+}
+
+func (m *testBatchVersionListerMgr) PlanInstall(pkgName string) []string {
+	return []string{"install", pkgName}
+}
+
+func (m *testBatchVersionListerMgr) PlanUninstall(pkgName string) []string {
+	return []string{"uninstall", pkgName}
+}
+
+func (m *testBatchVersionListerMgr) PlanUpgrade(pkgName string) []string {
+	return []string{"upgrade", pkgName}
+}
+
+func (m *testBatchVersionListerMgr) PlanUpgradeBatch(pkgNames []string) []string {
+	return append([]string{"upgrade-batch"}, pkgNames...)
+}
+
+func (m *testBatchVersionListerMgr) PlanClean() [][]string { return nil }
+
+func (m *testBatchVersionListerMgr) Query(pkgName string) (bool, error) {
+	_, ok := m.versions[pkgName]
+	return ok, nil
+}
+
+func (m *testBatchVersionListerMgr) ListInstalled() ([]string, error) {
+	var names []string
+	for name := range m.versions {
+		names = append(names, name)
+	}
+	return names, nil
+}
+
+func (m *testBatchVersionListerMgr) QueryVersion(pkgName string) (string, error) {
+	return m.versions[pkgName], nil
+}
+
+func (m *testBatchVersionListerMgr) ListInstalledVersions() (map[string]string, error) {
+	m.listCalls++
+	return m.versions, nil
+}
+
+func TestFillMissingInstalledVersions_UsesVersionListerInventory(t *testing.T) {
+	mgr := &testBatchVersionListerMgr{versions: map[string]string{
+		"git":     "2.45.0",
+		"ripgrep": "14.1.0",
+	}}
+	orig := adapter.All
+	adapter.All = append([]adapter.Adapter{mgr}, orig...)
+	t.Cleanup(func() { adapter.All = orig })
+
+	pkgs := []genvfile.LockedPackage{
+		{ID: "git", Manager: "batchmgr", PkgName: "git"},
+		{ID: "ripgrep", Manager: "batchmgr", PkgName: "ripgrep", InstalledVersion: "13.0.0"},
+		{ID: "neovim", Manager: "batchmgr", PkgName: "neovim"},
+		{ID: "curl", Manager: "not-a-manager", PkgName: "curl"},
+	}
+	FillMissingInstalledVersions(pkgs)
+	if mgr.listCalls != 1 {
+		t.Fatalf("ListInstalledVersions calls = %d, want 1", mgr.listCalls)
+	}
+	if pkgs[0].InstalledVersion != "2.45.0" {
+		t.Errorf("git = %q, want 2.45.0", pkgs[0].InstalledVersion)
+	}
+	if pkgs[1].InstalledVersion != "13.0.0" {
+		t.Errorf("ripgrep = %q, want existing 13.0.0", pkgs[1].InstalledVersion)
+	}
+	if pkgs[2].InstalledVersion != "" {
+		t.Errorf("neovim = %q, want empty (absent from inventory)", pkgs[2].InstalledVersion)
+	}
+	if pkgs[3].InstalledVersion != "" {
+		t.Errorf("curl = %q, want empty (unknown manager)", pkgs[3].InstalledVersion)
+	}
+}
+
+func TestReconcile_RemovalPathSkipsMissingManagers(t *testing.T) {
+	result := Reconcile(
+		nil,
+		[]genvfile.LockedPackage{
+			{ID: "git", Manager: "brew", PkgName: "git"},
+			{ID: "legacy", Manager: "yum", PkgName: "legacy"},
+		},
+		map[string]bool{"brew": true},
+	)
+
+	if len(result.ToRemove) != 1 {
+		t.Fatalf("expected 1 removal action, got %d", len(result.ToRemove))
+	}
+	if got := result.ToRemove[0].Pkg.ID; got != "git" {
+		t.Fatalf("expected git removal action, got %q", got)
+	}
+	if got := result.ToRemove[0].Manager; got != "brew" {
+		t.Fatalf("expected brew removal action, got %q", got)
+	}
+	if len(result.Unchanged) != 1 {
+		t.Fatalf("expected missing manager to stay locked, got %d unchanged", len(result.Unchanged))
+	}
+	if got := result.Unchanged[0].ID; got != "legacy" {
+		t.Fatalf("expected legacy to remain in lock, got %q", got)
+	}
+	if len(result.Warnings) != 1 {
+		t.Fatalf("expected 1 warning, got %d: %v", len(result.Warnings), result.Warnings)
 	}
 }
 
@@ -398,7 +762,7 @@ func TestPrintPlan_ReturnsCorrectCounts(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &schema.GenvFile{Packages: tc.pkgs}
-			actions := Plan(f, tc.available)
+			actions := planOnGOOS(f, tc.available, "darwin")
 			var sb strings.Builder
 			resolved, unresolved := PrintPlan(actions, &sb)
 			if resolved != tc.wantResolved {
@@ -435,7 +799,7 @@ func TestPlan_MultiplePackagesMixed(t *testing.T) {
 	// prefer is snap (unavailable) and its managers map has only snap
 	// (unavailable), so it falls back to the generic fallback at step 3 (brew).
 	available := map[string]bool{"brew": true}
-	actions := Plan(f, available)
+	actions := planOnGOOS(f, available, "darwin")
 	if len(actions) != 3 {
 		t.Fatalf("expected 3 actions, got %d", len(actions))
 	}
@@ -605,6 +969,145 @@ func TestReconcile_NewPackage_ToInstall(t *testing.T) {
 	}
 }
 
+func TestReconcileWith_NilLive_SameAsReconcile(t *testing.T) {
+	desired := []schema.Package{{ID: "git"}}
+	got := ReconcileWith(desired, nil, map[string]bool{"brew": true}, nil)
+	want := Reconcile(desired, nil, map[string]bool{"brew": true})
+	if len(got.ToInstall) != len(want.ToInstall) || len(got.Adopted) != 0 {
+		t.Fatalf("nil live: ToInstall=%d Adopted=%d, want ToInstall=%d Adopted=0",
+			len(got.ToInstall), len(got.Adopted), len(want.ToInstall))
+	}
+}
+
+func TestReconcileWith_LiveInstalled_NotInLock_Adopts(t *testing.T) {
+	desired := []schema.Package{{
+		ID:       "cursor",
+		Managers: map[string]string{"winget": "Anysphere.Cursor"},
+	}}
+	live := LiveSet{"winget": {"Anysphere.Cursor": true}}
+	got := ReconcileWith(desired, nil, map[string]bool{"winget": true}, live)
+	if len(got.ToInstall) != 0 {
+		t.Fatalf("ToInstall=%d, want 0 (already installed)", len(got.ToInstall))
+	}
+	if len(got.Adopted) != 1 {
+		t.Fatalf("Adopted=%d, want 1", len(got.Adopted))
+	}
+	if got.Adopted[0].ID != "cursor" || got.Adopted[0].Manager != "winget" || got.Adopted[0].PkgName != "Anysphere.Cursor" {
+		t.Fatalf("Adopted[0]=%+v, want cursor/winget/Anysphere.Cursor", got.Adopted[0])
+	}
+}
+
+func TestReconcileWith_LiveMissing_StillInstalls(t *testing.T) {
+	desired := []schema.Package{{
+		ID:       "syncthing",
+		Managers: map[string]string{"winget": "Syncthing.Syncthing"},
+	}}
+	live := LiveSet{"winget": {"Anysphere.Cursor": true}}
+	got := ReconcileWith(desired, nil, map[string]bool{"winget": true}, live)
+	if len(got.ToInstall) != 1 || got.ToInstall[0].Pkg.ID != "syncthing" {
+		t.Fatalf("ToInstall=%v, want syncthing", got.ToInstall)
+	}
+	if len(got.Adopted) != 0 {
+		t.Fatalf("Adopted=%d, want 0", len(got.Adopted))
+	}
+}
+
+func TestReconcileWith_LiveMatchIsCaseInsensitive(t *testing.T) {
+	desired := []schema.Package{{
+		ID:       "cursor",
+		Managers: map[string]string{"winget": "Anysphere.Cursor"},
+	}}
+	live := LiveSet{"winget": {"anysphere.cursor": true}}
+	got := ReconcileWith(desired, nil, map[string]bool{"winget": true}, live)
+	if len(got.Adopted) != 1 {
+		t.Fatalf("Adopted=%d, want 1 for case-insensitive live match", len(got.Adopted))
+	}
+}
+
+func TestLoadLiveSet_NoManagers(t *testing.T) {
+	got, warns := LoadLiveSet(nil)
+	if len(got) != 0 || len(warns) != 0 {
+		t.Fatalf("got %#v warns %v, want empty", got, warns)
+	}
+}
+
+func TestLoadLiveSet_UnavailableManagerSkipped(t *testing.T) {
+	got, _ := LoadLiveSet(map[string]bool{"not-a-manager": true})
+	if len(got) != 0 {
+		t.Fatalf("got %#v, want empty", got)
+	}
+}
+
+func TestLoadLiveSet_FalseAvailabilitySkipped(t *testing.T) {
+	got, warns := LoadLiveSet(map[string]bool{"brew": false})
+	if len(got) != 0 || len(warns) != 0 {
+		t.Fatalf("got %#v warns %v, want empty", got, warns)
+	}
+}
+
+func TestLoadLiveSetOnly_EmptyOnlyListsNothing(t *testing.T) {
+	got, warns := LoadLiveSetOnly(map[string]bool{"brew": true}, map[string]bool{})
+	if len(got) != 0 || len(warns) != 0 {
+		t.Fatalf("got %#v warns %v, want empty when no managers were requested", got, warns)
+	}
+}
+
+func TestManagersToList_EmptyPackages(t *testing.T) {
+	got := ManagersToList(nil, nil, map[string]bool{"brew": true, "composer": true})
+	if len(got) != 0 {
+		t.Fatalf("got %v, want no managers for an empty spec", got)
+	}
+}
+
+func TestManagersToList_UnlockedPrefer(t *testing.T) {
+	pkgs := []schema.Package{{ID: "git", Prefer: "brew"}}
+	got := ManagersToList(pkgs, nil, map[string]bool{"brew": true})
+	if !got["brew"] {
+		t.Fatalf("got %v, want brew for an unlocked preferred package", got)
+	}
+}
+
+func TestManagersToList_SkipsLocked(t *testing.T) {
+	pkgs := []schema.Package{{ID: "git", Prefer: "brew"}}
+	locked := []genvfile.LockedPackage{{ID: "git", Manager: "brew", PkgName: "git"}}
+	got := ManagersToList(pkgs, locked, map[string]bool{"brew": true})
+	if len(got) != 0 {
+		t.Fatalf("got %v, want none for a package already in the lock", got)
+	}
+}
+
+func TestCallTimed_Timeout(t *testing.T) {
+	started := time.Now()
+	_, err := CallTimed(func() ([]string, error) {
+		time.Sleep(time.Hour)
+		return []string{"x"}, nil
+	}, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout")
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %v, want timed out", err)
+	}
+	if time.Since(started) > 2*time.Second {
+		t.Fatalf("timeout took %s, want well under 2s", time.Since(started))
+	}
+}
+
+func TestPrintReconcilePlan_ShowsAdopted(t *testing.T) {
+	var buf bytes.Buffer
+	result := ReconcileResult{
+		Adopted: []genvfile.LockedPackage{{ID: "cursor", Manager: "winget", PkgName: "Anysphere.Cursor"}},
+	}
+	_, _, _ = PrintReconcilePlan(result, &buf)
+	out := buf.String()
+	if !strings.Contains(out, "already installed") || !strings.Contains(out, "cursor") {
+		t.Fatalf("plan = %q, want adopted cursor", out)
+	}
+	if !strings.Contains(out, "1 already installed") {
+		t.Fatalf("plan = %q, want summary count", out)
+	}
+}
+
 // TestReconcile_RemovedPackage_ToRemove verifies that a package in the lock
 // but absent from the spec ends up in ToRemove.
 func TestReconcile_RemovedPackage_ToRemove(t *testing.T) {
@@ -754,6 +1257,10 @@ func TestPrintReconcilePlan_NothingToDo(t *testing.T) {
 	if toInstall != 0 || toRemove != 0 || unresolved != 0 {
 		t.Errorf("expected all zeros, got install=%d remove=%d unresolved=%d", toInstall, toRemove, unresolved)
 	}
+	out := sb.String()
+	if !strings.Contains(out, "0 packages") {
+		t.Errorf("expected output to contain \"0 packages\", got %q", out)
+	}
 }
 
 // TestPrintReconcilePlan_AllResolved verifies no "unresolved" hint is emitted
@@ -871,14 +1378,67 @@ func TestExecuteApply_SuccessfulRemoval(t *testing.T) {
 	}
 }
 
+func TestExecuteApply_AlreadyAbsentUninstallIsSuccess(t *testing.T) {
+	orig := adapter.All
+	adapter.All = append([]adapter.Adapter{absentQueryMgr{}}, orig...)
+	t.Cleanup(func() { adapter.All = orig })
+
+	result := ReconcileResult{
+		ToRemove: []Action{
+			{
+				Pkg:          schema.Package{ID: "copilot-cli"},
+				Manager:      "absent-query-mgr",
+				PkgName:      "copilot-cli",
+				UninstallCmd: []string{"false"},
+			},
+		},
+	}
+	exec := ExecuteApply(context.Background(), result, nil, io.Discard, io.Discard)
+	if len(exec.Errors) != 0 {
+		t.Fatalf("already-absent uninstall should not error: %v", exec.Errors)
+	}
+	if len(exec.Uninstalled) != 1 || exec.Uninstalled[0] != "copilot-cli" {
+		t.Fatalf("Uninstalled = %v, want [copilot-cli]", exec.Uninstalled)
+	}
+}
+
+type absentQueryMgr struct{}
+
+func (absentQueryMgr) Name() string    { return "absent-query-mgr" }
+func (absentQueryMgr) Available() bool { return true }
+func (absentQueryMgr) NormalizeID(id string, _ map[string]string) (string, bool) {
+	return id, false
+}
+func (absentQueryMgr) PlanInstall(pkgName string) []string   { return []string{"true"} }
+func (absentQueryMgr) PlanUninstall(pkgName string) []string { return []string{"false"} }
+func (absentQueryMgr) PlanUpgrade(pkgName string) []string   { return []string{"true"} }
+func (absentQueryMgr) PlanClean() [][]string                 { return nil }
+func (absentQueryMgr) Query(string) (bool, error)            { return false, nil }
+func (absentQueryMgr) ListInstalled() ([]string, error)      { return nil, nil }
+func (absentQueryMgr) QueryVersion(string) (string, error)   { return "", nil }
+
+type presentQueryMgr struct{ absentQueryMgr }
+
+func (presentQueryMgr) Name() string               { return "present-query-mgr" }
+func (presentQueryMgr) Query(string) (bool, error) { return true, nil }
+
+type errorQueryMgr struct{ absentQueryMgr }
+
+func (errorQueryMgr) Name() string               { return "error-query-mgr" }
+func (errorQueryMgr) Query(string) (bool, error) { return false, errors.New("query timed out") }
+
 // TestExecuteApply_FailedRemoval verifies that a failed removal produces an
 // error and the package is NOT in Uninstalled.
 func TestExecuteApply_FailedRemoval(t *testing.T) {
+	orig := adapter.All
+	adapter.All = append([]adapter.Adapter{presentQueryMgr{}}, orig...)
+	t.Cleanup(func() { adapter.All = orig })
+
 	result := ReconcileResult{
 		ToRemove: []Action{
 			{
 				Pkg:          schema.Package{ID: "stuck-pkg"},
-				Manager:      "snap",
+				Manager:      "present-query-mgr",
 				PkgName:      "stuck-pkg",
 				UninstallCmd: []string{"false"},
 			},
@@ -891,6 +1451,30 @@ func TestExecuteApply_FailedRemoval(t *testing.T) {
 	}
 	if len(exec.Uninstalled) != 0 {
 		t.Errorf("Uninstalled: got %v, want empty (failed removal must not appear)", exec.Uninstalled)
+	}
+}
+
+func TestExecuteApply_QueryErrorDoesNotTreatFailedUninstallAsSuccess(t *testing.T) {
+	orig := adapter.All
+	adapter.All = append([]adapter.Adapter{errorQueryMgr{}}, orig...)
+	t.Cleanup(func() { adapter.All = orig })
+
+	result := ReconcileResult{
+		ToRemove: []Action{
+			{
+				Pkg:          schema.Package{ID: "stuck-pkg"},
+				Manager:      "error-query-mgr",
+				PkgName:      "stuck-pkg",
+				UninstallCmd: []string{"false"},
+			},
+		},
+	}
+	exec := ExecuteApply(context.Background(), result, nil, io.Discard, io.Discard)
+	if len(exec.Errors) == 0 {
+		t.Fatal("Query error must not convert a failed uninstall into success")
+	}
+	if len(exec.Uninstalled) != 0 {
+		t.Errorf("Uninstalled: got %v, want empty (Query error is not confirmed absent)", exec.Uninstalled)
 	}
 }
 
@@ -915,7 +1499,7 @@ func TestExecuteApply_SkipsUnresolvedInstall(t *testing.T) {
 // TestResolveOne verifies that ResolveOne resolves a single package correctly.
 func TestResolveOne(t *testing.T) {
 	pkg := schema.Package{ID: "git"}
-	action := ResolveOne(pkg, map[string]bool{"brew": true})
+	action := resolveOnGOOS(pkg, map[string]bool{"brew": true}, "darwin")
 	if !action.Resolved() {
 		t.Fatal("ResolveOne: expected resolved action")
 	}
@@ -924,6 +1508,107 @@ func TestResolveOne(t *testing.T) {
 	}
 	if action.PkgName != "git" {
 		t.Errorf("PkgName: got %q, want \"git\"", action.PkgName)
+	}
+}
+
+func TestResolveOne_DefaultFallbackSkipsEcosystemManagers(t *testing.T) {
+	pkg := schema.Package{ID: "git"}
+	action := ResolveOne(pkg, map[string]bool{"npm": true, "cargo": true, "vscode": true})
+	if action.Resolved() {
+		t.Fatalf("ResolveOne resolved via %q; ecosystem managers must be explicit-only fallback targets", action.Manager)
+	}
+}
+
+func TestResolveOne_DefaultFallbackStillUsesSystemManagers(t *testing.T) {
+	pkg := schema.Package{ID: "git"}
+	action := ResolveOne(pkg, map[string]bool{"npm": true, "paru": true})
+	if !action.Resolved() {
+		t.Fatal("ResolveOne: expected resolved action")
+	}
+	if action.Manager != "paru" {
+		t.Errorf("Manager: got %q, want %q", action.Manager, "paru")
+	}
+}
+
+func TestResolveOneOnGOOS_PlatformFallbackUsesNativeHomebrew(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		want string
+	}{
+		{name: "Darwin uses Homebrew", goos: "darwin", want: "brew"},
+		{name: "Linux uses Linuxbrew", goos: "linux", want: "linuxbrew"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action := resolveOnGOOS(
+				schema.Package{ID: "git"},
+				map[string]bool{"brew": true, "linuxbrew": true},
+				tt.goos,
+			)
+
+			if action.Manager != tt.want {
+				t.Errorf("manager = %q, want %q", action.Manager, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveOneOnGOOS_PlatformExplicitHomebrewSelectionRemainsAuthoritative(t *testing.T) {
+	tests := []struct {
+		name string
+		goos string
+		pkg  schema.Package
+		want string
+	}{
+		{
+			name: "Darwin prefer can select Linuxbrew",
+			goos: "darwin",
+			pkg:  schema.Package{ID: "git", Prefer: "linuxbrew"},
+			want: "linuxbrew",
+		},
+		{
+			name: "Linux managers map can select Homebrew",
+			goos: "linux",
+			pkg:  schema.Package{ID: "git", Managers: map[string]string{"brew": "git"}},
+			want: "brew",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			action := resolveOnGOOS(tt.pkg, map[string]bool{"brew": true, "linuxbrew": true}, tt.goos)
+
+			if action.Manager != tt.want {
+				t.Errorf("manager = %q, want %q", action.Manager, tt.want)
+			}
+		})
+	}
+}
+
+func TestResolveOne_PreferCanSelectEcosystemManager(t *testing.T) {
+	pkg := schema.Package{ID: "typescript", Prefer: "npm"}
+	action := ResolveOne(pkg, map[string]bool{"npm": true})
+	if !action.Resolved() {
+		t.Fatal("ResolveOne: expected resolved action")
+	}
+	if action.Manager != "npm" {
+		t.Errorf("Manager: got %q, want %q", action.Manager, "npm")
+	}
+}
+
+func TestResolveOne_ManagersMapCanSelectEcosystemManager(t *testing.T) {
+	pkg := schema.Package{ID: "kubectx", Managers: map[string]string{"krew": "ctx"}}
+	action := ResolveOne(pkg, map[string]bool{"krew": true})
+	if !action.Resolved() {
+		t.Fatal("ResolveOne: expected resolved action")
+	}
+	if action.Manager != "krew" {
+		t.Errorf("Manager: got %q, want %q", action.Manager, "krew")
+	}
+	if action.PkgName != "ctx" {
+		t.Errorf("PkgName: got %q, want %q", action.PkgName, "ctx")
 	}
 }
 

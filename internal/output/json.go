@@ -26,42 +26,84 @@ type Envelope struct {
 
 // PlanPackage is a single entry in a PlanResult list.
 type PlanPackage struct {
-	ID      string `json:"id"`
-	Manager string `json:"manager,omitempty"`
-	Cmd     string `json:"cmd,omitempty"`
+	ID       string           `json:"id"`
+	Manager  string           `json:"manager,omitempty"`
+	Cmd      string           `json:"cmd,omitempty"`
+	External *ExternalDetails `json:"external,omitempty"`
+}
+
+// ExternalDetails describes a managed external release without exposing credentials.
+type ExternalDetails struct {
+	SourceType               string   `json:"sourceType"`
+	Repository               string   `json:"repository,omitempty"`
+	Version                  string   `json:"version,omitempty"`
+	Verification             []string `json:"verification,omitempty"`
+	InstallType              string   `json:"installType,omitempty"`
+	Scope                    string   `json:"scope,omitempty"`
+	AllowBackgroundExecution bool     `json:"allowBackgroundExecution,omitempty"`
+}
+
+// FilePlanEntry is one planned filesystem change in an apply plan.
+type FilePlanEntry struct {
+	Source string `json:"source,omitempty"`
+	Target string `json:"target"`
+	Mode   string `json:"mode"`
+	Kind   string `json:"kind"`
+}
+
+// StatePaths names the lock and env/shell fragment files an apply will use.
+type StatePaths struct {
+	Dir   string `json:"dir"`
+	Lock  string `json:"lock"`
+	Env   string `json:"env,omitempty"`
+	Shell string `json:"shell,omitempty"`
 }
 
 // PlanResult is the Data payload for `genv apply [--dry-run] --json`.
 type PlanResult struct {
-	ToInstall       []PlanPackage `json:"toInstall"`
-	ToRemove        []PlanPackage `json:"toRemove"`
-	Unchanged       []PlanPackage `json:"unchanged"`
-	Unresolved      int           `json:"unresolved"`
-	ServicesToStart []string      `json:"servicesToStart,omitempty"`
-	ServicesToStop  []string      `json:"servicesToStop,omitempty"`
+	ToInstall       []PlanPackage   `json:"toInstall"`
+	ToRemove        []PlanPackage   `json:"toRemove"`
+	Unchanged       []PlanPackage   `json:"unchanged"`
+	Adopted         []PlanPackage   `json:"adopted,omitempty"`
+	Unresolved      int             `json:"unresolved"`
+	ServicesToStart []string        `json:"servicesToStart,omitempty"`
+	ServicesToStop  []string        `json:"servicesToStop,omitempty"`
+	Files           []FilePlanEntry `json:"files,omitempty"`
+	FailedHooks     []string        `json:"failedHooks,omitempty"`
+	State           *StatePaths     `json:"state,omitempty"`
 }
 
 // StatusEntry is a single package entry in a StatusResult.
 type StatusEntry struct {
-	ID               string `json:"id"`
-	Manager          string `json:"manager,omitempty"`
-	Kind             string `json:"kind"` // "ok" | "drift" | "missing" | "extra"
-	SpecVersion      string `json:"specVersion,omitempty"`
-	InstalledVersion string `json:"installedVersion,omitempty"`
+	ID               string           `json:"id"`
+	Manager          string           `json:"manager,omitempty"`
+	Kind             string           `json:"kind"` // "ok" | "drift" | "missing" | "present" | "extra"
+	SpecVersion      string           `json:"specVersion,omitempty"`
+	InstalledVersion string           `json:"installedVersion,omitempty"`
+	External         *ExternalDetails `json:"external,omitempty"`
 }
 
 // StatusResult is the Data payload for `genv status --json`.
 type StatusResult struct {
+	ActiveProfile  string               `json:"activeProfile,omitempty"`
 	Entries        []StatusEntry        `json:"entries"`
 	EnvEntries     []EnvStatusEntry     `json:"envEntries,omitempty"`
 	ShellEntries   []ShellStatusEntry   `json:"shellEntries,omitempty"`
 	ServiceEntries []ServiceStatusEntry `json:"serviceEntries,omitempty"`
+	FileEntries    []FilePlanEntry      `json:"fileEntries,omitempty"`
+	FailedHooks    []string             `json:"failedHooks,omitempty"`
 }
 
 // ScanResult is the Data payload for `genv scan --json`.
 type ScanResult struct {
-	Added   int `json:"added"`
-	Skipped int `json:"skipped"`
+	Added    int      `json:"added"`
+	Skipped  int      `json:"skipped"`
+	DryRun   bool     `json:"dryRun,omitempty"`
+	Packages []string `json:"packages,omitempty"`
+	// Unreadable names the managers whose inventory could not be read. It is
+	// reported even when the rest of the scan succeeds, so a partial inventory
+	// is not mistaken for a complete one.
+	Unreadable []string `json:"unreadableManagers,omitempty"`
 }
 
 // ApplyResult is the Data payload for `genv apply --json` (non-dry-run).
@@ -74,6 +116,9 @@ type ApplyResult struct {
 	ShellRemoved    []string `json:"shellRemoved,omitempty"`
 	ServicesApplied []string `json:"servicesApplied,omitempty"`
 	ServicesRemoved []string `json:"servicesRemoved,omitempty"`
+	FilesApplied    []string `json:"filesApplied,omitempty"`
+	FilesUpdated    []string `json:"filesUpdated,omitempty"`
+	FailedHooks     []string `json:"failedHooks,omitempty"`
 }
 
 // EnvStatusEntry is a single env variable entry in an EnvStatusResult.
@@ -121,4 +166,66 @@ type ServiceStatusResult struct {
 // Write serializes env to w as a single JSON line followed by a newline.
 func Write(w io.Writer, env Envelope) error {
 	return json.NewEncoder(w).Encode(env)
+}
+
+// UpgradeFilters summarizes which filters were applied to the upgrade plan.
+type UpgradeFilters struct {
+	Only         []string `json:"only,omitempty"`
+	Skip         []string `json:"skip,omitempty"`
+	OnlyManager  []string `json:"onlyManager,omitempty"`
+	SkipManager  []string `json:"skipManager,omitempty"`
+	HooksSkipped bool     `json:"hooksSkipped,omitempty"`
+	All          bool     `json:"all,omitempty"`
+}
+
+// UpgradeBatch represents a single batched command in the upgrade plan.
+type UpgradeBatch struct {
+	Manager  string           `json:"manager"`
+	IDs      []string         `json:"ids"`
+	PkgNames []string         `json:"pkgNames"`
+	Cmd      string           `json:"cmd"`
+	Status   string           `json:"status"`
+	Error    string           `json:"error,omitempty"`
+	External *ExternalDetails `json:"external,omitempty"`
+}
+
+// UpgradeSkipped represents a package skipped during upgrade planning.
+type UpgradeSkipped struct {
+	ID      string `json:"id"`
+	Manager string `json:"manager"`
+	Reason  string `json:"reason"`
+}
+
+// UpgradePackage represents a package whose version was updated.
+type UpgradePackage struct {
+	ID         string `json:"id"`
+	Manager    string `json:"manager"`
+	NewVersion string `json:"newVersion"`
+}
+
+// UpgradeHookResult represents a failed hook execution.
+type UpgradeHookResult struct {
+	Phase string `json:"phase"`
+	Error string `json:"error"`
+}
+
+// UpgradeStep is one named upgrade-runner step (system, firmware, later extras).
+// Tracked packages stay in Batches for compatibility.
+type UpgradeStep struct {
+	Name     string   `json:"name"`
+	Status   string   `json:"status"`
+	Reason   string   `json:"reason,omitempty"`
+	Commands []string `json:"commands,omitempty"`
+}
+
+// UpgradeResult is the Data payload for `genv upgrade [--dry-run] --json`.
+type UpgradeResult struct {
+	DryRun      bool                `json:"dryRun"`
+	Refresh     []UpgradeBatch      `json:"refresh,omitempty"`
+	Batches     []UpgradeBatch      `json:"batches"`
+	Steps       []UpgradeStep       `json:"steps,omitempty"`
+	Updated     []UpgradePackage    `json:"updated,omitempty"`
+	Skipped     []UpgradeSkipped    `json:"skipped,omitempty"`
+	FailedHooks []UpgradeHookResult `json:"failedHooks,omitempty"`
+	Filters     UpgradeFilters      `json:"filters"`
 }

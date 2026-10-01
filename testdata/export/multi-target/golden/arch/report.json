@@ -1,0 +1,12 @@
+[
+  {
+    "class": "error",
+    "code": "absolute-source",
+    "message": "files.templates[1].source cannot be bundled: /etc/genv/secret.tmpl"
+  },
+  {
+    "class": "warning",
+    "code": "sensitive-env-omitted",
+    "message": "env.SECRET is marked sensitive and was omitted from the export snapshot"
+  }
+]

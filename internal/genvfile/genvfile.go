@@ -36,10 +36,60 @@ func DefaultSpecPath() (string, error) {
 	return filepath.Join(dir, "genv.json"), nil
 }
 
-// LockPathFrom derives the lock file path from a genv.json path.
-// "genv.json" → "genv.lock.json", "custom.json" → "custom.lock.json".
+// ResolveStateDir returns the directory that owns the lock and env/shell
+// fragments. An explicit stateDir wins; otherwise the directory containing
+// specPath is used; if specPath is empty, DefaultDir is used.
+func ResolveStateDir(specPath, stateDir string) (string, error) {
+	if stateDir != "" {
+		abs, err := filepath.Abs(stateDir)
+		if err != nil {
+			return "", fmt.Errorf("resolving state directory %s: %w", stateDir, err)
+		}
+		return abs, nil
+	}
+	if specPath != "" {
+		abs, err := filepath.Abs(specPath)
+		if err != nil {
+			return "", fmt.Errorf("resolving spec path %s: %w", specPath, err)
+		}
+		return filepath.Dir(abs), nil
+	}
+	return DefaultDir()
+}
+
+// LockPathFrom returns the lock file path that belongs with specPath: a
+// genv.lock.json next to the spec. Empty specPath falls back to DefaultDir.
 func LockPathFrom(specPath string) string {
-	return strings.TrimSuffix(specPath, ".json") + ".lock.json"
+	dir, err := ResolveStateDir(specPath, "")
+	if err != nil {
+		return "genv.lock.json"
+	}
+	return filepath.Join(dir, "genv.lock.json")
+}
+
+// LockPathIn returns genv.lock.json inside stateDir.
+func LockPathIn(stateDir string) string {
+	if stateDir == "" {
+		return LockPathFrom("")
+	}
+	return filepath.Join(stateDir, "genv.lock.json")
+}
+
+// WithinDir reports whether path is the directory dir or a file inside it.
+func WithinDir(dir, path string) bool {
+	absDir, err := filepath.Abs(dir)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absDir, absPath)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 // ErrNotFound is returned by Read when the file does not exist.
@@ -86,36 +136,98 @@ func ReadOrNew(path string) (f *schema.GenvFile, isNew bool, err error) {
 	return f, false, err
 }
 
-// New returns a minimal, valid GenvFile ready to be populated.
+// New returns a minimal, valid schemaVersion 8 GenvFile with empty defaults
+// and a bucket for every known target so first-run add/init can persist
+// without guessing a single host.
 func New() *schema.GenvFile {
+	targets := make(map[string]*schema.TargetBundle, len(schema.KnownTargets))
+	for id := range schema.KnownTargets {
+		targets[id] = &schema.TargetBundle{}
+	}
 	return &schema.GenvFile{
-		SchemaVersion: schema.Version,
-		Packages:      []schema.Package{},
+		SchemaVersion: schema.Version8,
+		Defaults:      &schema.TargetBundle{},
+		Targets:       targets,
 	}
 }
 
 // Write serializes f to path with 2-space indentation.
 // Writing is atomic: it writes to a temp file then renames, so a crash
 // mid-write cannot leave a half-written genv.json.
+//
+// When path already exists and f only changes package lists, Write edits
+// those arrays in place so empty blocks and key order survive adopt/disown.
 func Write(path string, f *schema.GenvFile) error {
+	if original, err := os.ReadFile(path); err == nil {
+		if patched, ok := rewritePackagesInPlace(original, f); ok {
+			return writeValidated(path, patched)
+		}
+	}
+	return writeMarshaled(path, f)
+}
+
+func writeMarshaled(path string, f *schema.GenvFile) error {
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
 		return fmt.Errorf("serialising genv.json: %w", err)
 	}
 	data = append(data, '\n')
+	return writeValidated(path, data)
+}
+
+func writeValidated(path string, data []byte) error {
+	_, valErrs, parseErr := schema.ParseAndValidate(data)
+	if parseErr != nil {
+		return fmt.Errorf("%w: %s: %w", ErrInvalidFile, path, parseErr)
+	}
+	if len(valErrs) > 0 {
+		msgs := make([]string, len(valErrs))
+		for i, e := range valErrs {
+			msgs[i] = e.Error()
+		}
+		return fmt.Errorf("%w: %s: validation errors:\n  %s", ErrInvalidFile, path, strings.Join(msgs, "\n  "))
+	}
 
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("creating directory %s: %w", dir, err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	// 0600, matching the lock and the private fragments. A spec can hold env
+	// values marked sensitive, so it must never land world-readable. Writing
+	// 0600 also tightens a spec that a previous genv (or a careless copy) left
+	// at 0644: tightening is the safe direction, and the lock is already 0600.
+	tmpF, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
+	}
+	tmp := tmpF.Name()
+	if err := tmpF.Chmod(0o600); err != nil {
+		_ = tmpF.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("writing %s: %w", tmp, err)
+	}
+	if _, err := tmpF.Write(data); err != nil {
+		_ = tmpF.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("writing %s: %w", tmp, err)
+	}
+	// Sync while the write handle is still open — on Windows,
+	// FlushFileBuffers denies read-only handles, so this cannot be done via
+	// a reopen.
+	if err := tmpF.Sync(); err != nil {
+		_ = tmpF.Close()
+		_ = os.Remove(tmp)
+		return fmt.Errorf("syncing %s: %w", tmp, err)
+	}
+	if err := tmpF.Close(); err != nil {
+		_ = os.Remove(tmp)
 		return fmt.Errorf("writing %s: %w", tmp, err)
 	}
 	if err := os.Rename(tmp, path); err != nil {
 		_ = os.Remove(tmp)
 		return fmt.Errorf("saving %s: %w", path, err)
 	}
+	syncDir(dir)
 	return nil
 }

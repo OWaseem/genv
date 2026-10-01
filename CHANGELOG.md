@@ -2,9 +2,945 @@
 
 All notable changes to this project will be documented in this file.
 
-## Unreleased — v2.2.0
+## Unreleased
 
-Targets Milestone M13: hooks and lifecycle scripts. Users will be able to declare `pre` and `post` hooks in `genv.json` for events like `apply`, `add`, `remove`, and `upgrade`, with event context passed via environment variables.
+## v4.5.4 - 2026-09-30
+
+Correctness fixes for #213–#217. No new schema surface, so this is a patch.
+
+Deliberately excludes #212 (a declarative Windows Task Scheduler backend for
+`services`), which is a feature rather than a fix and cannot be verified
+outside Windows. It is tracked separately.
+
+### Fixed
+
+- `scan` proposed essentially every installed package on pacman — 767 of 771
+  proposals on the reporter's host, mostly libraries like `glibc` and
+  `glib2` — while `paru` and `yay` already listed only explicit packages.
+  `pacman` now scans `pacman -Qqe`; `--all` / `--deps` still returns the full
+  `-Qq` inventory (#214).
+- `scan` proposed Ruby's own default gems. The filter was matching the wrong
+  thing: RubyGems only prints the `default:` marker when a gem has a second,
+  non-default version installed, so on RubyGems 4.0.20 `abbrev (0.1.2)` is a
+  default gem with no marker while `bundler (default: 4.0.20, 4.0.18)` has
+  one. Inferring "is default" from that marker missed every default gem with a
+  single version. genv now asks RubyGems via
+  `Gem::Specification.default_stubs`. On a Ruby 4.0.20 host this cuts gem
+  proposals from 83 to 19 (#216).
+  *Known limitation:* the residual 19 (`csv`, `base64`, `bigdecimal`,
+  `benchmark`, `abbrev`) are no longer reported as default gems by RubyGems 4,
+  which also removed `bundled_gem?`, and they share a gem home with user
+  installs. Nothing in RubyGems distinguishes them, so genv cannot either.
+- `scan` could not parse npm's global package list and silently proposed zero
+  npm packages. `npm ls -g --json` returns an object; genv accepted that shape
+  only when a `dependencies` key was present, so an object without one fell
+  through to an array unmarshal and failed with `cannot unmarshal object into
+  Go value of type []adapter.jsListPackage` — a parse error for what is a
+  valid empty listing (#215).
+- `scan` reported success when a manager's inventory could not be read,
+  printing one line to stderr and continuing, so a partial inventory read as a
+  complete one. Unreadable managers are now named in the JSON payload and in
+  the envelope, and a hard failure exits non-zero. A per-manager timeout stays
+  a warning: winget's first-run source sync stalls for minutes on Windows and
+  must not fail every scan (#215).
+- A lock entry with no `InstalledVersion` — what a failed install leaves
+  behind — was reported as `ok` and then believed forever, because
+  `packageDrifted` compares a recorded version and had nothing to compare. The
+  package was never re-queued and the entry was written back into `Unchanged`
+  on every later apply, so the state could not recover even once the package
+  became installable. Apply now re-queues a version-less entry whose manager
+  reports the package absent, and `genv status` reports it as `unknown` — but
+  only when a live inventory positively contradicts the lock. A missing version
+  alone is not the trigger: many managers never report a version, and a real
+  install through one of them produces the same version-less entry, so genv waits
+  for the live inventory to disagree. A manager that could not be inventoried,
+  `status --offline`, and a package the manager does list all stay `ok`.- Generated `env.sh` / `shell.sh` fragments were sourced by absolute,
+  host-specific path with no existence guard. Because the fragments are
+  rendered output rather than tracked files, that path is legitimately absent
+  on every fresh clone and on any host that has not applied since the last
+  render, so each shell start printed `No such file or directory` until
+  someone ran `genv apply`. The POSIX source line is now
+  `if [ -r "$HOME/.config/genv/env.sh" ]; then . "$HOME/.config/genv/env.sh"; fi`
+  — guarded, and `$HOME`-relative so one committed rc template is correct on
+  every host. The PowerShell profile line gets the same treatment with
+  `Test-Path` and `$env:USERPROFILE`. An existing genv block is replaced rather
+  than appended to: recognition was exact-path matching, so a committed
+  template carrying macOS's `/Users/...` never matched on a Linux host and
+  every non-macOS host accumulated a second block and stayed permanently
+  dirty (#217).
+- Apply reconciles the env and shell fragments on the "already up to date" path
+  too. It previously returned before touching them, so a deleted `env.sh` was
+  never rewritten even though `status` reported the variable as applied, and a
+  stale rc line was never corrected. This is the same root cause as #213: the
+  lock being trusted over reality.
+
+## v4.5.3 - 2026-09-30
+
+Correctness follow-up to v4.5.2, which was tagged with a red Windows CI job.
+The v4.5.2 binaries were functionally sound apart from the `~name` path
+expansion noted below.
+
+### Fixed
+
+- `expandCLIPath` still expanded any `~` prefix, so `~name` resolved to
+  `$HOME` + `name` on the CLI path even though `internal/files` and
+  `internal/schema` had been fixed. `~name` is a different user's home and must
+  be left alone. This was the only part of #208 still outstanding, and it
+  reached the v4.5.2 binaries (#208).
+- The same function built paths by string concatenation, producing
+  `C:\Users\me/dotfiles` on Windows. It now uses `filepath.Join`, matching the
+  other two copies of the rule.
+- `TestBuildEditorCmd` asserted that `argv[0]` is the editor path as typed. That
+  was only true before the #209 fix, where a qualified path is executed as the
+  allowlisted binary resolved through PATH. The table now asserts the executed
+  binary and its base name (#209).
+- Tests that assumed POSIX behaviour now hold on every platform: Windows
+  rewrites `/` to `\` in symlink text at creation, and does not enforce
+  directory permission bits for the owner, so the two permission-based failure
+  tests skip there. A new test stubs `symlink` so the "live file survives a
+  failed install" guarantee is still covered on Windows (#205).
+
+### CI
+
+- Unit tests now run on **every supported platform**: ubuntu, macOS and
+  Windows. macOS had never been exercised in CI at all, despite being the
+  platform genv is most opinionated about (launchd, homebrew, codesign,
+  symlink privileges, the PowerShell backend).
+- The release workflow now runs a `preflight` job that calls the same
+  reusable test workflow before GoReleaser. A tag push no longer publishes
+  whatever state the tree happens to be in — which is how v4.5.2 shipped with
+  failing tests.
+- Added `.gitattributes` so checkouts use LF everywhere. Without it the
+  Windows runner checked out CRLF and `gofmt -l` reported all 368 Go files as
+  unformatted, a false failure that said nothing about formatting. The old
+  Windows job had no format step, so this was invisible.
+- Go arguments are quoted in the workflow because the Windows runner's default
+  shell is PowerShell, which rewrote `-coverprofile=coverage.out ./...` into a
+  package named `.out` and failed the step after every real test had passed.
+- Coverage is uploaded per platform. Totals differ meaningfully and the Linux
+  number cannot see Windows- or macOS-only source: **80.8%** on Linux,
+  **80.7%** on macOS, **78.8%** on Windows. The coverage floor stays on the
+  Linux runner, where it was tuned; a cross-platform 80% floor would fail on
+  Windows.
+
+## v4.5.2 - 2026-09-30
+
+All issues #195–#211.
+
+### Security
+
+- `genv.json` is written through a unique temp file in the target directory at
+  `0600`, matching the lock and the private fragments. It was created with
+  `os.Create`, landing at `0644` under a normal umask, so a spec holding
+  `env` values marked `sensitive` was world-readable, and a manual
+  `chmod 600` was silently cleared by the next `add` / `remove` / `env set`.
+  A spec left world-readable by an older genv is tightened, matching the lock
+  (Fixes #201).
+- Shell function bodies and alias values can no longer escape the fragment genv
+  generates. `}` was missing from the metacharacter denylist, so a body of
+  `} true` closed the generated function and ran `true` when the fragment was
+  sourced. Alias values were not checked at all (Fixes #199).
+- Hook `command` may no longer contain newlines. Hooks run through `sh -c`,
+  PowerShell `-Command`, or `cmd /C`, so a newline smuggled a second command
+  past what the author wrote. Hook `file` and service argv already refused them
+  (#211 follow-up 6).
+- `genv export` refuses a relative source that resolves outside the spec
+  directory (`../../.ssh/id_ed25519`) and rejects symlinks instead of copying
+  what they point at. `genv pull` now checks every path component, not just the
+  final one, so an intermediate symlink out of the cache no longer slips through
+  (Fixes #195, #211 follow-up 3).
+- `genv edit` no longer allowlists on the editor's basename and then executes
+  the original string: `EDITOR=/tmp/evil/code` matched `code` and ran
+  `/tmp/evil/code`. A qualified path resolves through `PATH` from its base name
+  and executes that, so `/usr/bin/vim` keeps working but a path off `PATH` is
+  refused (Fixes #209).
+- Spec-defined command adapters substitute `{{id}}` per token instead of
+  before splitting the argv template. `ValidPackageName` permits `;`, `|`,
+  quotes and `$`, so an id could spill into neighbouring tokens and, for a
+  `sh -c "…"` template, into the shell string (Fixes #200).
+
+### Fixed
+
+- `genv apply --json` without `--yes` is plan-only. It skipped confirmation and
+  called `ExecuteApply` with a hard-coded assume-yes while hooks still saw
+  `GENV_YES=false`, so packages, env, shell, services and files mutated with no
+  consent. `ExternalMode` now follows `--yes`, and the gate fires only when
+  there is pending work so an already-applied spec still reports `ok`, matching
+  `genv upgrade --json` (Fixes #196).
+- Every lock read-modify-write holds `LockMutation` and re-reads inside the
+  lock: `add`, `adopt`, `adopt --files`, `disown`, `scan`, and `files adopt`.
+  The scheduled worker holds the lock across its whole upgrade and writes the
+  snapshot it read at the start, which erased a `disown` landing in between — so
+  the next apply uninstalled a package the spec no longer listed (Fixes #202).
+- Hook and package subprocesses cannot hang after the child exits. `WaitDelay`
+  is now set for hooks and manager runs: a hook that backgrounds a process, or a
+  timeout that kills only the direct child, left `genv apply` blocked, and an
+  hourly worker run could sit until its job deadline without updating the lock.
+  `ErrWaitDelay` is normalised so a successful command is not reported as failed
+  just because a grandchild still held the pipe (Fixes #197).
+- Managed links compare resolved paths and fall back to `os.SameFile`, so a
+  relative link naming the same file as an absolute source is skipped instead of
+  reported as a mismatch by apply, status and adopt (Fixes #207).
+- `files adopt` and forced relink stage the symlink under a unique sibling name
+  and rename it into place. They previously moved the live file aside first, so
+  an `os.Symlink` failure (Windows without Developer Mode) left neither the old
+  file nor a link; the error now names the backup (Fixes #205).
+- Paths starting with `~name` no longer expand under the home directory. `~name`
+  is another user's home and was resolving to `$HOME` concatenated with the
+  name (for example `/Users/karimfoo`). Now only `~`, `~/…` and `~\…` expand,
+  in `files`, `schema`, `hooks` and external destinations (Fixes #208).
+- `genv export` bundles hook scripts, and a relative hook `file` resolves
+  against the spec directory. Export copied link, template, service and key
+  assets but not hooks, and apply stat'd a relative hook file against the
+  working directory, so a pulled spec lost its hooks under the scheduler
+  (Fixes #210).
+- `genv export` reports `~/…` and `$VAR` sources as unbundlable instead of
+  joining them under the spec directory and failing the copy, and a relative
+  external `publicKeyFile` now resolves against the spec directory so a key the
+  export bundled can actually be read on apply (Fixes #210).
+- systemd `ExecStart` / `ExecStop` / `ExecReload` arguments and `Environment=`
+  values escape `%` as `%%`. systemd expands specifiers inside quoted values, so
+  a `date +%s` argument was rewritten before the process saw it. launchd and
+  plist rendering are unchanged (Fixes #204).
+- Windows Update no longer reports a generic PowerShell failure as a WUA
+  result. With `$ErrorActionPreference = 'Stop'`, a COM failure exits 1, which
+  was reported as `WUA ResultCode 1 (InProgress)` with an elevation hint, and
+  exit 5 read as `Aborted`. The script now exits `100 + ResultCode` for any
+  code it deliberately reports, and only those offsets are translated
+  (Fixes #206).
+- Service unit, plist and scheduled-task names no longer collide. Service names
+  are spec map keys and may contain a separator (`apps/web`), so `a/x` and `b/x`
+  both became `genv-x` and removing one deleted the other. Sanitized names that
+  changed get a short digest of the original appended so distinct names stay
+  distinct (#211 follow-up 4).
+- An external destination of exactly `~` resolves to the home directory instead
+  of panicking on a one-byte slice (#203).
+- A dry run checks the mismatch condition before reporting `Updated`, so the
+  plan matches what apply actually does instead of advertising an update the
+  apply refuses (#211 follow-up 1).
+- Forced template overwrite renames over the target instead of unlinking it
+  first, and the staging file gets a unique name in the destination directory,
+  so a failed write leaves the previous file in place (#211 follow-up 5).
+- `ExecuteApply` honors `ApplyExecutionOptions.Unattended`: sudo is made
+  non-interactive and the run fails closed rather than blocking on an
+  elevation prompt nobody can answer (#211 follow-up 7).
+- A successful outdated query no longer appends `outdated timing: …` to
+  warnings. The scheduled worker logged it for every manager on every run,
+  burying query failures and timeouts (#211 follow-up 9).
+- A remote `repo.url` is no longer the file source root. `filepath.Clean` turned
+  `https://github.com/org/repo` into the relative path
+  `https:/github.com/org/repo`. Only `~/`, absolute and `file://` URLs are
+  treated as a local source root; `--source-root` still wins (Fixes #198).
+- `genv pull` expands a leading `~` in `repo.url` before `git clone`; git does
+  not expand it and `ValidRepoURL` accepts it (#211 follow-up 2).
+- Confirmation prompts share one buffered stdin reader. A fresh reader per
+  prompt meant a piped `y\ny\n` was consumed by the first prompt and the second
+  saw EOF, answering "no" to a question already answered (#211 follow-up 8).
+- `already up to date.` is printed after hooks run, so a hook error no longer
+  contradicts the line above it (#211 follow-up 10).
+
+## v4.5.1 - 2026-09-24
+
+### Fixed
+
+- Per-entry `backup: true` on a `files.templates[]` entry replaces a mismatched
+  target without `--force` and keeps `*.backup.<ts>`, matching managed-links.
+  File apply errors now include the underlying messages in human and `--json`
+  output instead of only `N error(s)` (Fixes #190).
+- uv git URL install specs (e.g. `git+ssh://git@…`) now resolve to the installed
+  tool name via repo basename / `[required: …]` matching instead of cutting at
+  the first `@`, so `status --verify` / Query / uninstall no longer miss tools
+  uv already lists (Fixes #191).
+
+## v4.5.0 - 2026-09-21
+
+### Added
+
+- Apply lifecycle hooks have an idempotency contract: check-then-act, then
+  report `GENV_HOOK_STATUS=changed` or `GENV_HOOK_STATUS=skipped` on stdout or
+  stderr. The per-phase hook summary prints `changed`, `skipped (no-op)`, or
+  `error` next to the name, exit code, and duration. Exit 0 without a status
+  line is treated as `changed` so existing exit-only hooks stay compatible
+  (Fixes #182).
+- `genv status --verify` and `genv export --verify` query each tracked package's
+  resolved (or locked) manager to prove it is installed, instead of inferring
+  from allowlists or trusting the lock. Locked packages that Query reports
+  absent become status drift; export writes `package-not-installed` (and related)
+  error-class report items so `--strict` can fail. `--verify` cannot be combined
+  with `status --offline` or `status --files` (Fixes #184).
+
+### Fixed
+
+- `genv export` no longer emits error-class `manager-not-supported` for
+  packages that `genv apply` / `genv status` would resolve. Homebrew is
+  treated as usable on Linux, and implicit default OS managers (for example
+  pacman on Arch) count when `prefer` / `managers` names are absent on the
+  target (Fixes #175).
+- CLI help and shell completions no longer hardcode `schemaVersion 8`
+  (`genv migrate` still writes 8) (Fixes #183).
+- Unmatched `--skip` / `--only` filters are tagged as `config-drift` and
+  logged at WARN in the scheduled updates worker instead of INFO
+  (Fixes #177).
+
+## v4.4.1 - 2026-09-11
+
+### Fixed
+
+- Scheduled `genv updates __run-once` (including `updates.autoApply`) never
+  prompts for admin. Refresh/apply use `sudo -n` on Unix; unelevated Windows
+  skips mutating winget/choco (and paru/yay) instead of stacking UAC consent
+  dialogs. Elevation skips are logged and are not apply errors. Interactive
+  `genv apply` / `genv upgrade` still may sudo or UAC.
+- System-scope managed external archive and direct installs elevate the
+  staging write and atomic replacement (Unix `sudo`) instead of creating
+  `.genv-install-*` as the current user under `/usr/local/bin`. Unattended
+  runs refuse elevation rather than prompting. Windows still requires an
+  elevated session for system-scope destinations (Fixes #173).
+
+### Changed
+
+- `google.golang.org/grpc` (indirect, via Sigstore) 1.82.1 → 1.83.2.
+
+## v4.4.0 - 2026-09-10
+
+### Added
+
+- Schema v9 managed external release recipes for GitHub Releases and structured
+  HTTP metadata. Recipes support platform-specific direct, ZIP/tar archive, and
+  explicit interpreter script installs; SHA-256/checksum, Sigstore, minisign,
+  and OpenPGP verification; machine-local ownership receipts; local drift
+  status; update/upgrade planning; safe removal; and exported signer key assets.
+  Unverified, insecure-transport, and installer-script actions enforce dedicated
+  interactive/background policy rather than inheriting a generic `--yes`.
+
+### Removed
+
+- Snap packaging and automatic Snap Store publication. The published snap used
+  strict confinement, which exposed Ubuntu Core instead of the host system,
+  redirected genv's config home, and prevented access to host package managers.
+  The `snap` adapter remains supported for managing other installed snaps.
+
+### Fixed
+
+- Windows `genv updates start` pins the Task Scheduler (`schtasks`) job
+  `UserId` to the current account with `InteractiveToken` + `LeastPrivilege`,
+  so registration stays the unelevated per-user path. Access-denied creates
+  surface a short elevated/GPO/foreign-owned-task hint (Fixes #167).
+- Windows `genv upgrade` system step maps Windows Update Agent `ResultCode`
+  values to readable errors (notably `4` Failed) instead of opaque
+  `exit status 4`, accepts EULAs, checks download results, lists failed
+  update titles/HRESULTs, and treats `SucceededWithErrors` as soft success
+  unless a per-update result is Failed. Elevation is documented; genv does
+  not auto-elevate (Fixes #168).
+
+## v4.3.3 - 2026-09-05
+
+### Changed
+
+- Homebrew cask no longer ships a legacy `postflight` hook that re-ran
+  `genv updates start` after upgrades. GoReleaser can only emit
+  `postflight`, not `postflight_steps`, which triggered a brew
+  deprecation warning. Modern `genv updates start` already registers a
+  PATH-stable brew prefix bin path via `selfpath.PreferStable`, so the
+  Caskroom reload is unnecessary. The cask caveat tells users with older
+  LaunchAgents (or a missing-executable hint from `genv updates status`)
+  to run `genv updates start` after upgrading.
+
+## v4.3.2 - 2026-09-05
+
+### Added
+
+- Spec services can declare a LaunchAgent or systemd --user unit from a
+  template: `services.<name>.launchd.plist` and `services.<name>.systemd.unit`.
+  Paths render like `files.templates[]`. `genv apply` writes the unit, loads it
+  if needed, and re-bootstraps / restarts when the rendered content changes.
+  `genv service status` uses `launchctl print gui/$UID/<Label>` or
+  `systemctl --user is-active`. Removing the service boots it out (or stops
+  the unit) and deletes the file. No postApply hook is required.
+- Schema v8 top-level `adapters` defines command adapters for plugin CLIs
+  (Claude Code plugins, gh extensions, editor plugins). Packages with
+  `prefer: <adapter>` install, remove, and upgrade via the declared commands
+  and participate in `status`, `scan`, `updates check`, and `upgrade`.
+  List parsing is JSON (`idField` / `versionField`) and/or regex (`listMatch`).
+  `external` stays track-only. See SCHEMA.md.
+- `genv apply --source-root <dir>` resolves `files.links` / `files.templates`
+  and service `launchd.plist` / `systemd.unit` sources against that directory
+  instead of the spec file directory. Use it to dry-run (or apply) a worktree
+  copy of `genv.json` against the live tree so existing links stay `ok` and
+  only real file changes show. A missing or non-directory `--source-root` is
+  refused. Lock, env, and shell paths still follow `--file` / `--lock-file` /
+  `--state-dir`.
+- Lock files record a `contentHash` (`sha256:<hex>`) per managed link and
+  template after a successful apply. `genv status --files` reports `drifted`
+  (with the path) when the live source or rendered body no longer matches that
+  hash. Topology-only `ok` / `missing` / `wrong-type` / `mismatch` are
+  unchanged. Apply never reverts a drifted body; a later successful apply
+  refreshes the hash. Pre-hash locks omit the field and stay topology-only.
+  Hashing is always on for `link` / `managed-link` / templates; `merge-dir`
+  trees are not hashed.
+- `files.links[]`, `files.templates[]`, and `files.dirs[]` accept optional
+  `perm`, an octal string (`0600`, `0700`). Apply chmods the managed-link
+  source, rendered template, or directory after creating the entry. A second
+  apply is a no-op when the mode already matches. `genv status` reports
+  `perm-mismatch`. `mode` on links stays the link kind (`link` /
+  `managed-link` / `merge-dir`); it is still rejected on dirs.
+- Per-entry `backup: true` on a files link (or template) replaces that
+  entry's mismatched regular file without `--force`, and keeps a
+  `*.backup.*` copy. Other mismatches still report and still need `--force`.
+  Global `--backup` alone does not grant replace consent.
+- `genv files adopt <target>` seeds a missing source from the live file,
+  backs the live file up, creates the link, and records it in the lock.
+  `--dry-run` prints the copy/backup/link steps without writing.
+- Lifecycle hooks now receive `GENV_SPEC_FILE`, `GENV_SPEC_DIR`, and
+  `GENV_LOCK_FILE`. A hook with `continueOnError: true` reports a failure
+  without failing apply. Each hook phase prints a name/exit/duration
+  summary after hooks run.
+
+### Fixed
+
+- `genv adopt` and `genv disown` rewrite only the changed `packages` arrays
+  when the rest of the spec is unchanged, so empty objects and original key
+  order survive in `genv.json`.
+- Applying a spec with `--file` no longer rewrites the live default lock or
+  env/shell fragments. Lock and fragments default to the spec directory;
+  `--state-dir` relocates all three. Plan output names the paths.
+  `adopt --file` reads the sibling lock. Wet apply refuses writes outside
+  that directory without an explicit `--lock-file` or `--state-dir`.
+- `genv adopt` now queries the adapter for the installed version and writes
+  it to the lock. `genv status` shows `*` for no constraint and `?` when the
+  installed version is unknown. Apply backfills empty lock versions from
+  `VersionLister` inventory so existing adopted entries pick up versions on
+  the next apply.
+- Lock mutations no longer leave a zero-byte `<lock>.mutex` sidecar after
+  apply and other writes. Unlock unlinks it, re-checking inode identity so
+  concurrent holders stay exclusive.
+
+## v4.3.1 - 2026-09-05
+
+### Fixed
+
+- `genv scan` no longer proposes non-package ids: `-` from `uv tool list`
+  entrypoint bullets, `npm` from `npm list -g` reporting itself, or
+  `toolchain:*` from rustup. uv parses only `name v<version>` headers;
+  rustup `ListForScan` is empty (ListInstalled still reports toolchains
+  for apply/status); `--all` still drops those three shapes.
+
+- `genv upgrade --json` wet-run now requires `--yes` to execute (or `--dry-run`
+  to plan only), matching the human confirmation path. The refused envelope
+  still includes the planned batches.
+- Leftover `genv upgrade <id>` arguments now apply as `--only` filters, matching
+  shell completions. `--only` and positionals merge.
+- Upgrade and index-refresh planning skip a manager when `Available()` is false
+  and record an explicit reason, instead of emitting commands that cannot run.
+- `genv apply --skip-packages` no longer inventories live package managers or
+  prints the per-package `(up to date)` table. The header names files/env/services
+  instead of a package count, and JSON omits the package plan the same way.
+  Env, shell, files, and services still apply; lock packages are left untouched.
+- Native Windows `genv updates` no longer flashes a console on each Task
+  Scheduler run. The task still uses `InteractiveToken` (so `updates.notify`
+  can toast) and still starts through `schtasks /Run` (so OpenSSH cannot kill
+  it). The action is now `wscript.exe //B //Nologo` plus a `.vbs` host that
+  `WshShell.Run`s the existing `.cmd` with window style 0. `<Hidden>true</Hidden>`
+  alone does not hide `cmd.exe`. `updates.log` and one completion notification
+  are unchanged. Do not flip `genv.exe` to the Windows GUI subsystem.
+  `updates stop` now ends the running task before delete and retries removing
+  the `.vbs` host if `wscript` still has it open (sharing violation).
+- The `vscode` adapter now prefers `cursor` on PATH, then `code`. Cursor-only
+  hosts can scan, adopt, and upgrade extensions without a `code` shim.
+  VS Code-only hosts (`code`, no `cursor`) are unchanged.
+
+### Added
+
+- Tracked-package planning now refreshes each index-based manager once before
+  outdated detection. `genv upgrade`, `genv updates check`, and the hourly
+  `__run-once` / `autoApply` worker share that path. Refresh argv: `brew update`
+  (brew and linuxbrew share one call), `sudo apt-get update`,
+  `sudo pacman -Sy --noconfirm` (not `-Syu`), `paru`/`yay -Sy --noconfirm`,
+  `sudo dnf makecache`, `sudo apk update`, `scoop update`,
+  `winget source update`. Live registries (mas, bun/npm/pnpm/yarn, uv/pipx,
+  pip-user, cargo, volta, choco, snap, vscode) stay as-is. A failed or timed-out
+  refresh keeps that manager's packages and warns on wet upgrade, check, and
+  `updates.log`. `--all` still refreshes. Human plans show the refresh command
+  (e.g. `brew  ==> brew update`). `brew outdated` now passes `--greedy` so
+  auto-updating casks are not dropped after the fetch.
+
+### Changed
+
+- `genv scan` now proposes user-facing installs by default: Homebrew
+  `brew leaves` plus casks, Ruby gems that are not default or bundled,
+  and pip-user packages that are not dependencies of other user-site
+  packages (minus installer/stdlib-like noise). npm/pnpm/yarn were
+  already top-level (`--depth=0`). Pass `--all` or `--deps` for the
+  previous full `ListInstalled` inventory. `--dry-run` on a host whose
+  brew leaves and casks are already tracked stays near-empty aside from
+  real extras.
+- README documents the hard skip for any non-empty package `version` during
+  upgrade (range-satisfying upgrades are not implemented).
+
+## v4.3.0 - 2026-09-03
+
+### Added
+
+- Native Windows `genv updates start` registers a per-user Task Scheduler
+  job (`schtasks`) so the hourly updates checker has the same start / status /
+  stop lifecycle as systemd --user and launchd. The task runs at logon plus
+  `updates.interval`, sets a PATH that includes scoop/winget shims, and is
+  started through the scheduler service so OpenSSH job objects cannot kill it.
+- `genv upgrade` now runs a named step runner after the existing tracked-package
+  planner: OS vendor updates for the active target, then firmware when a clean
+  tool exists. macOS uses `sudo softwareupdate -i -a`. Windows uses the built-in
+  Windows Update Agent COM API via `pwsh` (else `powershell` / `powershell.exe`)
+  — no extra modules, and not `winget` (which upgrades packages, not the OS).
+  Arch and wsl-arch use `sudo pacman -Syu --noconfirm` (paru/yay stay
+  tracked-package adapters). Ubuntu uses `sudo apt-get update` then
+  `sudo apt-get upgrade -y` (or `apt` if `apt-get` is absent); snap stays
+  tracked-only. Linux firmware is `sudo fwupdmgr update` when `fwupdmgr` is
+  present; macOS firmware is delivered by the system step; Windows firmware is
+  skipped as vendor-specific. Missing tools are skipped with a reason; elevation
+  is part of the planned command, not silently dropped. Step failures do not
+  abort later steps. `genv updates check`, the timer, and `updates.autoApply`
+  remain tracked packages only. Further steps (rustup, editors, containers, and
+  other extra tools) land in follow-ups.
+
+### Fixed
+
+- `genv updates check` / `genv upgrade` no longer treat VS Code/Cursor
+  extensions as perpetually outdated. The vscode adapter now queries the
+  editor's marketplace (from `product.json`, so Cursor uses
+  marketplace.cursorapi.com) and compares against the newest **stable**
+  version. Pre-release gallery versions are skipped; the emitted command
+  remains `code --install-extension <id> --force`, which cannot install
+  pre-releases. Previously vscode had no `OutdatedLister`, so every
+  tracked extension was kept on every check.
+- `genv apply` recovers when the lock and the manager disagree: uninstalling
+  a package that is already gone is treated as success and the lock entry is
+  dropped. `genv remove` writes the spec only after uninstall succeeds, and
+  `genv disown` can clear lock-only leftovers. Package removal failures no
+  longer skip post-apply hooks unless there is a real unresolved file mismatch.
+- asdf, sdkman, and stack `Query` no longer report absent for packages they
+  cannot inspect. After apply's Query-based uninstall recovery, that false
+  absent dropped the lock while the package was still installed. Those adapters
+  now return an error so uninstall still runs.
+
+## v4.2.2 - 2026-08-22
+
+### Fixed
+
+- README now documents every apply/status/upgrade flag it references (including
+  `--skip-packages`, `--timeout`, and the upgrade filter flags), and install
+  examples pin the current release.
+- Shell completions offer `status --offline` and `completion install
+  powershell` in all four shells; six stale `--host` help strings now say the
+  default is host classification, matching reality and the README.
+- CI workflows cancel superseded runs via concurrency groups instead of
+  queueing duplicates.
+- The scheduled updates worker no longer abandons an in-flight upgrade when
+  its job budget expires: it waits on a short shutdown grace so package
+  managers are not killed mid-transaction, and drains in-flight desktop
+  notifications (bounded by their own 3s timeout) before closing the audit
+  log.
+- RELEASING.md now describes AUR publishing accurately (separate macOS job,
+  not GoReleaser) and the real changelog exclude filters.
+- Spec and lock file writes are now durable across crashes: both are fsynced
+  before the publishing rename (and the directory afterwards), so a power
+  loss can no longer leave an empty or partial `genv.json` /
+  `genv.lock.json`.
+- `genv pull` writes the pulled spec through a temp file and rename, so an
+  interrupted pull can no longer leave `genv.json` truncated.
+- Every package-manager probe is now bounded. `genv scan`, `genv search`,
+  upgrade version capture, the outdated check, and service status probes cap
+  each manager subprocess (30s default), so a hung manager — winget's
+  first-run source sync can stall for minutes on fresh profiles — can no
+  longer wedge the command. Timed-out probes surface as errors or
+  conservative fallbacks: a timed-out outdated query keeps all packages, so
+  real upgrades are never silently skipped.
+
+### Changed
+
+- `internal/resolver`: exported `DefaultLiveListTimeout` and added `CallTimed`
+  / `RunTimed` helpers so commands that inventory managers directly share the
+  same per-spawn deadline machinery as apply/status.
+- Adapter probes (`ListInstalled`, `QueryVersion`, `Query`, `ListOutdated`,
+  availability checks) run under a shared deadline and set `WaitDelay`, so a
+  killed manager's orphaned children cannot hold output pipes open.
+
+## v4.2.1 - 2026-08-20
+
+### Fixed
+
+- `genv apply` / `genv status` only inventory managers needed by unlocked spec
+  packages, and each listing times out after 30s. A hung `composer global show`
+  no longer stalls Windows CI or a real apply.
+
+## v4.2.0 - 2026-08-20
+
+### Fixed
+
+- `genv apply` no longer treats an empty lock as “install everything”. Packages
+  already present in winget/scoop are adopted into the lock (no upgrade).
+- `winget install` uses `--disable-interactivity --no-upgrade`. Apply’s
+  per-subprocess timeout defaults to 10m (`--timeout 0` disables).
+- A failed or hung package no longer skips env/files.
+- `genv adopt <id>` reads `managers.<mgr>` from the spec (e.g. `Anysphere.Cursor`)
+  and can lock a package that is already listed in the spec.
+- Windows status/apply no longer report zsh aliases or `HOMEBREW_*` as missing.
+- Scoop subprocesses find git via the versioned `scoop/apps/git/<ver>/cmd`
+  directory when the `current` junction is invisible (OpenSSH).
+
+### Added
+
+- `genv apply --skip-packages`
+- `genv status --offline` (lock-only). Default status probes live managers;
+  installed-but-unlocked packages are `present`.
+- `external` manager for apps genv tracks but does not install.
+
+## v4.1.0 - 2026-08-19
+
+### Added
+
+- Self-hosted Scoop install channel on stable tags: GoReleaser publishes
+  `genv.json` to `ks1686/scoop-bucket`. v4.0.13 shipped GitHub/Homebrew; this
+  release is the first tag that uploads the Scoop manifest from CI.
+
+### Fixed
+
+- Scoop publisher token template matches Homebrew (`{{ .Env.SCOOP_BUCKET_GITHUB_TOKEN }}`).
+  GoReleaser 2.17 has no `envOrDefault`, which aborted the v4.0.13 scoop upload.
+- `TestRunSubcmd_PerSpawnTimeout` gives the follow-up spawn 2s (not 50ms) so
+  Windows CI does not fail `go env GOVERSION` after killing `sleep`.
+
+## v4.0.13 - 2026-08-19
+
+### Added
+
+- Self-hosted Scoop install channel: GoReleaser publishes a manifest to
+  `ks1686/scoop-bucket` when `SCOOP_BUCKET_GITHUB_TOKEN` is set, and skips that
+  upload (without failing the rest of the release) when the token is empty or
+  unset.
+
+## v4.0.12 - 2026-08-15
+
+### Fixed
+
+- Release config no longer declares GoReleaser Pro-only `wingets` / `chocolateys` keys. OSS GoReleaser 2.17 rejected them and aborted before publishing `v4.0.11`. Scoop remains configured with `skip_upload: true`.
+
+## v4.0.11 - 2026-08-15
+
+### Fixed
+
+- `genv add` now installs first and only then writes `genv.json` / the lock. Unresolved or failed installs leave the spec unchanged and exit `4`. Use `genv adopt` to track without installing.
+- New specs from `genv init`, first `add`/`scan`, and `genvfile.New` are schemaVersion 8 (`defaults` + known `targets.*`). Named profiles are refused on v8 specs.
+- Files apply rejects relative sources that escape `SourceRoot`. `--force-new-lock --dry-run` no longer renames the lock. Alias/function names are POSIX-safe. `runSubcmd` rejects empty argv.
+- `apk` name/version split now understands `-rN` releases. `pip-user` and `volta` implement `OutdatedLister`. `krew` availability requires the krew plugin, not just `kubectl`.
+- Apply unit tests that plant brew locks now seed schemaVersion 1 so Linux CI is not refused by the v8 foreign-lock gate. E2E spec assertions read v8 `targets.*` packages. Adapter `installFakeBinary` works on Windows (`PathListSeparator` + `.cmd` shim).
+- CI `govulncheck` sets `GOTOOLCHAIN=auto` so the scanner can build on Go 1.25 while unit tests stay on go.mod 1.24.3.
+- Windows unit tests isolate `USERPROFILE` (not only `HOME`), JSON-escape file paths, and treat execute-bit checks as Unix-only. Portable path helpers (`isAbsolutePath`, `brewStableBin`) no longer follow host `filepath` rules for POSIX/Homebrew strings. Completion search on Windows now stays inside a timeout instead of hanging on live `npm` queries.
+
+### Added
+
+- Native `apt`, `dnf`, and `apk` adapters (install/uninstall/query/search/outdated, default-fallback eligible). Ubuntu mapping prefers `apt` ahead of snap/linuxbrew.
+- GoReleaser Scoop stub (`skip_upload: true`). winget / Chocolatey publishers are GoReleaser Pro-only and are not declared in OSS config.
+- `Regression` GitHub Actions workflow: fail-closed add, v8 defaults, safety, adapter, files e2e, and actionlint.
+- MIT `LICENSE` and `contents: read` on non-release CI workflows.
+
+### Changed
+
+- Install docs use `brew install --cask genv` and current archive names. WSL Ubuntu examples prefer native `apt`.
+- Removed leftover Superpowers/handoff session notes and the historical `SECURITY_AUDIT.md` dump. Live security policy remains [SECURITY.md](SECURITY.md).
+
+## v4.0.10 - 2026-08-12
+
+### Added
+
+- Darwin release binaries are signed with a Developer ID Application certificate and notarized via App Store Connect (GoReleaser `notarize.macos` / quill) when `MACOS_*` GitHub Actions secrets are set. See [RELEASING.md](RELEASING.md).
+
+### Changed
+
+- Homebrew cask `post_install` no longer strips `com.apple.quarantine` (notarized binaries do not need it). It still re-runs `genv updates start` when the updates LaunchAgent is present so launchd picks up the new Caskroom path after upgrades.
+
+## v4.0.9 - 2026-08-01
+
+### Fixed
+
+- Lifecycle hooks now inherit stdin (same as package actions), so interactive prompts in hooks work at a TTY.
+- `--yes` is exposed to hooks as `GENV_YES=true|false` (alongside existing `GENV_*` context env) so hooks can opt into noninteractive flags.
+
+## v4.0.8 - 2026-08-01
+
+### Added
+
+- Shell completions for `genv add` / `genv adopt` suggest repository package names via
+  `genv __complete repo-packages` (cached manager dumps + live search fallback).
+
+## v4.0.7 - 2026-07-27
+
+### Fixed
+
+- `updates __run-once` no longer blocks on desktop notifications after a successful plan. Under launchd, `osascript` could ignore cancel and hold the process until the 5m job deadline (`updates.check.timeout` → exit 4) even though outdated detection had already finished in seconds.
+
+## v4.0.6 - 2026-07-27
+
+### Added
+
+- Scheduled `updates __run-once` logs per-manager outdated-query timings (and total plan duration) so a slow launchd run can be distinguished from a silent timeout fallback.
+
+## v4.0.5 - 2026-07-27
+
+### Fixed
+
+- `updates start` derives Homebrew `bin/genv` from Caskroom/Cellar versioned paths even when the brew symlink is missing or dangling mid-upgrade (no longer depends on `SameFile` alone).
+- Scheduled updates PATH no longer retains Homebrew shim directories captured from cask `post_install`.
+- `updates __run-once` enforces a wall-clock deadline (launchd `TimeOut` / systemd `TimeoutStartSec`, plus an in-process timeout) so a TLS/keychain hang cannot wedge the hourly checker permanently; `brew outdated` and notifications use bounded command contexts.
+
+## v4.0.4 - 2026-07-27
+
+### Fixed
+
+- `genv updates start` prefers a PATH-stable self path (e.g. Homebrew `bin/genv`) over a version-pinned Caskroom path from `os.Executable` / cask `post_install`, so the updates LaunchAgent/systemd unit survives upgrades. `updates status` warns and `validate` fails when genv-managed agents point at a missing executable.
+- Release workflow: AUR publish retries transient `aur.archlinux.org` SSH drops, and `workflow_dispatch` supports `aur-only` repair for an existing GitHub release without re-running GoReleaser.
+
+## v4.0.3 - 2026-07-26
+
+### Fixed
+
+- When `genv apply` leaves unresolved file mismatches, it now prints that post-apply hooks are being skipped (services still run before files; only hooks are gated).
+
+### Added
+
+- `genv scan --dry-run` previews packages that would be adopted without writing the spec or lock.
+- `genv scan` text mode confirms before adopting unless `--yes` is set (JSON still writes without a prompt, matching `apply --json`).
+
+## v4.0.2 - 2026-07-26
+
+### Fixed
+
+- `genv apply` no longer aborts the whole run when a managed file mismatches: packages, env, shell, and services still apply; non-conflicting file ops still run; mismatched paths are named; exit `4` if any file issues remain.
+- Text apply plans print per-file `create` / `update` / `mismatch` / `ok` lines (not only a count).
+- `genv service status` works for `brew_formula` services without a `status` argv (delegates to `brew services list`).
+- `genv updates help` / `--help` / `-h` print usage and exit 0.
+- After Homebrew cask upgrades, `post_install` re-runs `genv updates start` when the updates LaunchAgent is present; `updates status` and successful `genv upgrade` of package `genv` hint to re-register when launchd codesign kills the agent.
+- Unit tests for service apply no longer write live launchd plists under the real `$HOME`.
+
+### Added
+
+- `genv apply --backup` backs up mismatched targets before `--force` overwrite (same effect as per-entry `backup: true`).
+
+### Changed
+
+- `genv migrate` warns when host-unscoped packages are copied into every migrated target bucket.
+
+## v4.0.1 - 2026-07-26
+
+### Fixed
+
+- On schemaVersion 8 specs, `status`, `upgrade`, `updates check` / `__run-once`, `env list`, `shell status`, `service list|start|stop|status`, `adopt --files`, and add/remove lifecycle hooks now materialize the active target via the same `Resolve` + `MergeTarget` path as `apply` (with `--target` / `$GENV_TARGET`). Previously they read empty top-level fields, so status reported every lock entry as `extra` and upgrade/updates silently planned nothing after `genv migrate`.
+
+### Changed
+
+- Integration CI adds an Arch Docker **v8 command matrix** (`scripts/docker-v8-command-matrix.sh` / `make integration-v8`) that builds genv and exercises every top-level CLI command against a pacman-backed schemaVersion 8 spec.
+
+## v4.0.0 - 2026-07-26
+
+### Added
+
+- Native Windows PowerShell parity (schema **v7**): `env`/`shell` profile backends write `env.ps1` / `shell.ps1` and inject the CurrentUser CurrentHost profile when `pwsh` or Windows PowerShell is on `PATH` (prefer `pwsh`). Aliases/functions may set `"shell": "powershell"`; omitted `shell` stays POSIX-only. Hooks on Windows use the detected PowerShell engine (`-NoProfile -Command` / `-File`), with `cmd /C` fallback. `genv completion powershell` embeds and installs `completions/genv.ps1`.
+- Multi-machine portability (schema **v8**): `defaults` plus `targets.*` let one git-tracked `genv.json` carry macOS, Windows, native Arch, Ubuntu-like Linux, Ubuntu WSL2, and Arch WSL2 desired state without sharing lock files. `genv migrate` converts legacy host predicates to target buckets, `genv map --target` prints assist-only manager mapping suggestions, and `genv export --target --out` writes single-target snapshots plus reports while omitting locks and sensitive env values. `genv apply --target` selects the active bucket and refuses foreign locks unless `--force-new-lock` backs them up first.
+
+### Changed
+
+- CI now enforces a statement-coverage floor (`COVER_MIN`, default 80%) via `make cover-gate` and runs `make bench-gate` for the cold-start budget (`BENCH_MAX_MS`; local default 200ms, CI uses 400ms for shared-runner noise). Previously claimed but not wired into GitHub Actions.
+- Documentation cleanup: roadmap/release/security wording aligned with the v3.x/v4.x line; winget/Scoop/Chocolatey install channels explicitly deferred; outdated-upgrade plan and scheduler handoff marked completed/historical; `SECURITY_AUDIT.md` annotated with 2026-07-25 remediation status.
+- Host classification no longer treats WSL2 as a blanket Arch match. Targets are `macos`, `windows`, `arch`, `ubuntu`, `wsl-arch`, and optional `linux`.
+- Documentation pass for the v4.0.0 line: README rewritten around schema v8 targets and current install/CLI surface; SCHEMA, SECURITY, ROADMAP, and platform install guides updated for PowerShell (v7), portable targets (v8), and versioned release asset names.
+
+### Fixed
+
+- README `--lock-file` help text now correctly defaults to the genv config directory (not “next to the resolved spec”).
+- `genv pull` copies relative `files` assets with the spec (not only `genv.json`), and refuses to ship locks/secrets in pull/export bundles.
+
+## v3.2.1 - 2026-07-21
+
+### Changed
+
+- Internal cleanup for outdated detection: shared registry HTTP helper, `Filters.All` as the single `--all` / outdated-filter switch (removed redundant `DetectOutdated`), co-located outdated helpers, and table-driven outdated adapter tests.
+
+## v3.2.0 - 2026-07-21
+
+### Changed
+
+- `genv upgrade` now plans only packages with a detected update by default (same outdated filtering as `genv updates check`). Pass `--all` to restore the previous brute-force plan of every unconstrained tracked package. Outdated detection now also covers npm/pnpm/yarn, uv/pipx, cargo, winget/scoop/choco, pacman/paru/yay, and snap. Multiple Mac App Store upgrades are batched into one `mas upgrade` invocation.
+
+## v3.1.0 - 2026-07-15
+
+### Changed
+
+- `genv updates check` and the background updates checker now report only packages that actually have an update available, instead of planning an upgrade for every tracked package. The checker previously emitted one upgrade batch per manager unconditionally, so its notification count never reflected reality and never dropped after upgrading. Outdated status is now detected per manager — `brew outdated --json=v2` (formulae and casks), `mas outdated`, and, because bun has no reliable global-outdated command, an npm registry `latest` comparison for global bun packages. A manager whose query fails keeps all of its packages (so a real update is never silently missed), and managers without outdated detection are unchanged. The scheduled-check notification now counts outdated packages rather than batches and stays silent when nothing is outdated. `genv upgrade` is unchanged and still upgrades every tracked package, letting each manager skip already-current ones.
+
+## v3.0.5 - 2026-07-13
+
+### Fixed
+
+- The `gem` adapter no longer reports gems from an installation directory it cannot write to (e.g. macOS system Ruby at `/Library/Ruby/Gems`). Those gems are root-owned, so `genv scan` was adopting dozens of unmanageable packages that failed every `genv upgrade` with `Gem::FilePermissionError`. When the active gem install dir is not writable, the adapter now lists nothing.
+
+## v3.0.4 - 2026-07-13
+
+### Fixed
+
+- `genv scan` no longer re-adopts packages whose friendly ID differs from their manager-specific name. Adapters like `mas` report installed apps by their manager name (a numeric App Store product ID), so an app already tracked as `{"id":"xcode","managers":{"mas":"497799835"}}` was adopted again on every scan as a duplicate bare-numeric `497799835` entry — doubling its App Store upgrade work. Scan now treats every `managers` value as already tracked.
+
+## v3.0.3 - 2026-07-13
+
+### Fixed
+
+- The Homebrew cask now strips `com.apple.quarantine` on install. The release binaries are adhoc-signed (not notarized), so macOS quarantined them, and launchd refused to exec a quarantined adhoc binary (`OS_REASON_EXEC`) — breaking `genv updates` scheduled jobs after every cask install/upgrade.
+- `bun` global packages are now upgraded with `bun add --global` instead of `bun update --global`. The latter looks for a local `package.json` and no-ops for globally-installed packages ("No package.json, so nothing to update"), so scheduled upgrades never actually updated bun globals and reported failures.
+
+## v3.0.2 - 2026-07-13
+
+### Fixed
+
+- Automatic manager discovery is now platform-native: macOS search, scan, and implicit resolution use `brew` without duplicate `linuxbrew` suggestions, while Linux uses `linuxbrew`. Explicit `prefer` and `managers` configuration remains authoritative when the selected manager is available.
+- Managed update jobs now receive a deterministic package-manager `PATH` under launchd and systemd, and `genv updates status` distinguishes registration, active execution, successful runs, and failed runs using real supervisor state.
+- `genv upgrade` and managed updates conservatively skip version-constrained packages when an adapter cannot guarantee a compatible target instead of issuing an unsafe latest-version upgrade.
+- Scheduled auto-apply now fails closed when its audit log cannot be opened, records each failed action with its tracked package IDs, and retains bounded, credential-redacted manager diagnostics.
+
+## v3.0.1 - 2026-07-11
+
+### Fixed
+
+- `genv env set`, `genv shell alias set`, and `genv service add` no longer downgrade `schemaVersion` when editing a spec that already declares a newer version. Previously they rewrote the version to the minimum required by the newly-added block (`2`, `3`, and `4` respectively), which corrupted v5/v6 files (dropping support for `files`, `hooks`, and `updates` blocks) and caused the very next validation to fail. They now raise the version to the required minimum only when the current version is older.
+
+## v3.0.0 - 2026-07-11
+
+### Added
+
+- `genv upgrade` now supports machine-readable `--json` output plus tracked-only filters: `--only`, `--skip`, `--only-manager`, and `--skip-manager`.
+- `genv updates check/start/stop/status` adds a managed updates checker built on the same tracked-only upgrade planner. It defaults to check/log/notify behavior and only applies upgrades when `updates.autoApply` is explicitly enabled.
+- Schema v6 adds the `updates` block and expands lifecycle hooks to apply/add/remove/upgrade phases with `--no-hooks`, hook timeouts, deterministic hook context environment, and script-file hook references.
+- `genv profile list/create/switch` adds named profiles stored under `profiles/<name>.json`, merged over the base `genv.json`, with active profile state recorded in the lock file.
+- Added tracked-only language/tool/plugin adapters for global JS/TS, Python/data, Rust, Go, Ruby/PHP/.NET, Haskell/OCaml/Julia, universal version managers, Kubernetes plugins, Helm plugins, and VS Code extensions.
+
+### Changed
+
+- Resolver fallback is now restricted to system package managers. Ecosystem, toolchain, and plugin managers such as `npm`, `cargo`, `go`, `krew`, `helm`, and `vscode` remain selectable through `prefer` or `managers`, but are never blind fallback targets.
+- Public docs now explicitly distinguish genv's tracked-only updates checker from a full-machine update-all runner.
+- macOS user-facing manager choices dedupe `brew`/`linuxbrew` while preserving existing `linuxbrew` specs and locks.
+
+### Documentation
+
+- README, SCHEMA, and ROADMAP now document schema v6, updates, profiles, lifecycle hooks, tracked-only adapter semantics, and the v3.0.0 closure of the currently committed roadmap backlog.
+
+## v2.4.0 - 2026-07-07
+
+### Changed
+
+- `genv upgrade` now batches tracked packages by package manager and issues one selective multi-package upgrade command per manager when the underlying tool supports it (`pacman`, `paru`, `yay`, `brew`, `linuxbrew`, `choco`, `scoop`, `snap`). Managers without selective multi-package upgrade syntax (`uv`, `mas`, `bun`) remain per-package. Post-upgrade version refresh also uses a single list command for managers that support it (`pacman`, `paru`, `yay`, `snap`, plus existing `bun`, `choco`, `scoop`, `uv`, `mas`), reducing the total number of subprocesses from O(packages) to O(managers). Untracked packages are never touched.
+
+### Added
+
+- New optional `adapter.BatchUpgrader` interface for adapters that can upgrade multiple named packages in one command while leaving untracked packages alone.
+- `ListInstalledVersions` implementations for `pacman`, `paru`, `yay`, and `snap` to power the batched version refresh.
+
+### Documentation
+
+- README, CHANGELOG, ROADMAP, AGENTS, and CONTRIBUTING now reflect the batched upgrade behavior and the new `BatchUpgrader` extension.
+
+## v2.3.4 - 2026-07-07
+
+### Added
+
+- **`genv completion install [shell] [--dir <path>]`** — installs the embedded completion script into the shell's standard completion directory so completions work with no manual setup: zsh → `$XDG_DATA_HOME/zsh/site-functions/_genv`, bash → `$XDG_DATA_HOME/bash-completion/completions/genv`, fish → `$XDG_CONFIG_HOME/fish/completions/genv.fish`. The shell is auto-detected from `$SHELL` when omitted, and `--dir` overrides the target directory (e.g. to install into a directory already on your zsh `$fpath`). The positional shell may appear before or after `--dir`.
+- The shipped bash/zsh/fish completion scripts now complete the new `completion install` subcommand and its `--dir` flag.
+
+## v2.3.3 - 2026-07-07
+
+### Added
+
+- **`mas` adapter** for managing Mac App Store apps through the `mas` CLI (macOS only). Apps are tracked by their numeric App Store product ID via the `managers.mas` field, e.g. `{"id": "xcode", "managers": {"mas": "497799835"}}`. Implements install/uninstall (`sudo`-prefixed, like `pacman`/`snap`)/upgrade planning, installed-membership and version queries, and the batch `VersionLister` path (a single `mas list` call) consumed by `genv scan` and `genv status`. `mas` is now a recognized manager in both Go schema validation and the published JSON schema.
+
+### Fixed
+
+- `genv upgrade` no longer prints raw lifecycle-hook command strings to the terminal. The per-hook "running hook" log line dropped from INFO to DEBUG, so it now appears only under `--debug` instead of trailing every upgrade with escaped shell commands.
+
+## v2.3.2 - 2026-07-07
+
+### Fixed
+
+- Shortened Snap Store package summary metadata to satisfy snapcraft's 78-character validation limit.
+
+## v2.3.1 - 2026-07-07
+
+### Changed
+
+- Rewrote repository history to preserve only the active contributors, Karim Smires and Omar Waseem, while removing bot/AI co-author trailers from commits.
+- Reduced redundant package-manager listing work for `bun`, `choco`, `scoop`, and `uv`, and taught `genv scan` to use the new batch version-listing path instead of querying versions package-by-package.
+- Parallelized package search across searchable adapters while preserving adapter-priority ordering and first-seen deduplication.
+- Cached repeated adapter lookups in resolver upgrade/removal planning paths.
+
+### Fixed
+
+- Hooks now use `cmd /C` on native Windows instead of assuming `sh -c` exists.
+- File symlink errors on Windows now include an actionable Developer Mode / Administrator hint while preserving the original error for unwrapping.
+- Service unit/plist path construction now resolves the user home directory through `os.UserHomeDir()` instead of directly reading `HOME`.
+- File-apply summary errors now preserve underlying errors for `errors.Is` / `errors.As` without changing the human-readable summary.
+- Built-in help, bash/zsh/fish completions, and CI metadata now reflect the current command set and platform support.
+- Release checksum signing now uses cosign v3's Sigstore bundle output instead of the removed separate certificate/signature output flags.
+
+### Documentation
+
+- Rewrote stale install and e2e documentation for schema v5 files, WSL2, macOS, and native Windows.
+- Reframed contribution guidance around the project being personal/solo-maintained while preserving Omar Waseem's contributor attribution.
+- Updated README, roadmap, release metadata, and agent guidance for the v2.3.x state of the tool.
+
+## v2.3.0 - 2026-07-07
+
+### Added
+
+- **Native Windows support** (previously WSL2-only): a new `windows` host classification (`internal/host.Classify`), plus three new adapters — `winget`, `scoop`, and `choco`. `bun` and `uv` already worked cross-platform and now cover global installs on native Windows too. This was the Windows-support portion of the v3.0.0 milestone; the later v3.0.0 line completes the updates checker as well.
+- `files.links[]` gains a third mode, `"merge-dir"`, alongside `"link"` and `"managed-link"`. Instead of symlinking an entire source directory as one unit, it symlinks each file under source individually into target. This lets multiple records target the *same* directory — e.g. one with no `host`, one `host`-filtered — and layer: a later record's same-named file wins over an earlier one without needing `--force`, so a shared base directory plus a small host-specific override directory can compose one target directory, instead of requiring a full separate source tree per host. `genv status --files` reports one entry per merged file for per-file drift detection.
+
+### Fixed
+
+- `Uv.PlanClean` returned `nil` ("no standard tool-only cache-clean command") — true for `uv tool`, but `uv` itself has a real global cache-clean command. `genv clean` now runs `uv cache clean` for uv, same as every other adapter with a real cache to clear.
+
+### Documentation
+
+- README's CLI reference table was missing `genv adopt --files`, `genv status --files`, and `genv pull` entirely (never added when they shipped). Documented all three, plus a `genv pull` flags section and the `--files` flag under `genv status` flags.
+
+## v2.2.1 - 2026-07-06
+
+### Fixed
+
+- `Brew`/`Linuxbrew` adapters' `ListInstalled` ran `brew list --formula --1` (and `--cask --1`) — `--1` is not a recognized brew flag, so brew silently printed its usage banner and exited 0 instead of listing anything. This broke `genv scan` for every brew/Linuxbrew user: it always reported "0 added" regardless of how much was actually installed. Fixed to `-1` (one-per-line output), with new regression tests in `internal/adapter/brew_test.go` that check the exact arguments passed, not just that *some* output comes back.
+
+## v2.2.0 - 2026-07-06
+
+Ships the `tc-genv-migration` surface: schema v5 (`files` + `hooks` blocks, `host` selector, `repo` field), three new adapters, and the commands needed to move a dotfiles repo from shell scripts to a declarative `genv.json`. This is a **scoped subset** of Milestone M13 (hooks and lifecycle scripts) — see ROADMAP.md M13 for what's shipped versus still open (no `add`/`remove` hook wiring, no `GENV_EVENT`/`GENV_INSTALLED`/`GENV_REMOVED` env context, no `--no-hooks` flag, no script-file hook references, no hook-specific timeout).
+
+### Schema v5
+
+- `files` block with `link`, `copy`, `copy-template`, and `managed-link` modes, per-record `Host` selector, and a `Backup` flag controlling whether a forced overwrite preserves the old target.
+- `hooks` block with three fixed phases: `hooks.preUpgrade`, `hooks.postApply`, `hooks.postUpgrade`. Hooks are literal shell command strings, host-filtered, executed via `sh -c`; the hook carries its own privilege (e.g. `sudo pacman -Syu`) — genv does not add `sudo` itself.
+- `host` selector (`HostPredicate`, accepting a single string or a string array) on `packages`, `services`, `files`, and `hooks` records, matched against a runtime-detected `macos`/`arch`/`wsl2` host. WSL2 inherits every `host:"arch"` record.
+- `repo` top-level field: the local path to the spec repo, consumed by `genv pull`.
+- Lock file location changed: the default lock path is now `~/.config/genv/genv.lock.json` (from the genv config dir), no longer derived from the spec path. Overridable with `--lock-file`. v1–v4 specs still load unchanged.
+
+### Re-added and new adapters
+
+- **`pacman`** — Arch Linux official repositories only (`pacman -S --needed --noconfirm`, `sudo`-prefixed). Re-added because Arch official repositories are first-party to the distro, unlike the v2.1.2-removed apt/dnf-style managers that required submission to and approval by external repositories. AUR packages remain covered by the existing `paru` and `yay` adapters.
+- **`bun`** — global installs only (`bun add --global <pkg>`); cwd-scoped installs are out of scope and belong in a hook.
+- **`uv`** — global tool installs only (`uv tool install <pkg>`); venv-scoped installs are out of scope.
+
+### New commands
+
+- `genv pull` — self-pulls the spec repo declared in the `repo` field; refuses on a dirty working tree.
+- `genv adopt --files` — registers already-managed files into the lock without rewriting them (template targets are rendered before comparison).
+- `genv status --files` — live-filesystem parity check for the `files` block, separate from the existing spec-vs-lock `genv status` contract.
+
+### Fixes
+
+- `pacman`'s `PlanInstall`/`PlanUninstall`/`PlanUpgrade`/`PlanClean` commands are now `sudo`-prefixed, matching `snap`. Unlike `paru`/`yay`, bare `pacman` has no built-in privilege escalation, so `genv clean` (which runs every detected adapter's clean command) failed for any non-root user.
+- The `internal/host` `Classify()` unit test no longer fails on a plain Linux CI runner that is neither Arch nor WSL2 (it now skips instead of asserting a known class).
 
 ---
 
@@ -127,10 +1063,10 @@ Milestones M6 and M7 are complete. The CLI surface, JSON output schema, and `gen
 
 - `--json` output envelope gains a `"version"` field; schema is versioned and documented.
 - Formal deprecation policy established: breaking changes require a major version bump.
-- All internal packages reach ≥80% line coverage as reported by `go test -cover`.
+- All internal packages reach ≥80% line coverage as reported by `go test -cover`. *(Clarified 2026-07: CI enforces an 80% **total** statement-coverage floor via `COVER_MIN` / `make cover-gate`; per-package totals vary.)*
 - Property-based and fuzz tests added for version constraint logic and the resolver.
 - End-to-end smoke tests run `genv apply` against real package managers in CI.
-- Resolver + manager detection benchmarked; <200ms cold-start budget enforced as a CI gate.
+- Resolver + manager detection benchmarked; <200ms cold-start budget enforced as a CI gate. *(Wired into GitHub Actions in Unreleased.)*
 - Security audit: all adapter shell invocations reviewed for injection vectors; none found.
 
 ### Developer and user experience (M7)

@@ -4,6 +4,12 @@ on:
   push:
   pull_request:
 
+# Superseded runs (a new push to the same branch/PR) are cancelled instead of
+# queueing duplicate full runs.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
 
@@ -12,10 +18,33 @@ permissions:
 #   1. Adapter-layer tests  (internal/adapter/)
 #   2. End-to-end tests     (e2e/)
 #
+# Plus a schemaVersion 8 CLI command matrix that builds genv inside Arch and
+# exercises every top-level command (not install-only).
+#
 # Skipped adapters and reasons:
 #   linuxbrew   — Brew on Linux; same caching/time constraint as macOS brew.
 
 jobs:
+  # ── schemaVersion 8 full CLI command matrix ─────────────────────────────────
+  # Builds the current sources in Arch and runs scripts/docker-v8-command-matrix.sh
+  # against a real pacman-backed v8 spec. Covers apply/status/upgrade/updates,
+  # add/remove hooks, env/shell/service, export/map, and the rest of the CLI.
+  v8-command-matrix:
+    name: arch-latest (v8 command matrix)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run schemaVersion 8 CLI command matrix
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/src:ro" \
+            -e GENV_SRC_ROOT=/src \
+            archlinux:latest \
+            bash /src/scripts/docker-v8-command-matrix.sh
+
   # ── paru (Arch AUR helper) ───────────────────────────────────────────────────
   # paru refuses ALL operations when run as root. Spin up an Arch container via
   # docker run, build paru from AUR as a non-root builder user, then run tests
@@ -25,7 +54,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build paru and run integration tests
         run: |
@@ -34,6 +63,8 @@ jobs:
             archlinux:latest \
             bash -c '
               set -euo pipefail
+
+              sed -i "s/^CheckSpace/#CheckSpace/; s/^#DisableSandbox/DisableSandbox/" /etc/pacman.conf
 
               echo "==> Updating system and installing build dependencies"
               pacman -Syu --noconfirm
@@ -82,7 +113,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Build yay and run integration tests
         run: |
@@ -91,6 +122,8 @@ jobs:
             archlinux:latest \
             bash -c '
               set -euo pipefail
+
+              sed -i "s/^CheckSpace/#CheckSpace/; s/^#DisableSandbox/DisableSandbox/" /etc/pacman.conf
 
               echo "==> Updating system and installing build dependencies"
               pacman -Syu --noconfirm
@@ -140,13 +173,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Enable snapd
         run: |
@@ -169,16 +202,33 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-          cache: true
+          cache: false
 
       - name: Adapter integration test — TestBrew
         run: go test -tags integration -race -v -run TestBrew ./internal/adapter/
 
       - name: E2E test — TestE2EBrew
         run: go test -tags integration -race -v -run TestE2EBrew ./e2e/
+
+  # Hermetic files-block e2e (no live package manager required).
+  files:
+    name: ubuntu-latest (files e2e)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Files e2e
+        run: go test -tags integration -race -v -run TestFiles_ ./e2e/

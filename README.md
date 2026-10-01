@@ -1,365 +1,363 @@
-# genv — Global Environment Manager
+# genv
 
-Track, sync, and reproduce your software environment across Linux, macOS, and WSL2.
+Track, sync, and reproduce your software environment across **macOS**, **Windows**, **Arch Linux**, **Ubuntu-like Linux**, and **WSL2**.
+
+`genv` is a thin layer over the package managers you already use. Desired state lives in one git-friendly `genv.json`. Applied state lives in a machine-local lock file. Run `genv apply` and the machine matches the spec.
+
+**Current release:** [latest](https://github.com/ks1686/genv/releases/latest) (v4.1.0+) — schema **v7** PowerShell parity, schema **v8** portable multi-target configs.
 
 ```bash
-genv add git                       # add and immediately install a package
-genv remove git                    # remove from spec and immediately uninstall
-genv adopt git                     # track an already-installed package without reinstalling
-genv disown git                    # stop tracking a package without uninstalling it
-genv scan                          # bulk-adopt all installed packages into genv.json
-genv status                        # show drift between genv.json and the lock file
-genv apply                         # reconcile system state with genv.json
-genv apply --dry-run               # preview what will change
-genv apply --yes                   # apply without a confirmation prompt (CI-safe)
-genv apply --dry-run --json        # machine-readable plan output
+genv add git                          # track + install
+genv apply --dry-run                  # preview reconcile
+genv apply --yes                      # apply without prompt
+genv status                           # show drift
+genv migrate --write                  # upgrade a legacy spec to v8
+genv export --target ubuntu --out ./u # single-target snapshot + report
+genv map --target arch                # assist-only manager suggestions
 ```
-
----
-
-## What it is
-
-`genv` is a thin layer on top of your existing package managers. It tracks what you want installed in a single `genv.json` file, then figures out how to install each package on whatever machine you're on.
-
-It follows a declarative model: **you edit the spec file, and `genv apply` makes reality match it** — installing packages that were added and uninstalling ones that were removed. A `genv.lock.json` file records what genv last applied, so it only acts on the delta.
-
-Move to a new machine? Clone your dotfiles, run `genv apply`, and you're done.
-
----
-
-## Supported platforms and package managers
-
-| Platform | Managers                                                                                            |
-| -------- | --------------------------------------------------------------------------------------------------- |
-| Linux    | `paru`, `yay` (AUR), `snap`, `linuxbrew`                                                            |
-| macOS    | `brew` (formulae + casks)                                                                           |
-| Windows  | WSL2 (targets the Linux userland inside WSL2)                                                       |
-
-`genv` detects which managers are available on the current host and picks the best one automatically, or uses your preference.
 
 ---
 
 ## Install
 
-### macOS
+| Platform | Install |
+| -------- | ------- |
+| macOS | `brew tap ks1686/tap && brew install --cask genv` |
+| Arch / Manjaro | `paru -S genv` or `yay -S genv` (or `genv-bin`) |
+| Other Linux | GitHub release tarball (see below) |
+| Windows | Scoop (self-hosted bucket) or GitHub release zip (see below) |
+| Any (from source) | `go install github.com/ks1686/genv@latest` (Go 1.24+) |
+
+**Linux x86-64 example** (replace the version to match [Releases](https://github.com/ks1686/genv/releases/latest)):
 
 ```bash
-brew tap ks1686/tap
-brew install genv
-```
-
-### Linux — Arch / Manjaro
-
-```bash
-paru -S genv      # or: yay -S genv
-```
-
-### Linux — other distros
-
-Download a pre-built binary from [Releases](https://github.com/ks1686/genv/releases/latest):
-
-```bash
-# example for x86-64 Linux
-curl -Lo genv.tar.gz https://github.com/ks1686/genv/releases/latest/download/genv_linux_amd64.tar.gz
+curl -Lo genv.tar.gz https://github.com/ks1686/genv/releases/latest/download/genv_4.5.1_linux_amd64.tar.gz
 tar -xzf genv.tar.gz
 sudo mv genv /usr/local/bin/
-```
-
-### Windows (WSL2)
-
-Use the Linux instructions above inside your WSL2 shell. See the [WSL2 install guide](docs/wsl2-install.md) for a full walkthrough.
-
-### Any platform — Go install
-
-```bash
-go install github.com/ks1686/genv@latest
-```
-
-Requires Go 1.21+. The binary is placed in `$GOPATH/bin`.
-
----
-
-Verify the installation:
-
-```bash
 genv version
 ```
 
-Release binaries are signed with [cosign](https://docs.sigstore.dev/cosign/overview/) using keyless signing. The signature and certificate are attached to every GitHub release alongside `checksums.txt`.
+**Windows (Scoop, after Scoop itself is installed):**
+
+```powershell
+scoop bucket add ks1686 https://github.com/ks1686/scoop-bucket
+scoop install genv
+```
+
+The bucket is self-hosted (not Scoop extras). `scoop install genv` needs a root
+`genv.json` on that bucket, which the first stable tag uploaded.
+
+**Windows (PowerShell zip):**
+
+```powershell
+Invoke-WebRequest -Uri https://github.com/ks1686/genv/releases/latest/download/genv_4.5.1_windows_amd64.zip -OutFile genv.zip
+Expand-Archive genv.zip -DestinationPath .
+# put genv.exe on PATH, then:
+genv version
+```
+
+winget and Chocolatey installers for the **genv binary** are not published
+(GoReleaser Pro). Once genv is on `PATH`, it still **manages packages** through
+winget, Scoop, and Chocolatey.
+
+Release archives ship cosign-signed checksums (keyless). Darwin binaries are also Developer ID signed and notarized when Apple secrets are configured — see [SECURITY.md](SECURITY.md).
+
+Platform walkthroughs: [Linux](docs/linux-install.md) · [macOS](docs/macos-install.md) · [Windows](docs/windows-install.md) · [WSL2](docs/wsl2-install.md) · [multi-machine](docs/multi-machine.md)
 
 ---
 
 ## Quick start
 
+### One machine
+
 ```bash
-# Add packages — each one is tracked in genv.json and installed immediately
+genv init                              # optional wizard
 genv add git
 genv add neovim --version "0.10.*"
-genv add firefox --manager flatpak:org.mozilla.firefox
-
-# Bulk-adopt all packages already installed on this machine
-genv scan
-
-# Adopt a single already-installed package — track it without reinstalling
-genv adopt ripgrep
-
-# Disown a package — stop tracking it without uninstalling it
-genv disown ripgrep
-
-# Check if genv.json and the lock file are in sync
+genv scan                              # bulk-adopt user-facing installs (not brew deps / stdlib)
 genv status
-
-# See what is currently tracked by genv (reads genv.lock.json)
-genv list
-
-# Edit genv.json directly in your $EDITOR
-genv edit
-
-# Reconcile — installs newly added packages, removes deleted ones
-genv apply --dry-run   # preview the delta first
-genv apply             # apply it (prompts for confirmation)
-genv apply --yes       # apply without prompting (for CI / scripts)
-
-# Machine-readable output for pipelines
-genv apply --dry-run --json
-genv status --json
-
-# Remove a package — uninstalls it and removes it from the spec
-genv remove git
+genv apply --dry-run
+genv apply --yes
 ```
 
-Your `genv.json` lives at `~/.config/genv/genv.json` by default (respects `$XDG_CONFIG_HOME`). It is just a file — commit it, share it, version it.
+Default paths (respect `$XDG_CONFIG_HOME`):
+
+| File | Location | Role |
+| ---- | -------- | ---- |
+| Spec | `~/.config/genv/genv.json` | Desired state — edit / commit this |
+| Lock | `~/.config/genv/genv.lock.json` | Applied state — **machine-local, never commit** |
+
+### Multiple machines (schema v8)
+
+Put shared settings in `defaults`, OS-specific packages under `targets.*`, commit the spec, then apply per machine:
+
+```bash
+genv migrate --file genv.json --write   # if upgrading from v1–v7
+genv map --target ubuntu                # see manager gaps (read-only)
+genv apply --target ubuntu --dry-run
+genv apply --target ubuntu --yes
+```
+
+Active target resolution: `--target` → `$GENV_TARGET` → host classification.
+
+Full guide: [docs/multi-machine.md](docs/multi-machine.md).
 
 ---
 
-## How the declarative model works
+## Targets and package managers
 
-`genv` maintains two files side by side:
+| Target | Detected when | Typical managers |
+| ------ | ------------- | ---------------- |
+| `macos` | macOS | `brew`, `mas` |
+| `windows` | native Windows | `winget`, `scoop`, `choco` |
+| `arch` | native Arch / Arch-like | `pacman`, `paru`, `yay` |
+| `ubuntu` | Ubuntu-like Linux **or** Ubuntu-like WSL2 | `apt`, `snap`, `linuxbrew` |
+| `wsl-arch` | Arch-like WSL2 | `pacman`, `paru`, `yay` |
+| `linux` | optional catch-all (set via `--target` / `GENV_TARGET`) | `apt`, `dnf`, `apk`, `snap`, `linuxbrew`, … |
 
-| File             | Default location                | Purpose                                                                                                 |
-| ---------------- | ------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `genv.json`      | `~/.config/genv/genv.json`      | **Desired state** — what you want installed. Edit via `genv add`/`genv remove`/`genv edit`/`genv scan`. |
-| `genv.lock.json` | `~/.config/genv/genv.lock.json` | **Applied state** — what genv last installed, via which manager. Auto-managed; do not edit by hand.     |
+WSL2 does **not** inherit native `arch` automatically. Put shared bits in `defaults`; use `targets.ubuntu` or `targets.wsl-arch` for distro-specific packages.
 
-When you run `genv apply`:
+**Also available** (explicit `prefer` / `managers`): `bun`, `npm`, `pnpm`, `yarn`, `deno`, `volta`, `uv`, `pipx`, `pip-user`, `poetry`, `conda`, `mamba`, `pixi`, `cargo`, `go`, `rustup`, `gem`, `composer`, `dotnet-tool`, `ghcup`, `stack`, `opam`, `juliaup`, `sdkman`, `asdf`, `mise`, `krew`, `helm`, `vscode`.
 
-1. genv reads `genv.json` (desired) and `genv.lock.json` (last applied).
-2. Packages in desired but not in the lock → **install**.
-3. Packages in the lock but not in desired → **uninstall** (using the manager recorded in the lock, then clean cache).
-4. Packages in both → **skip** (already up to date).
-5. Lock file is updated to reflect what actually succeeded.
+On schema v1-v8, `external` is a track-only pseudo-manager for software installed outside a package manager. Schema v9 can instead attach a managed external recipe that discovers GitHub Releases or structured HTTP releases, verifies the selected artifact, and installs/removes direct executables, archives, or installer scripts. See [managed external releases](docs/external-releases.md) and [SCHEMA.md](SCHEMA.md#managed-external-releases-v9).
 
-`genv add <id>` and `genv remove <id>` are convenience commands that update the spec **and** immediately install or uninstall the single package, keeping the lock in sync.
+Schema v8 also accepts top-level `adapters` for plugin CLIs genv does not ship built-in (`claude plugin`, `gh extension`, …). Set `prefer` to the adapter name. Details and examples: [SCHEMA.md](SCHEMA.md#spec-adapters-v8).
 
-`genv adopt <id>` and `genv disown <id>` give you fine-grained tracking control without touching the system: adopt starts tracking a package that's already installed (no install runs), and disown stops tracking one without uninstalling it.
-
-`genv scan` discovers every package currently installed across all available managers and bulk-adopts them into your spec and lock — useful for generating a baseline spec from an existing machine.
-
-`genv status` compares your spec and lock file and reports any drift — packages in the spec but not yet applied, packages in the lock but removed from the spec, and version constraint violations.
+Native `apt`, `dnf`, and `apk` adapters are registered system managers (`prefer: apt|dnf|apk`). Use `genv map` / `genv export` when moving a spec across Linux families.
 
 ---
 
-## genv.json format
+## Spec format (schema v8/v9)
+
+Recommended shape for new configs:
 
 ```json
 {
-  "schemaVersion": "4",
-  "packages": [
-    {
-      "id": "git"
+  "schemaVersion": "8",
+  "defaults": {
+    "env": {
+      "EDITOR": { "value": "nvim" }
     },
-    {
-      "id": "neovim",
-      "version": "0.10.*",
-      "prefer": "brew"
-    },
-    {
-      "id": "firefox",
-      "managers": {
-        "flatpak": "org.mozilla.firefox",
-        "brew": "firefox",
-        "snap": "firefox"
-      }
-    }
-  ],
-  "env": {
-    "EDITOR": {
-      "value": "nvim"
-    }
-  },
-  "shell": {
-    "aliases": {
-      "ll": {
-        "value": "ls -lah"
+    "shell": {
+      "aliases": {
+        "ll": { "value": "ls -lah" }
       }
     }
   },
-  "services": {
-    "syncthing": {
-      "start": ["syncthing", "serve"],
-      "stop": ["pkill", "-f", "syncthing"]
+  "targets": {
+    "macos": {
+      "packages": [
+        { "id": "git", "prefer": "brew" },
+        { "id": "ripgrep", "prefer": "brew" }
+      ]
+    },
+    "ubuntu": {
+      "packages": [
+        { "id": "git", "prefer": "apt" },
+        { "id": "ripgrep", "prefer": "apt" }
+      ],
+      "env": {
+        "EDITOR": null
+      }
+    },
+    "windows": {
+      "packages": [
+        {
+          "id": "git",
+          "prefer": "winget",
+          "managers": { "winget": "Git.Git", "scoop": "git", "choco": "git" }
+        }
+      ],
+      "shell": {
+        "aliases": {
+          "ll": { "value": "Get-ChildItem", "shell": "powershell" }
+        }
+      }
     }
+  },
+  "updates": {
+    "enabled": true,
+    "interval": "24h",
+    "autoApply": false,
+    "notify": true
+  },
+  "repo": {
+    "url": "https://github.com/example/dotfiles",
+    "ref": "main"
   }
 }
 ```
 
-**Fields:**
+**v8 rules (short):**
 
-- `id` — canonical name for the package (used by genv)
-- `version` — optional version constraint; omit for latest; supports `"x.y.*"` prefix wildcards
-- `prefer` — optional hint for which manager to use first
-- `managers` — optional map of manager-specific package identifiers (for packages with different names across managers)
-- `env` — optional map of global shell environment variables managed by genv
-- `shell` — optional shell config block for aliases/functions/source snippets
-- `services` — optional service block for declarative user-space service lifecycle management
+- Desired state lives under `defaults` and/or `targets.<id>` — not as top-level `packages` / `env` / `shell` / `files` / `services` / `hooks`.
+- No per-record `host` in v8 (use target buckets).
+- Target map entries may be `null` **tombstones** to drop a default for one OS (`EDITOR` above).
+- `repo` and `updates` stay top-level.
+- Schema **v7** adds `"shell": "powershell"` (POSIX-only when omitted). On native Windows, genv prefers `pwsh`, else Windows PowerShell, for profile fragments and hooks.
+
+Legacy **v1–v7** specs still load. Convert with `genv migrate`. Field-by-field reference: [SCHEMA.md](SCHEMA.md).
+
+---
+
+## How apply and locks work
+
+1. Read the spec and the lock.
+2. For v8: resolve the active target, merge `defaults` + target (+ tombstones).
+3. Refuse a **foreign lock** (wrong target / OS / unavailable managers). Recover with `genv apply --force-new-lock` (backs up the lock) or by removing it locally.
+4. Install packages in the spec but not the lock; uninstall lock entries removed from the spec.
+5. Reconcile env, shell, files, services, hooks as configured.
+6. Update the lock (v8 records `target` + `goos`).
+
+Convenience commands (`add` / `remove` / `adopt` / `disown` / `scan`) update the spec and usually the live system in one step. `genv add` installs first and only persists the spec after a successful install (unresolved or failed installs exit `4` and leave the spec unchanged; use `adopt` to track without installing). On v8 they write into `targets.<active>` (`--target` or `$GENV_TARGET` / classification).
+
+Human `apply` prompts unless `--yes`. Because a JSON caller cannot answer a prompt, `genv apply --json` is **plan-only** unless `--yes` is passed (or `--dry-run` to plan explicitly); a wet run without `--yes` returns the plan with `wet-run requires --yes` and changes nothing. Hooks receive the same consent through `GENV_YES`. An already-applied spec still reports `ok`, matching `genv upgrade --json`.
+
+`genv.json` itself is written `0600` (like the lock and the private fragments) because a spec can hold `env` values marked `sensitive`. A spec left world-readable by an older genv is tightened to match the lock.
+
+Managed links are compared by resolved path, so a relative link pointing at the same file as an absolute `source` counts as correct. Relative file sources and hook `file` paths resolve against the spec directory (`--source-root` overrides), which is where `genv pull` and `genv export` place bundled assets.
+
+`genv scan` adopts **user-facing** installs by default: Homebrew `brew leaves` plus casks (not the full formula tree), Ruby gems that are not default or bundled with the interpreter, and pip-user packages that are not dependencies of other user-site packages (minus installer/stdlib-like noise such as `certifi` / `setuptools`). npm/pnpm/yarn already list top-level globals only (and scan never proposes `npm` itself). uv proposes tool names from `uv tool list` headers, not `-` entrypoint bullets. rustup toolchains are not proposed. Pass `--all` or `--deps` to adopt every `ListInstalled` name, including Homebrew libraries and language stdlib. Scan still never proposes `-`, `npm` via npm, or `toolchain:*`. Preview with `--dry-run`; text mode prompts unless `--yes` is set.
+
+`genv pull` fetches `genv.json` **and** relative `files` assets plus hook scripts from `repo.url`. It never overwrites the lock or secrets. Only relative sources are bundled: a source that is absolute, `~/…`, or contains a `$VAR` is reported rather than copied, and symlinks are refused.
 
 ---
 
 ## CLI reference
 
-| Command                                           | Description                                                            |
-| ------------------------------------------------- | ---------------------------------------------------------------------- |
-| `genv add <id> [flags]`                           | Add package to spec and install it now                                 |
-| `genv remove <id>`                                | Remove package from spec and uninstall it now (alias: `rm`)            |
-| `genv adopt <id> [flags]`                         | Track an already-installed package without reinstalling                |
-| `genv disown <id>`                                | Stop tracking a package without uninstalling it                        |
-| `genv scan [flags]`                               | Bulk-adopt all installed packages into genv.json                       |
-| `genv status [flags]`                             | Show drift between genv.json and the lock file                         |
-| `genv list`                                       | List packages currently tracked by genv (from lock file) (alias: `ls`) |
-| `genv apply [flags]`                              | Reconcile system state with genv.json                                  |
-| `genv validate [flags]`                           | Validate genv.json without changing the system                         |
-| `genv upgrade [flags]`                            | Upgrade tracked packages and refresh lock versions                     |
-| `genv init [flags]`                               | Interactive wizard to create a new genv.json                           |
-| `genv env <set\|unset\|list>`                     | Manage global environment variables in the spec                        |
-| `genv shell <alias\|status\|edit>`                | Manage shell aliases and shell config drift                            |
-| `genv service <add\|remove\|start\|stop\|status>` | Manage declared user-space services                                    |
-| `genv completion <bash\|zsh\|fish>`               | Print shell completion script                                          |
-| `genv clean [--dry-run]`                          | Clear the cache of all detected package managers                       |
-| `genv edit`                                       | Open genv.json in `$EDITOR`                                            |
-| `genv version`                                    | Show build version, commit, and date                                   |
-| `genv help`                                       | Show help text                                                         |
+| Command | Purpose |
+| ------- | ------- |
+| `add` / `remove` (`rm`) | Track + install / untrack + uninstall |
+| `adopt` / `disown` | Track without install / untrack without uninstall |
+| `scan` | Bulk-adopt user-facing installs (`--dry-run`, `--yes`; `--all` / `--deps` for full trees). Exits non-zero if a manager's inventory could not be read |
+| `list` (`ls`) | Show lock-tracked packages |
+| `status` | Spec ↔ lock drift (`--files` includes content `drifted`, `--offline`, `--verify`, `--target`); a version-less lock entry the live inventory contradicts is `unknown` |
+| `apply` | Reconcile (`--dry-run`, `--yes`, `--json`, `--force`, `--backup`, `--strict`, `--quiet`, `--skip-packages`, `--timeout <d>`, `--no-hooks`, `--hook-timeout <d>`, `--target`, `--force-new-lock`, `--state-dir`, `--source-root <dir>`) |
+| `validate` | Validate spec + genv-managed agent executables |
+| `upgrade` | Upgrade tracked packages plus OS vendor updates (`--all`, `--only` / leftover IDs, `--skip`, `--only-manager`, `--skip-manager`, `--target`; `--json` wet-run requires `--yes`) |
+| `updates` | Background checker (`check` / `start` / `stop` / `status`; `--target`, `--only`, `--skip`, `--only-manager`, `--skip-manager` on check/start) |
+| `profile` | Named overlays (`list` / `create` / `switch`; refused on schema v8) |
+| `pull` | Fetch spec + file assets from `repo` |
+| `migrate` | v1–v7 → v8 targets |
+| `export` | Single-target snapshot + report + assets (`--verify` proves live installs) |
+| `map` | Assist-only manager mapping suggestions |
+| `init` / `edit` | Wizard / `$EDITOR` |
+| `env` / `shell` / `service` / `files` | Env vars, aliases, user services (`launchd` / `systemd` templates), `files adopt` |
+| `completion` | `bash` / `zsh` / `fish` / `powershell` |
+| `clean` | Clear detected manager caches |
+| `version` / `help` | Build info / usage |
 
-### `genv add` / `genv adopt` flags
+### Shell completions
 
-- `--version <ver>` — version constraint, e.g. `"0.10.*"`
-- `--prefer <mgr>` — preferred manager, e.g. `brew`
-- `--manager <mgr:name,...>` — manager-specific names, e.g. `flatpak:org.mozilla.firefox`
-
-### `genv apply` flags
-
-- `--dry-run` — print the reconcile plan without executing
-- `--strict` — exit with an error if any package cannot be resolved
-- `--yes` — skip the confirmation prompt (for CI and scripts)
-- `--json` — emit machine-readable JSON to stdout instead of human-readable text
-- `--timeout <duration>` — per-subprocess deadline, e.g. `5m` or `30s` (0 = no timeout)
-- `--debug` — emit debug-level structured logs to stderr
-
-### `genv status` flags
-
-- `--json` — emit machine-readable JSON to stdout
-- `--debug` — emit debug-level structured logs to stderr
-
-### `genv scan` flags
-
-- `--json` — emit machine-readable JSON to stdout
-- `--debug` — emit debug-level structured logs to stderr
-
-### `genv clean` flags
-
-- `--dry-run` — print the clean commands without executing
-
-### Common flag
-
-- `--file <path>` — path to genv.json (default: `$XDG_CONFIG_HOME/genv/genv.json` or `~/.config/genv/genv.json`)
-
----
-
-## Machine-readable output (`--json`)
-
-When `--json` is passed, the command writes a single JSON object to stdout and routes all subprocess output to stderr, keeping stdout clean for piping.
+Install for your shell (auto-detects from `$SHELL` when omitted):
 
 ```bash
-# Parse the plan in CI
-genv apply --dry-run --json | jq '.data.toInstall[].id'
-
-# Check status in a script
-genv status --json | jq '.ok'
-
-# Non-interactive apply in a bootstrap script
-genv apply --yes --json 2>/dev/null
+genv completion install        # bash, zsh, or fish
+genv completion install powershell
 ```
 
-The envelope format:
+Tab completion on `add` / `adopt` suggests package names from available managers (Homebrew-style local dumps when possible). After you accept a name, interactive `genv add` still asks which manager to use when multiple match.
+
+### Common flags
+
+- `--file <path>` — spec path (default under `~/.config/genv/`)
+- `--lock-file <path>` — lock path (default `genv.lock.json` next to `--file`)
+- `--state-dir <dir>` — directory for lock and env/shell fragments (default: directory of `--file`)
+- `--target <id>` — v8 target for apply / status / upgrade / updates / mutate / export / map / scan
+- `--host <name>` — legacy host filter override for v1–v7 records / hooks (defaults via host **classification**, not hostname)
+- `--json` — machine-readable envelope on stdout; subprocess noise on stderr
+
+### Apply / portability flags worth knowing
+
+```bash
+genv apply --target windows --yes                 # adopt live apps, install only the missing
+genv apply --skip-packages --yes                  # links + env only
+genv apply --timeout 30m --hook-timeout 2m        # cap each subprocess / hook (default 10m; 0 disables)
+genv apply --target ubuntu --dry-run --json
+genv apply --force --backup --yes                 # overwrite mismatched files; keep *.backup.*
+genv files adopt ~/.foo --dry-run                 # seed missing source, backup live file, link
+genv apply --target ubuntu --force-new-lock --yes   # after a foreign lock refuse
+genv apply --dry-run --file ./worktree/genv.json --source-root ~/.config/genv
+genv status --target windows                      # present vs missing vs ok
+genv status --verify                              # Query each manager: is this package actually installed?
+genv adopt cursor --target windows                # lock Anysphere.Cursor if already installed
+genv export --target macos --out ./dist/macos --strict
+genv export --target macos --out ./dist/macos --verify --strict
+genv migrate --write
+```
+
+File mismatches without `--force` no longer block packages/services: non-conflicting file ops still apply, each mismatched path is printed, and apply exits `4` if any remain.
+
+### Lifecycle hooks
+
+Hooks should **check-then-act** and exit without doing work when the system is already current. On success, print one of:
+
+```bash
+echo GENV_HOOK_STATUS=changed
+echo GENV_HOOK_STATUS=skipped
+```
+
+Non-zero exit is `error`. Exit 0 without a status line is treated as `changed` (legacy exit-only hooks). After each phase, apply prints `changed`, `skipped (no-op)`, or `error` next to the hook name, exit code, and duration. See [SCHEMA.md](SCHEMA.md#hooks).
+
+### User services (launchd / systemd)
+
+Declare a LaunchAgent or systemd --user unit in the spec instead of a `postApply` hook:
 
 ```json
-{
-  "command": "apply",
-  "ok": true,
-  "data": { ... },
-  "errors": []
+"services": {
+  "syncthing": {
+    "launchd": { "plist": "launchd/com.example.syncthing.plist" },
+    "systemd": { "unit": "systemd/syncthing.service" }
+  }
 }
 ```
 
-`ok` is `false` when the command encountered an error or found drift (`genv status`). Exit codes are unchanged regardless of `--json`.
+`genv apply` renders the template (`__HOME__` and the other `files.templates[]` placeholders), writes `~/Library/LaunchAgents/<Label>.plist` or `~/.config/systemd/user/<basename>.service`, and loads it. Editing the template and applying again re-bootstraps the launchd job or restarts the systemd unit. `genv service status syncthing` reads supervisor state. Removing the service from the spec unloads it and deletes the unit file. See [SCHEMA.md](SCHEMA.md#v4--services).
+
+### Updates checker
+
+`genv updates start` registers a user systemd timer (Linux), launchd job (macOS), or Task Scheduler task (`schtasks`, Windows). Default behavior is check / log / notify for **tracked packages only**. Set `"autoApply": true` in the `updates` block to apply those tracked upgrades automatically. The timer is non-interactive: it never prompts for sudo or UAC, and skips packages that need elevation (logged in `updates.log`). OS vendor and firmware updates are not part of the checker — use `genv upgrade` for that. Details: [SCHEMA.md](SCHEMA.md#updates).
+
+### Exit codes
+
+| Code | Meaning |
+| ---- | ------- |
+| 0 | Success |
+| 1 | Bad arguments / unknown command |
+| 2 | I/O or serialization error |
+| 3 | Spec failed validation |
+| 4 | Semantic error (also `status` when drift exists; foreign lock refuse) |
 
 ---
 
-## How resolution works
+## Resolution and upgrades (summary)
 
-When genv needs to install a package it:
+**Install resolution:** detect available managers → honor `prefer` → try `managers` map → fall back to system managers using the package `id`. Language / toolchain / plugin managers (including v8 spec `adapters`) are **explicit-only** (must set `prefer` or `managers`) so `git` never silently resolves through npm.
 
-1. Detects which package managers are available on the host.
-2. Honors the `prefer` hint if that manager is available.
-3. Falls back to the first available manager listed in the `managers` map.
-4. Falls back to the first available manager in the registry, using the package ID as the name.
-
-Unresolved packages (no compatible manager found) produce a warning. Use `--strict` to treat them as a hard error.
+**Upgrades:** `genv upgrade` applies tracked-package updates, then OS vendor updates for the active target (macOS `softwareupdate`, Windows Update Agent COM via PowerShell (often needs an elevated session; genv does not auto-elevate; WUA ResultCodes are mapped to readable errors), Arch `pacman -Syu`, Ubuntu `apt-get upgrade`). Firmware uses `fwupdmgr` on Linux when present; macOS firmware ships through `softwareupdate`, and Windows firmware is skipped as vendor-specific. `genv updates check` and the timer stay tracked-packages-only and share the tracked planner with `upgrade`. The timer rewrites refresh/apply `sudo` to `sudo -n` and skips unelevated winget/choco (and paru/yay) rather than prompting. Before outdated detection, the planner refreshes each index-based manager that still has candidates (`brew update`, `sudo apt-get update`, `sudo pacman -Sy`, and the equivalents on paru/yay/dnf/apk/scoop/winget). Live registries (mas, npm/bun, uv/pipx, cargo, volta, choco, snap, vscode) are queried as-is. A failed refresh keeps that manager's packages and prints a warning — same conservative rule as a failed outdated query. A manager whose binary is gone (`Available()` false) is skipped with an explicit reason instead of planning `brew update` / `brew upgrade` that cannot run. By default they plan packages with a detected update; `--all` on `upgrade` still refreshes, then plans every unconstrained tracked package. Leftover positional IDs (`genv upgrade git`) are treated as `--only`. Human `upgrade` prompts unless `--yes`; `upgrade --json` wet-run also requires `--yes` (or `--dry-run` to plan only). Packages with a non-empty `version` are always skipped; genv does not yet plan range-satisfying upgrades. Batched where the manager allows (`brew`, `pacman`/`paru`/`yay`, `apt`/`dnf`/`apk`, `mas`, `snap`, `scoop`, `choco`, …). The `vscode` manager compares against the marketplace's newest **stable** version (pre-release builds are ignored; `--install-extension --force` cannot install them). It invokes `cursor` when that CLI is on PATH, otherwise `code`. `brew outdated` uses `--greedy` so auto-updating casks are not hidden after the index fetch.
 
 ---
 
-## Exit codes
+## Project status
 
-| Code | Meaning                                                                           |
-| ---- | --------------------------------------------------------------------------------- |
-| 0    | Success                                                                           |
-| 1    | Bad arguments or unknown command                                                  |
-| 2    | Filesystem or serialization error                                                 |
-| 3    | `genv.json` fails schema validation                                               |
-| 4    | Semantic error — also returned by `genv status` when drift or extra entries exist |
+| Area | State |
+| ---- | ----- |
+| Core CLI + declarative apply | Stable |
+| macOS / Windows / Arch / Ubuntu / WSL targets | Stable (v4.0.0) |
+| Schema v7 PowerShell profiles | Stable |
+| Schema v8 portable targets | Stable |
+| Background `updates` + profiles + hooks | Stable |
+| apt / dnf / apk adapters | Stable |
+| Publish genv to Scoop | Self-hosted bucket `ks1686/scoop-bucket`; uploads when `SCOOP_BUCKET_GITHUB_TOKEN` is set |
+| Publish genv to winget / choco | Not published; publishers are GoReleaser Pro-only |
 
----
-
-## Roadmap
-
-Implementation milestones and detailed checklists are tracked in [ROADMAP.md](ROADMAP.md).
-
-Current focus (v2.x):
-
-- [x] M1: Core CLI and `genv.json` spec validation
-- [x] M2: Resolver + adapter layer, declarative apply, adopt/disown, cache clean
-- [x] M3: `genv scan`, lock file version pinning, `genv status`
-- [x] M4: `--json`, `--yes`, `--timeout`, `--debug`, signed releases
-- [x] M5: macOS and WSL2 validation and automated testing
-- [x] M6: API stability, test coverage, performance benchmarks, security audit
-- [x] M7: Shell completions, `genv validate`, `genv upgrade`, `genv init`, improved errors
-- [x] M8: global environment variable management (`genv env`)
-- [x] M9: shell configuration management (`genv shell`)
-- [x] M10: services management (`genv service`) + expanded packaging channels
-- [ ] M11: updates daemon
-- [ ] M12: named profiles
-- [ ] M13: hooks and lifecycle scripts
-
-## Releasing
-
-The repository includes a tag-driven GitHub release workflow. The release process is documented in [RELEASING.md](RELEASING.md).
+Historical milestone checklists: [ROADMAP.md](ROADMAP.md). Release notes: [CHANGELOG.md](CHANGELOG.md). Tag-driven publishing: [RELEASING.md](RELEASING.md).
 
 ---
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
----
+See [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

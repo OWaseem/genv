@@ -1,8 +1,9 @@
 # Releasing genv
 
-This repository publishes GitHub releases, a Homebrew formula, and an AUR package
-automatically when an annotated tag is pushed. GoReleaser handles GitHub releases,
-Homebrew, AUR, and the Snap Store automatically — no external reviewer sign-off required.
+This repository publishes GitHub releases, a Homebrew cask, a Scoop manifest,
+and AUR packages automatically when an annotated tag is pushed. GoReleaser
+handles GitHub releases, Homebrew, and Scoop; a follow-up macOS workflow job
+publishes the AUR packages.
 
 ---
 
@@ -15,15 +16,43 @@ Homebrew, AUR, and the Snap Store automatically — no external reviewer sign-of
 | `v0.2.0` | M3–M5 complete (scan, status, JSON output, --yes/--timeout/--debug, macOS + WSL2 validation) |
 | `v1.0.0` | M6 and M7 complete (stable API/quality bar + UX command set) |
 | `v2.0.0` | M8 and M9 complete (env and shell configuration management) |
-| `v2.1.0` | M10 complete (services management, new adapters: zypper/xbps/emerge, Snap Store publishing) |
-| `v2.2.0` | M13 complete (hooks and lifecycle scripts) |
-| `v2.3.0` | M12 complete (named profiles) |
-| `v3.0.0` | M11 complete + first-party Windows support (Chocolatey, Scoop) |
+| `v2.1.0` | M10 complete (services management, new adapters: zypper/xbps/emerge, historical Snap Store publishing) |
+| `v2.2.0` | Scoped M13 surface (schema v5 `files`/`hooks`, host selectors, `pull` / `status --files` / `adopt --files`) |
+| `v2.3.0` | Native Windows support (`windows` host, `winget`/`scoop`/`choco`, merge-dir file links) |
+| `v3.0.0` | M11 updates checker, M12 named profiles, full M13 lifecycle hooks, upgrade JSON/filtering, tracked ecosystem adapters |
+| `v3.2.x` | Outdated-aware `genv upgrade` / `updates check` (default plan only packages with detected updates) |
+| `v4.0.0` | Schema v7 PowerShell parity + schema v8 portable multi-target (`defaults`/`targets`, migrate/export/map, foreign-lock gate) |
+| `v4.0.1` | Fix schemaVersion 8 materialize gaps (`status` / `upgrade` / `updates` / hooks / env·shell·service reads) + Arch CLI matrix CI |
+| `v4.0.2` | Apply continues past file mismatches; human file plans + `--backup`; brew-formula service status; updates `--help`; launchd re-register after genv upgrade |
+| `v4.0.3` | Explicit skip message for post-apply hooks on file mismatch; `scan --dry-run` + confirmation/`--yes` |
+| `v4.0.4` | Prefer PATH-stable genv path for updates LaunchAgent/systemd; agent dangling-path checks in status/validate; AUR publish retry + aur-only repair |
+| `v4.0.5` | Brew bin derivation without SameFile mid-upgrade; strip Homebrew shims from scheduled PATH; `__run-once` / brew / notify timeouts so launchd cannot wedge |
+| `v4.0.6` | Per-manager outdated timing in updates.log to diagnose slow launchd checks vs timeout fallback |
+| `v4.0.7` | `__run-once` no longer hangs on osascript notify until 5m deadline (exit 4) |
+| `v4.0.8` | `add`/`adopt` Tab completions via `genv __complete repo-packages` (cached dumps + search fallback) |
+| `v4.0.9` | Lifecycle hooks inherit stdin + receive `GENV_YES` when `--yes` is set |
+| `v4.0.10` | Darwin GitHub Release / Homebrew binaries are Developer ID signed and notarized |
+| `v4.0.11` | Fail-closed `add`, schema v8 defaults, native apt/dnf/apk, Windows CI/test hardening (tag exists; GitHub Release aborted on Pro-only GoReleaser keys) |
+| `v4.0.12` | Drop Pro-only winget/chocolatey GoReleaser keys so OSS publish can succeed |
+| `v4.0.13` | Self-hosted Scoop bucket (`ks1686/scoop-bucket`) |
+| `v4.1.0` | First tagged Scoop upload from CI (token template matches Homebrew) |
+| `v4.2.0` | Windows apply skip-if-present, 10m timeout, live status, `--skip-packages`, `external` manager |
+| `v4.2.1` | Apply/status list only needed managers; 30s listing timeout so hung Composer cannot stall Windows CI |
+| `v4.2.2` | Every manager probe bounded (scan/search/upgrade/outdated/services); crash-safe fsync'd spec & lock writes; atomic pull; docs/completions/CI fixes; updates worker shutdown grace |
+| `v4.3.0` | Windows updates scheduler, vscode stable-only outdated detection, lock/apply recovery, and `genv upgrade` OS/firmware steps |
+| `v4.3.1` | Index refresh before outdated; user-facing `scan` default; apply `--skip-packages` quiet; vscode prefers `cursor`; hidden Windows updates host; upgrade `--json`/`--only` polish |
+| `v4.3.2` | Spec adapters; apply `--source-root`; file `contentHash` / `perm` / per-entry backup; `files adopt`; launchd/systemd service templates; hook `continueOnError`; lock/adopt/disown fixes |
+| `v4.3.3` | Drop legacy Homebrew cask `postflight` hook (PreferStable + caveat); silences brew `postflight_steps` deprecation |
+| `v4.4.0` | Schema v9 managed external releases (replace Snap ship); Windows schtasks per-user + WUA ResultCode messaging |
+| `v4.4.1` | Non-interactive scheduled updates + system-scope elevate for managed external installs (Fixes #173); grpc 1.83.2 |
+| `v4.5.0` | Hook changed/skipped/error contract; status/export `--verify`; export manager-not-supported FPs; help no longer hardcodes schemaVersion 8; unmatched skip/only config-drift WARN |
+| `v4.5.1` | Template backup:true without --force (#190); uv git URL tool-name matching (#191) |
+| `v4.5.2` | Correctness and hardening pass over #195–#211: private spec writes, shell-wrapper and export/pull escape fixes, `apply --json` consent gate, lock-mutation coverage, bounded subprocess waits, WUA result-code separation, systemd `%` escaping, unique service unit names |
 
 Use pre-release suffixes (`-beta.N`, `-rc.N`) for any release that is not fully
-validated. GoReleaser's `skip_upload: auto` setting skips the Homebrew and AUR
-publishers for pre-release tags automatically, so only stable tags reach those
-channels.
+validated. GoReleaser's `skip_upload: auto` setting skips the Homebrew and Scoop
+publishers for pre-release tags, and the AUR publish job skips pre-release
+versions itself — so only stable tags reach those channels.
 
 ---
 
@@ -39,7 +68,82 @@ In the repository settings → Actions → General, confirm:
 - "Allow all actions" or allow the specific actions used
 - "Read and write permissions" for the default `GITHUB_TOKEN` (needed to create releases)
 
-### 2. Homebrew tap
+### 2. Apple Developer ID signing and notarization
+
+Darwin release binaries are signed with a **Developer ID Application** certificate
+and notarized via App Store Connect (GoReleaser → anchore/quill on `ubuntu-latest`).
+Cosign continues to sign `checksums.txt` separately.
+
+Without these secrets, GoReleaser skips `notarize.macos` and ships adhoc-signed
+Darwin binaries (the pre-v4.1 behavior).
+
+**2a. Create a Developer ID Application certificate**
+
+1. Open [Certificates](https://developer.apple.com/account/resources/certificates/list).
+2. Create a certificate of type **Developer ID Application**.
+3. Upload a Certificate Signing Request (CSR). Generate one locally:
+
+   ```bash
+   mkdir -p .local/apple-signing
+   openssl req -new -newkey rsa:2048 -nodes \
+     -keyout .local/apple-signing/DeveloperID.key \
+     -out .local/apple-signing/DeveloperID.csr \
+     -subj "/emailAddress=YOU@example.com/CN=Developer ID Application/C=US"
+   ```
+
+4. Download the `.cer`, double-click to import into Keychain Access (keep the
+   private key that matched the CSR on the same Mac).
+5. In Keychain Access, select the **Developer ID Application** identity →
+   Export → `.p12`, and choose a strong password. Store the `.p12` and password
+   outside the repo (`.local/` is gitignored).
+
+**2b. Create an App Store Connect API key**
+
+1. Open [Users and Access → Integrations → Team Keys](https://appstoreconnect.apple.com/access/integrations/api).
+2. Generate a key with **Developer** access (or App Manager).
+3. Download the `.p8` once (`AuthKey_<KEY_ID>.p8`). Note the **Key ID** and
+   **Issuer ID** (UUID on the same page).
+
+**2c. Add GitHub Actions secrets**
+
+Encode and upload (or use the helper):
+
+```bash
+./scripts/set-macos-signing-secrets.sh \
+  --p12 /path/to/Certificates.p12 \
+  --p12-password 'your-export-password' \
+  --p8 /path/to/AuthKey_XXXXXXXXXX.p8 \
+  --key-id XXXXXXXXXX \
+  --issuer-id 00000000-0000-0000-0000-000000000000
+```
+
+Secrets created:
+
+| Secret | Contents |
+| --- | --- |
+| `MACOS_SIGN_P12` | base64 of the `.p12` |
+| `MACOS_SIGN_PASSWORD` | password that opens the `.p12` |
+| `MACOS_NOTARY_KEY` | base64 of the `.p8` |
+| `MACOS_NOTARY_KEY_ID` | API Key ID |
+| `MACOS_NOTARY_ISSUER_ID` | Issuer UUID |
+
+**2d. Verify a Darwin artifact after the next release**
+
+Team ID for this project: `7R2VPW8GH4`  
+Identity: `Developer ID Application: KARIM SMIRES (7R2VPW8GH4)`
+
+```bash
+codesign -dv --verbose=4 ./genv
+# Expect: Authority=Developer ID Application: KARIM SMIRES (7R2VPW8GH4)
+#         TeamIdentifier=7R2VPW8GH4
+
+# Bare CLI tools often report "does not seem to be an app" from spctl -a;
+# that is normal. Prefer exec assessment / successful launch under quarantine:
+spctl -a -t exec -vv ./genv
+./genv version
+```
+
+### 3. Homebrew tap
 
 GoReleaser pushes the formula to a separate `homebrew-tap` repo.
 
@@ -54,10 +158,38 @@ Users install after setup:
 
 ```bash
 brew tap ks1686/tap
-brew install genv
+brew install --cask genv
 ```
 
-### 3. AUR (`genv-bin` and `genv`)
+### 4. Scoop bucket
+
+GoReleaser pushes a Scoop manifest to a separate `scoop-bucket` repo. It does
+not create that repo; create it first (`gh repo create`). The release workflow
+`GITHUB_TOKEN` cannot push to another repository.
+
+1. Create the repo **`ks1686/scoop-bucket`** on GitHub (public). Do **not** add
+   the `scoop-bucket` GitHub topic — that lists the bucket on scoop.sh.
+2. In the **`ks1686/genv`** repository settings → Secrets and variables → Actions,
+   add a repository secret named **`SCOOP_BUCKET_GITHUB_TOKEN`**.
+   - Generate a fine-grained PAT at GitHub Settings → Developer Settings → Personal access tokens → Fine-grained tokens.
+   - Grant it **Contents: Read and write** on the `ks1686/scoop-bucket` repository only.
+   - Do not reuse `HOMEBREW_TAP_GITHUB_TOKEN` unless that token is also granted
+     on `scoop-bucket`.
+   - Do not put a `gh` OAuth token (`gho_…`) into Actions secrets.
+3. Leave `scoops.directory` unset so manifests live at the bucket root
+   (`scoop install genv` cannot find the manifest otherwise).
+4. If the secret is missing, GoReleaser skips the Scoop upload (`skip_upload: true`)
+   and the rest of the release still publishes. With the secret set, `skip_upload`
+   is `auto` (stable tags upload; prereleases do not).
+
+Users install after a tagged release has pushed `genv.json`:
+
+```powershell
+scoop bucket add ks1686 https://github.com/ks1686/scoop-bucket
+scoop install genv
+```
+
+### 5. AUR (`genv-bin` and `genv`)
 
 Two AUR packages are published on every stable release. Both use the same `AUR_KEY` secret.
 
@@ -67,9 +199,9 @@ Two AUR packages are published on every stable release. Both use the same `AUR_K
 The two packages `conflict` with each other so users can only have one installed at a time.
 Each CI script updates an existing AUR package — it does not create a new one. The first publish of each must be done manually.
 
-**3a. Create an AUR account** at <https://aur.archlinux.org/> if you don't have one.
+**5a. Create an AUR account** at <https://aur.archlinux.org/> if you don't have one.
 
-**3b. Generate an SSH key** for AUR (use a dedicated key, not your main one):
+**5b. Generate an SSH key** for AUR (use a dedicated key, not your main one):
 
 ```bash
 ssh-keygen -t ed25519 -C "aur" -f ~/.ssh/aur
@@ -78,7 +210,7 @@ ssh-keygen -t ed25519 -C "aur" -f ~/.ssh/aur
 
 Add the public key to your AUR account: <https://aur.archlinux.org/account/> → SSH keys.
 
-**3c. Create the `genv-bin` package on AUR** (one-time manual step):
+**5c. Create the `genv-bin` package on AUR** (one-time manual step):
 
 ```bash
 # Clone the (empty) AUR repo — this creates the package namespace
@@ -122,7 +254,7 @@ git push
 > `checksums.txt` before pushing. AUR will flag the package as untrustworthy
 > if SKIP is left in place.
 
-**3c-2. Create the `genv` source package on AUR** (one-time manual step):
+**5c-2. Create the `genv` source package on AUR** (one-time manual step):
 
 ```bash
 git clone ssh://aur@aur.archlinux.org/genv.git /tmp/genv-src-aur
@@ -159,7 +291,7 @@ git commit -m "Initial release v0.2.0"
 git push
 ```
 
-**3d. Add the AUR SSH private key as a repository secret:**
+**5d. Add the AUR SSH private key as a repository secret:**
 
 In `ks1686/genv` → Settings → Secrets and variables → Actions, add a secret named
 **`AUR_KEY`** containing the contents of `~/.ssh/aur` (the private key).
@@ -207,7 +339,17 @@ paru -S genv       # builds from source
    - Generate `checksums.txt`
    - Publish a GitHub Release with all artifacts
    - Push the Homebrew formula to `ks1686/homebrew-tap`
+   - Push `genv.json` to `ks1686/scoop-bucket` (Scoop pipe continues on error — confirm the file landed)
    - Push updated PKGBUILDs to AUR (`genv-bin` pre-compiled and `genv` source)
+
+   If GitHub/Homebrew succeeded but AUR failed (transient `aur.archlinux.org` SSH),
+   do **not** re-run the whole Release job (GoReleaser will hit `already_exists`).
+   Instead dispatch an AUR-only repair:
+
+   ```bash
+   gh workflow run Release -f mode=aur-only -f version=4.0.3
+   gh run watch  # pick the new run
+   ```
 
 6. **Verify** by downloading one artifact and running:
 
@@ -223,15 +365,22 @@ paru -S genv       # builds from source
    genv version
    ```
 
-8. **Verify AUR** (on any Arch machine):
+8. **Verify Scoop** (on Windows, after the bucket has `genv.json`):
+
+   ```powershell
+   scoop bucket add ks1686 https://github.com/ks1686/scoop-bucket
+   scoop update
+   scoop install genv
+   genv version
+   ```
+
+9. **Verify AUR** (on any Arch machine):
 
    ```bash
    paru -Sy genv-bin && genv version   # pre-compiled
    # or
    paru -Sy genv && genv version       # from source
    ```
-
-9. **Snap Store:** handled automatically by GoReleaser's `snapcrafts` section — no manual step needed.
 
 ---
 
@@ -243,9 +392,10 @@ For each release, the notes should cover:
 - any known limitations or partially-validated surfaces (e.g., adapters not tested in CI)
 - any breaking changes to `genv.json` schema or lock format
 
-GoReleaser auto-generates a changelog from `feat:` and `fix:` commits as the release
-body. Edit it on GitHub after publish, or use `release.notes` in `.goreleaser.yml`
-to provide a custom body before tagging.
+GoReleaser auto-generates a changelog for the release body from commit messages,
+excluding `docs:`, `test:`, and `chore:` commits. Edit it on GitHub after
+publish, or provide a custom body in the GoReleaser changelog config before
+tagging.
 
 ---
 
@@ -263,10 +413,12 @@ Artifacts land in `./dist/`. Nothing is published.
 
 ## Future distribution channels
 
-Candidates for v3.0.0 (Windows support milestone):
+Scoop is live as a self-hosted bucket (`ks1686/scoop-bucket`), not Scoop extras.
+winget and Chocolatey stay unpublished (community review + GoReleaser Pro).
+GitHub Release zips remain a supported Windows path.
 
-| Channel | Complexity | Notes |
+| Channel | Status | Notes |
 | --- | --- | --- |
-| Scoop | Low | GoReleaser supports it natively; relevant for v3.0.0 Windows support |
-| winget | Low | GoReleaser supports it natively; relevant for v3.0.0 Windows support |
-| apt PPA | High | Needs a Launchpad account; `.deb` artifacts already ship via GitHub Releases |
+| winget | Deferred | Publisher is GoReleaser Pro-only; default source needs microsoft/winget-pkgs review |
+| Chocolatey | Deferred | Publisher is GoReleaser Pro-only; community repo has the same review gate |
+| apt PPA | Deferred | `.deb` artifacts already ship via GitHub Releases |

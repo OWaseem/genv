@@ -1,5 +1,10 @@
-// Package schema defines the genv.json v1-v4 data model and validation logic.
+// Package schema defines the genv.json v1–v9 data model and validation logic.
 package schema
+
+import (
+	"encoding/json"
+	"fmt"
+)
 
 // Version is the accepted value for genv.json v1 (packages only).
 const Version = "1"
@@ -13,24 +18,149 @@ const Version3 = "3"
 // Version4 is the accepted value for genv.json v4 (packages + env + shell + services block).
 const Version4 = "4"
 
+// Version5 is the accepted value for genv.json v5 (adds files, hooks, host, and repo).
+const Version5 = "5"
+
+// Version6 is the accepted value for genv.json v6 (adds the updates config block).
+const Version6 = "6"
+
+// Version7 is the accepted value for genv.json v7 (adds PowerShell shell targeting).
+const Version7 = "7"
+
+// Version8 is the accepted value for genv.json v8 (adds portable defaults/targets).
+const Version8 = "8"
+
+// Version9 is the accepted value for genv.json v9 (adds managed external releases).
+const Version9 = "9"
+
+// versionOrder lists known schemaVersion values from oldest to newest.
+var versionOrder = []string{Version, Version2, Version3, Version4, Version5, Version6, Version7, Version8, Version9}
+
+// IsPortableVersion reports whether v uses the defaults/targets data model.
+func IsPortableVersion(v string) bool { return v == Version8 || v == Version9 }
+
+// versionRank returns the ordinal of a schemaVersion string within versionOrder,
+// or -1 if the value is not a recognized version.
+func versionRank(v string) int {
+	for i, known := range versionOrder {
+		if v == known {
+			return i
+		}
+	}
+	return -1
+}
+
+// AtLeastVersion returns whichever of current or min represents the newer schema
+// version. It lets callers raise a spec to the minimum version a newly-added
+// block requires without ever downgrading a file that already declares a newer
+// version (e.g. adding an env block to a v5 file must not rewrite it as v2).
+// An unrecognized current value is treated as older than any known version.
+func AtLeastVersion(current, min string) string {
+	if versionRank(current) > versionRank(min) {
+		return current
+	}
+	return min
+}
+
 // KnownShellTargets is the set of valid per-shell targeting values for alias
 // and function entries. An empty string means "all supported shells".
 var KnownShellTargets = map[string]bool{
-	"bash": true,
-	"zsh":  true,
-	"fish": true,
+	"bash":       true,
+	"zsh":        true,
+	"fish":       true,
+	"powershell": true,
 }
 
 // ValidShellTargetsMsg is the user-facing string describing valid shell target values.
-const ValidShellTargetsMsg = `"bash", "zsh", "fish", or omit for all`
+const ValidShellTargetsMsg = `"bash", "zsh", "fish", "powershell", or omit for all POSIX`
 
 // KnownManagers is the set of package-manager IDs recognized in schema v1.
 var KnownManagers = map[string]bool{
-	"paru":      true,
-	"yay":       true,
-	"snap":      true,
-	"brew":      true,
-	"linuxbrew": true,
+	"paru":        true,
+	"yay":         true,
+	"snap":        true,
+	"apt":         true,
+	"dnf":         true,
+	"apk":         true,
+	"brew":        true,
+	"linuxbrew":   true,
+	"mas":         true,
+	"pacman":      true,
+	"bun":         true,
+	"npm":         true,
+	"pnpm":        true,
+	"yarn":        true,
+	"deno":        true,
+	"volta":       true,
+	"uv":          true,
+	"pipx":        true,
+	"pip-user":    true,
+	"poetry":      true,
+	"conda":       true,
+	"mamba":       true,
+	"pixi":        true,
+	"cargo":       true,
+	"go":          true,
+	"rustup":      true,
+	"gem":         true,
+	"composer":    true,
+	"dotnet-tool": true,
+	"ghcup":       true,
+	"stack":       true,
+	"opam":        true,
+	"juliaup":     true,
+	"sdkman":      true,
+	"asdf":        true,
+	"mise":        true,
+	"krew":        true,
+	"helm":        true,
+	"vscode":      true,
+	"winget":      true,
+	"scoop":       true,
+	"choco":       true,
+	"external":    true,
+}
+
+// KnownTargets is the set of canonical portable target IDs accepted in v8 specs.
+var KnownTargets = map[string]bool{
+	"macos":    true,
+	"windows":  true,
+	"arch":     true,
+	"ubuntu":   true,
+	"wsl-arch": true,
+	"linux":    true,
+}
+
+// HostPredicate selects which host(s) a record applies to. It unmarshals from
+// either a single string ("macos") or a JSON array (["arch","wsl2"]). An empty
+// predicate matches every host.
+type HostPredicate []string
+
+// UnmarshalJSON accepts a string or a string array for the host field.
+func (h *HostPredicate) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		*h = nil
+		return nil
+	}
+	if data[0] == '"' {
+		var s string
+		if err := json.Unmarshal(data, &s); err != nil {
+			return fmt.Errorf("host must be a string or array of strings: %w", err)
+		}
+		*h = HostPredicate{s}
+		return nil
+	}
+	var arr []string
+	if err := json.Unmarshal(data, &arr); err != nil {
+		return fmt.Errorf("host must be a string or array of strings: %w", err)
+	}
+	*h = HostPredicate(arr)
+	return nil
+}
+
+// MarshalJSON always emits host as a JSON array.
+func (h HostPredicate) MarshalJSON() ([]byte, error) {
+	return json.Marshal([]string(h))
 }
 
 // GenvFile is the top-level structure of a genv.json file.
@@ -38,20 +168,232 @@ var KnownManagers = map[string]bool{
 // v2: schemaVersion "2", packages + optional env block.
 // v3: schemaVersion "3", packages + optional env + optional shell block.
 // v4: schemaVersion "4", packages + optional env + optional shell + optional services block.
+// v5: schemaVersion "5", adds optional files, hooks, host selectors, and repo fields.
+// v6: schemaVersion "6", adds the optional updates config block.
+// v7: schemaVersion "7", adds PowerShell shell targeting.
+// v8: schemaVersion "8", moves portable config into defaults and targets.
 type GenvFile struct {
-	SchemaVersion string             `json:"schemaVersion"`
-	Packages      []Package          `json:"packages"`
-	Env           map[string]EnvVar  `json:"env,omitempty"`
-	Shell         *ShellConfig       `json:"shell,omitempty"`
-	Services      map[string]Service `json:"services,omitempty"`
+	SchemaVersion string                   `json:"schemaVersion"`
+	Packages      []Package                `json:"packages"`
+	Env           map[string]EnvVar        `json:"env,omitempty"`
+	Shell         *ShellConfig             `json:"shell,omitempty"`
+	Services      map[string]Service       `json:"services,omitempty"`
+	Files         *FilesConfig             `json:"files,omitempty"`
+	Hooks         *HooksConfig             `json:"hooks,omitempty"`
+	Repo          *Repo                    `json:"repo,omitempty"`
+	Updates       *UpdatesConfig           `json:"updates,omitempty"`
+	Adapters      map[string]AdapterDef    `json:"adapters,omitempty"`
+	Defaults      *TargetBundle            `json:"defaults,omitempty"`
+	Targets       map[string]*TargetBundle `json:"targets,omitempty"`
+}
+
+// MarshalJSON preserves the legacy v1-v7 top-level shape while portable versions omit
+// empty legacy top-level blocks. In particular, nil/empty Packages must not
+// serialize as "packages": null in portable target files.
+func (f GenvFile) MarshalJSON() ([]byte, error) {
+	type alias GenvFile
+	if !IsPortableVersion(f.SchemaVersion) {
+		return json.Marshal(alias(f))
+	}
+	type v8File struct {
+		SchemaVersion string                   `json:"schemaVersion"`
+		Packages      []Package                `json:"packages,omitempty"`
+		Env           map[string]EnvVar        `json:"env,omitempty"`
+		Shell         *ShellConfig             `json:"shell,omitempty"`
+		Services      map[string]Service       `json:"services,omitempty"`
+		Files         *FilesConfig             `json:"files,omitempty"`
+		Hooks         *HooksConfig             `json:"hooks,omitempty"`
+		Repo          *Repo                    `json:"repo,omitempty"`
+		Updates       *UpdatesConfig           `json:"updates,omitempty"`
+		Adapters      map[string]AdapterDef    `json:"adapters,omitempty"`
+		Defaults      *TargetBundle            `json:"defaults,omitempty"`
+		Targets       map[string]*TargetBundle `json:"targets,omitempty"`
+	}
+	return json.Marshal(v8File{
+		SchemaVersion: f.SchemaVersion,
+		Packages:      f.Packages,
+		Env:           f.Env,
+		Shell:         f.Shell,
+		Services:      f.Services,
+		Files:         f.Files,
+		Hooks:         f.Hooks,
+		Repo:          f.Repo,
+		Updates:       f.Updates,
+		Adapters:      f.Adapters,
+		Defaults:      f.Defaults,
+		Targets:       f.Targets,
+	})
+}
+
+// AdapterDef is a spec-level command adapter for plugin ecosystems that genv
+// does not ship a built-in manager for (Claude Code plugins, gh extensions, …).
+// Commands are argv templates: {{id}} (and {{name}}) expand to the package id.
+// list output is parsed as JSON (idField / versionField) and/or regex (listMatch).
+type AdapterDef struct {
+	List         string `json:"list"`
+	Install      string `json:"install"`
+	Remove       string `json:"remove"`
+	Upgrade      string `json:"upgrade,omitempty"`
+	Version      string `json:"version,omitempty"`
+	Outdated     string `json:"outdated,omitempty"`
+	ListMatch    string `json:"listMatch,omitempty"`
+	IDField      string `json:"idField,omitempty"`
+	VersionField string `json:"versionField,omitempty"`
+}
+
+// KnownManager reports whether name is a built-in manager or a spec-defined adapter.
+func KnownManager(f *GenvFile, name string) bool {
+	if KnownManagers[name] {
+		return true
+	}
+	if f == nil || name == "" {
+		return false
+	}
+	_, ok := f.Adapters[name]
+	return ok
+}
+
+// ValidAdapterName reports whether name is a legal spec adapter key:
+// lowercase letter, then lowercase letters, digits, or hyphens.
+func ValidAdapterName(name string) bool {
+	if name == "" || name[0] < 'a' || name[0] > 'z' {
+		return false
+	}
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+// TargetBundle is a portable defaults or target-scoped config block.
+//
+// Env and Services use pointer map values so target entries can unmarshal JSON
+// null as tombstones. Defaults must not contain tombstones.
+type TargetBundle struct {
+	Packages []Package           `json:"packages,omitempty"`
+	Env      map[string]*EnvVar  `json:"env,omitempty"`
+	Shell    *TargetShellConfig  `json:"shell,omitempty"`
+	Services map[string]*Service `json:"services,omitempty"`
+	Files    *FilesConfig        `json:"files,omitempty"`
+	Hooks    *HooksConfig        `json:"hooks,omitempty"`
+}
+
+// UpdatesConfig declares settings for the background updates checker/daemon.
+// Interval is a Go duration string (e.g. "24h") that must parse to a strictly
+// positive duration when Enabled is true. OnlyManagers, SkipManagers, Only, and
+// Skip mirror the tracked-only upgrade filters accepted by `genv upgrade`.
+type UpdatesConfig struct {
+	Enabled      bool     `json:"enabled,omitempty"`
+	Interval     string   `json:"interval,omitempty"`
+	AutoApply    bool     `json:"autoApply,omitempty"`
+	Notify       bool     `json:"notify,omitempty"`
+	OnlyManagers []string `json:"onlyManagers,omitempty"`
+	SkipManagers []string `json:"skipManagers,omitempty"`
+	Only         []string `json:"only,omitempty"`
+	Skip         []string `json:"skip,omitempty"`
+}
+
+// Repo points to the spec repository used by `genv pull`.
+type Repo struct {
+	URL string `json:"url"`
+	Ref string `json:"ref,omitempty"`
+}
+
+// FilesConfig declares filesystem entries that genv should reconcile.
+type FilesConfig struct {
+	Links     []FileLink     `json:"links,omitempty"`
+	Templates []FileTemplate `json:"templates,omitempty"`
+	Dirs      []FileDir      `json:"dirs,omitempty"`
+}
+
+// FileLink declares a symbolic link from Source to Target.
+// Mode is "link" (default), "managed-link", or "merge-dir".
+// Perm is an optional octal mode applied to Source.
+type FileLink struct {
+	Source string        `json:"source"`
+	Target string        `json:"target"`
+	Mode   string        `json:"mode,omitempty"`
+	Host   HostPredicate `json:"host,omitempty"`
+	Backup bool          `json:"backup,omitempty"`
+	Perm   string        `json:"perm,omitempty"`
+}
+
+// FileTemplate declares a file that should be copied from Source to Target
+// after running the v5 placeholder renderer.
+// Perm is an optional octal mode applied to the rendered Target file.
+type FileTemplate struct {
+	Source string        `json:"source"`
+	Target string        `json:"target"`
+	Host   HostPredicate `json:"host,omitempty"`
+	Backup bool          `json:"backup,omitempty"`
+	Perm   string        `json:"perm,omitempty"`
+}
+
+// FileDir declares a directory that should exist.
+// Perm is an optional octal mode applied to Target after it exists.
+type FileDir struct {
+	Target string        `json:"target"`
+	Host   HostPredicate `json:"host,omitempty"`
+	Perm   string        `json:"perm,omitempty"`
+}
+
+// HooksConfig declares lifecycle shell commands.
+type HooksConfig struct {
+	PreApply    []Hook `json:"preApply,omitempty"`
+	PostApply   []Hook `json:"postApply,omitempty"`
+	PreAdd      []Hook `json:"preAdd,omitempty"`
+	PostAdd     []Hook `json:"postAdd,omitempty"`
+	PreRemove   []Hook `json:"preRemove,omitempty"`
+	PostRemove  []Hook `json:"postRemove,omitempty"`
+	PreUpgrade  []Hook `json:"preUpgrade,omitempty"`
+	PostUpgrade []Hook `json:"postUpgrade,omitempty"`
+}
+
+// Hook is a single lifecycle shell command or script-file reference.
+type Hook struct {
+	Name            string        `json:"name,omitempty"`
+	Command         string        `json:"command"`
+	File            string        `json:"file,omitempty"`
+	Host            HostPredicate `json:"host,omitempty"`
+	ContinueOnError bool          `json:"continueOnError,omitempty"`
 }
 
 // Service is a single user-space service declaration.
+// At least one of Start, BrewFormula, Launchd.Plist, or Systemd.Unit is required.
+// When BrewFormula is set, genv manages the service via `brew services` on macOS.
+// Launchd and Systemd declare user-supervisor units from rendered templates.
 type Service struct {
-	Start   []string `json:"start"`
-	Stop    []string `json:"stop,omitempty"`
-	Restart []string `json:"restart,omitempty"`
-	Status  []string `json:"status,omitempty"`
+	Start       []string      `json:"start,omitempty"`
+	Stop        []string      `json:"stop,omitempty"`
+	Restart     []string      `json:"restart,omitempty"`
+	Status      []string      `json:"status,omitempty"`
+	BrewFormula string        `json:"brew_formula,omitempty"`
+	Launchd     *LaunchdSpec  `json:"launchd,omitempty"`
+	Systemd     *SystemdSpec  `json:"systemd,omitempty"`
+	Host        HostPredicate `json:"host,omitempty"`
+}
+
+// LaunchdSpec points at a LaunchAgent plist template, rendered like files.templates.
+type LaunchdSpec struct {
+	Plist string `json:"plist"`
+}
+
+// SystemdSpec points at a systemd --user unit template, rendered like files.templates.
+type SystemdSpec struct {
+	Unit string `json:"unit"`
+}
+
+// DeclaresLaunchd reports whether svc names a launchd plist template.
+func (s Service) DeclaresLaunchd() bool {
+	return s.Launchd != nil && s.Launchd.Plist != ""
+}
+
+// DeclaresSystemd reports whether svc names a systemd --user unit template.
+func (s Service) DeclaresSystemd() bool {
+	return s.Systemd != nil && s.Systemd.Unit != ""
 }
 
 // ShellConfig is the shell configuration block in genv.json.
@@ -61,15 +403,23 @@ type ShellConfig struct {
 	Source    []string                 `json:"source,omitempty"`
 }
 
+// TargetShellConfig is the v8 defaults/targets shell block. Alias and function
+// entries are pointers so target JSON null values can delete defaults.
+type TargetShellConfig struct {
+	Aliases   map[string]*ShellAlias    `json:"aliases,omitempty"`
+	Functions map[string]*ShellFunction `json:"functions,omitempty"`
+	Source    []string                  `json:"source,omitempty"`
+}
+
 // ShellAlias is a single shell alias declaration.
-// Shell may be "bash", "zsh", "fish", or empty (applied to all supported shells).
+// Shell may be "bash", "zsh", "fish", "powershell", or empty (POSIX shells only).
 type ShellAlias struct {
 	Value string `json:"value"`
 	Shell string `json:"shell,omitempty"`
 }
 
 // ShellFunction is a single shell function declaration.
-// Shell may be "bash", "zsh", "fish", or empty (applied to all supported shells).
+// Shell may be "bash", "zsh", "fish", "powershell", or empty (POSIX shells only).
 type ShellFunction struct {
 	Body  string `json:"body"`
 	Shell string `json:"shell,omitempty"`
@@ -87,4 +437,82 @@ type Package struct {
 	Version  string            `json:"version,omitempty"`
 	Prefer   string            `json:"prefer,omitempty"`
 	Managers map[string]string `json:"managers,omitempty"`
+	Host     HostPredicate     `json:"host,omitempty"`
+	External *ExternalRecipe   `json:"external,omitempty"`
+}
+
+// ExternalRecipe declares how to discover and manage a release outside a package manager.
+type ExternalRecipe struct {
+	Detect                   ExternalDetect         `json:"detect"`
+	Source                   ExternalSource         `json:"source"`
+	Platforms                []ExternalPlatform     `json:"platforms"`
+	Verify                   []ExternalVerification `json:"verify,omitempty"`
+	AllowUnverified          bool                   `json:"allowUnverified,omitempty"`
+	AllowInsecureHTTP        bool                   `json:"allowInsecureHTTP,omitempty"`
+	AllowBackgroundExecution bool                   `json:"allowBackgroundExecution,omitempty"`
+}
+
+// ExternalDetect describes local executable and version detection.
+type ExternalDetect struct {
+	Command      []string `json:"command"`
+	VersionRegex string   `json:"versionRegex"`
+}
+
+// ExternalSource describes a GitHub Release or structured HTTP version endpoint.
+type ExternalSource struct {
+	Type           string `json:"type"`
+	Repository     string `json:"repository,omitempty"`
+	Release        string `json:"release,omitempty"`
+	TagRegex       string `json:"tagRegex,omitempty"`
+	APIBase        string `json:"apiBase,omitempty"`
+	VersionURL     string `json:"versionURL,omitempty"`
+	Format         string `json:"format,omitempty"`
+	VersionPointer string `json:"versionPointer,omitempty"`
+	VersionRegex   string `json:"versionRegex,omitempty"`
+}
+
+// ExternalPlatform selects one artifact and installation recipe for a host.
+type ExternalPlatform struct {
+	OS          []string        `json:"os"`
+	Arch        []string        `json:"arch"`
+	Libc        []string        `json:"libc,omitempty"`
+	AssetRegex  string          `json:"assetRegex,omitempty"`
+	ArtifactURL string          `json:"artifactURL,omitempty"`
+	Install     ExternalInstall `json:"install"`
+}
+
+// ExternalInstall describes direct, archive, or script installation.
+type ExternalInstall struct {
+	Type            string                `json:"type"`
+	Scope           string                `json:"scope,omitempty"`
+	Destination     string                `json:"destination,omitempty"`
+	StripComponents int                   `json:"stripComponents,omitempty"`
+	Files           []ExternalInstallFile `json:"files,omitempty"`
+	Interpreter     string                `json:"interpreter,omitempty"`
+	Args            []string              `json:"args,omitempty"`
+	Env             map[string]string     `json:"env,omitempty"`
+	Uninstall       []string              `json:"uninstall,omitempty"`
+}
+
+// ExternalInstallFile maps one archive member to a destination.
+type ExternalInstallFile struct {
+	From string `json:"from"`
+	To   string `json:"to"`
+	Mode string `json:"mode,omitempty"`
+}
+
+// ExternalVerification describes one required payload verifier.
+type ExternalVerification struct {
+	Type                string `json:"type"`
+	AssetRegex          string `json:"assetRegex,omitempty"`
+	URL                 string `json:"url,omitempty"`
+	Value               string `json:"value,omitempty"`
+	ValuePointer        string `json:"valuePointer,omitempty"`
+	SignatureAssetRegex string `json:"signatureAssetRegex,omitempty"`
+	BundleAssetRegex    string `json:"bundleAssetRegex,omitempty"`
+	Identity            string `json:"identity,omitempty"`
+	Issuer              string `json:"issuer,omitempty"`
+	PublicKey           string `json:"publicKey,omitempty"`
+	PublicKeyFile       string `json:"publicKeyFile,omitempty"`
+	Fingerprint         string `json:"fingerprint,omitempty"`
 }

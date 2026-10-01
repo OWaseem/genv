@@ -2,8 +2,13 @@ package service
 
 import (
 	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ks1686/genv/internal/genvfile"
 	"github.com/ks1686/genv/internal/schema"
@@ -43,7 +48,7 @@ func TestServiceStatus(t *testing.T) {
 		},
 	}
 
-	entries := ServiceStatus(spec, lock)
+	entries := ServiceStatus(spec, lock, true, "")
 
 	expected := map[string]ServiceStatusKind{
 		"ok-service":       ServiceStatusOK,
@@ -68,7 +73,35 @@ func TestServiceStatus(t *testing.T) {
 	}
 }
 
+func TestServiceStatus_skipProbe(t *testing.T) {
+	if _, err := exec.LookPath("touch"); err != nil {
+		t.Skip("touch not in PATH")
+	}
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "probed")
+	spec := map[string]schema.Service{
+		"probe-me": {
+			Start:  []string{"true"},
+			Status: []string{"touch", marker},
+		},
+	}
+	entries := ServiceStatus(spec, nil, false, "")
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	if entries[0].Running {
+		t.Fatal("probe=false should not mark the service running")
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("status command ran despite probe=false")
+	}
+}
+
 func TestApplyServices(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	installServiceFakeBinary(t, "systemctl", "exit 0")
+	installServiceFakeBinary(t, "launchctl", "exit 0")
 	ctx := context.Background()
 
 	// Case: start a missing service
@@ -77,7 +110,7 @@ func TestApplyServices(t *testing.T) {
 	}
 	lock := []genvfile.LockedService{}
 
-	applied, removed, errs := ApplyServices(ctx, spec, lock, false)
+	applied, removed, errs := ApplyServices(ctx, spec, lock, false, "")
 	if len(errs) > 0 {
 		t.Errorf("ApplyServices failed: %v", errs[0])
 	}
@@ -94,7 +127,7 @@ func TestApplyServices(t *testing.T) {
 		{Name: "extra-svc", Stop: []string{"true"}},
 	}
 
-	applied, removed, errs = ApplyServices(ctx, spec, lock, false)
+	applied, removed, errs = ApplyServices(ctx, spec, lock, false, "")
 	if len(errs) > 0 {
 		t.Errorf("ApplyServices failed: %v", errs[0])
 	}
@@ -120,7 +153,7 @@ func TestApplyServicesFailure(t *testing.T) {
 		"bad-svc": {Start: []string{"false"}},
 	}
 
-	applied, removed, errs := ApplyServices(ctx, spec, nil, false)
+	applied, removed, errs := ApplyServices(ctx, spec, nil, false, "")
 	if len(errs) == 0 {
 		t.Error("expected an error when start command fails, got none")
 	}
@@ -134,6 +167,10 @@ func TestApplyServicesFailure(t *testing.T) {
 
 func TestApplyServicesModified(t *testing.T) {
 	// A service whose config changed vs the lock must be re-applied.
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	installServiceFakeBinary(t, "systemctl", "exit 0")
+	installServiceFakeBinary(t, "launchctl", "exit 0")
 	ctx := context.Background()
 	spec := map[string]schema.Service{
 		"mod-svc": {Start: []string{"true"}},
@@ -142,7 +179,7 @@ func TestApplyServicesModified(t *testing.T) {
 		{Name: "mod-svc", Start: []string{"echo", "old"}},
 	}
 
-	applied, _, errs := ApplyServices(ctx, spec, lock, false)
+	applied, _, errs := ApplyServices(ctx, spec, lock, false, "")
 	if len(errs) > 0 {
 		t.Errorf("unexpected error: %v", errs[0])
 	}
@@ -159,7 +196,7 @@ func TestApplyServicesExtraNoStop(t *testing.T) {
 		{Name: "nostop-svc"},
 	}
 
-	_, removed, errs := ApplyServices(ctx, nil, lock, false)
+	_, removed, errs := ApplyServices(ctx, nil, lock, false, "")
 	if len(errs) > 0 {
 		t.Errorf("unexpected error: %v", errs[0])
 	}
@@ -174,7 +211,7 @@ func TestSpecToLock(t *testing.T) {
 		"svc-a": {Start: []string{"a"}, Status: []string{"check-a"}},
 	}
 
-	lock := SpecToLock(spec)
+	lock := SpecToLock(spec, "")
 
 	if len(lock) != 2 {
 		t.Fatalf("expected 2 locked services, got %d", len(lock))
@@ -192,10 +229,10 @@ func TestSpecToLock(t *testing.T) {
 }
 
 func TestSpecToLockEmpty(t *testing.T) {
-	if got := SpecToLock(nil); got != nil {
+	if got := SpecToLock(nil, ""); got != nil {
 		t.Errorf("expected nil for empty spec, got %v", got)
 	}
-	if got := SpecToLock(map[string]schema.Service{}); got != nil {
+	if got := SpecToLock(map[string]schema.Service{}, ""); got != nil {
 		t.Errorf("expected nil for empty map, got %v", got)
 	}
 }
@@ -211,9 +248,9 @@ func TestSystemdUnitContent(t *testing.T) {
 
 	checks := []string{
 		"Description=genv managed service: my-daemon",
-		"ExecStart=/usr/bin/my-daemon --config /etc/my.conf",
-		"ExecStop=/usr/bin/my-daemon --stop",
-		"ExecReload=/usr/bin/my-daemon --reload",
+		`ExecStart="/usr/bin/my-daemon" "--config" "/etc/my.conf"`,
+		`ExecStop="/usr/bin/my-daemon" "--stop"`,
+		`ExecReload="/usr/bin/my-daemon" "--reload"`,
 		"WantedBy=default.target",
 	}
 	for _, want := range checks {
@@ -228,7 +265,7 @@ func TestSystemdUnitContentMinimal(t *testing.T) {
 	svc := schema.Service{Start: []string{"sleep", "inf"}}
 	content := SystemdUnitContent("minimal", svc)
 
-	if !strings.Contains(content, "ExecStart=sleep inf") {
+	if !strings.Contains(content, `ExecStart="sleep" "inf"`) {
 		t.Errorf("missing ExecStart in unit:\n%s", content)
 	}
 	if strings.Contains(content, "ExecStop") {
@@ -260,6 +297,122 @@ func TestLaunchdPlistContent(t *testing.T) {
 	}
 }
 
+func TestSystemdUnitContent_StripsNewlineInjection(t *testing.T) {
+	svc := schema.Service{
+		Start: []string{"/usr/bin/my-daemon", "ok\nExecStartPre=/bin/evil"},
+	}
+	content := SystemdUnitContent("svc\nInjected=1", svc)
+
+	if strings.Contains(content, "\nExecStartPre=/bin/evil") {
+		t.Fatalf("unit content contains injected directive:\n%s", content)
+	}
+	if strings.Contains(content, "\nInjected=1") {
+		t.Fatalf("service name should not inject unit directives:\n%s", content)
+	}
+}
+
+func TestLaunchdPlistContent_EscapesXML(t *testing.T) {
+	svc := schema.Service{
+		Start: []string{"/bin/echo", `<x>&"y"`},
+	}
+	content := LaunchdPlistContent("name&<>", svc)
+
+	if strings.Contains(content, `<string><x>&"y"</string>`) {
+		t.Fatalf("plist argument is not XML escaped:\n%s", content)
+	}
+	if !strings.Contains(content, `<string>&lt;x&gt;&amp;&#34;y&#34;</string>`) {
+		t.Fatalf("escaped plist argument missing:\n%s", content)
+	}
+	if !strings.Contains(content, `<string>genv.name&amp;&lt;&gt;</string>`) {
+		t.Fatalf("escaped plist label missing:\n%s", content)
+	}
+}
+
+func TestScheduledJobContent_uses_interval_and_one_shot_command(t *testing.T) {
+	// Given: the managed updates checker command and cadence.
+	command := []string{"/usr/local/bin/genv", "updates", "__run-once", "--file", "/tmp/genv.json"}
+	environment := map[string]string{
+		"Z_VAR": "last",
+		"PATH":  `/custom/bin:/path with spaces:/quoted"path`,
+	}
+
+	// When: supervisor metadata is rendered for systemd and launchd.
+	unit := SystemdScheduledUnitContent("updates", command, environment)
+	timer := SystemdScheduledTimerContent("updates", 2*time.Hour)
+	plist := LaunchdScheduledPlistContent("updates", command, 2*time.Hour, environment)
+	script := `C:\Users\qa\.config\genv\scheduled\genv-updates.cmd`
+	vbs := `C:\Users\qa\.config\genv\scheduled\genv-updates.vbs`
+	xml := SchtasksScheduledTaskXML("updates", `C:\Windows\System32\wscript.exe`, vbs, 2*time.Hour)
+	wrapper := SchtasksScheduledCmdContent(ScheduledJob{Name: "updates", Command: command, Environment: environment})
+	vbsWrapper := SchtasksScheduledVbsContent(`C:\Windows\System32\cmd.exe`, script)
+
+	// Then: both backends run the one-shot command on the configured interval.
+	if !strings.Contains(unit, "Type=oneshot") || !strings.Contains(unit, `ExecStart="/usr/local/bin/genv" "updates" "__run-once"`) {
+		t.Fatalf("systemd unit = %q, want one-shot genv updates command", unit)
+	}
+	if !strings.Contains(unit, "TimeoutStartSec=300") {
+		t.Fatalf("systemd unit = %q, want TimeoutStartSec so wedged jobs are killed", unit)
+	}
+	if !strings.Contains(timer, "OnUnitActiveSec=7200s") || !strings.Contains(timer, "Unit=genv-updates.service") {
+		t.Fatalf("systemd timer = %q, want 7200s cadence for updates unit", timer)
+	}
+	if !strings.Contains(plist, "<key>StartInterval</key>") || !strings.Contains(plist, "<integer>7200</integer>") || !strings.Contains(plist, "<string>genv.updates</string>") {
+		t.Fatalf("launchd plist = %q, want StartInterval cadence for updates label", plist)
+	}
+	if !strings.Contains(plist, "<key>TimeOut</key>") || !strings.Contains(plist, "<integer>300</integer>") {
+		t.Fatalf("launchd plist = %q, want TimeOut so launchd SIGTERMs wedged jobs", plist)
+	}
+	if !strings.Contains(xml, "<LogonTrigger>") || !strings.Contains(xml, "<Interval>PT2H</Interval>") || !strings.Contains(xml, `<URI>\genv-updates</URI>`) {
+		t.Fatalf("schtasks XML = %q, want logon trigger and 2h repetition for genv-updates", xml)
+	}
+	if !strings.Contains(xml, "<ExecutionTimeLimit>PT300S</ExecutionTimeLimit>") {
+		t.Fatalf("schtasks XML = %q, want ExecutionTimeLimit so wedged jobs are killed", xml)
+	}
+	if !strings.Contains(xml, `<Command>C:\Windows\System32\wscript.exe</Command>`) || !strings.Contains(xml, vbs) {
+		t.Fatalf("schtasks XML = %q, want windowless wscript host over %s", xml, vbs)
+	}
+	if strings.Contains(xml, `/d /c call`) || strings.Contains(strings.ToLower(xml), `cmd.exe</command>`) {
+		t.Fatalf("schtasks XML = %q, visible-window argv (cmd.exe /d /c call) is not allowed", xml)
+	}
+	if !strings.Contains(vbsWrapper, ", 0, True") || !strings.Contains(vbsWrapper, script) {
+		t.Fatalf("schtasks vbs = %q, want hidden Run of %s", vbsWrapper, script)
+	}
+	if !strings.Contains(xml, "<DisallowStartOnRemoteAppSession>false</DisallowStartOnRemoteAppSession>") {
+		t.Fatalf("schtasks XML = %q, want remote-session start so SSH logon can still fire the task", xml)
+	}
+	if !strings.Contains(wrapper, `"/usr/local/bin/genv" "updates" "__run-once"`) || !strings.Contains(wrapper, "rem genv-program: /usr/local/bin/genv") {
+		t.Fatalf("schtasks cmd = %q, want one-shot genv updates command", wrapper)
+	}
+}
+
+func TestScheduledJobContent_Environment_is_deterministic_and_escaped(t *testing.T) {
+	command := []string{"/usr/local/bin/genv", "updates", "__run-once"}
+	environment := map[string]string{
+		"Z_VAR": "last",
+		"PATH":  "/custom&bin:/quoted\"path",
+	}
+
+	unit := SystemdScheduledUnitContent("updates", command, environment)
+	wantSystemd := "Environment=\"PATH=/custom&bin:/quoted\\\"path\"\nEnvironment=\"Z_VAR=last\""
+	if !strings.Contains(unit, wantSystemd) {
+		t.Fatalf("systemd unit = %q, want sorted escaped environment %q", unit, wantSystemd)
+	}
+
+	plist := LaunchdScheduledPlistContent("updates", command, time.Hour, environment)
+	wantLaunchd := "<key>EnvironmentVariables</key>\n    <dict>\n        <key>PATH</key>\n        <string>/custom&amp;bin:/quoted&#34;path</string>\n        <key>Z_VAR</key>\n        <string>last</string>\n    </dict>"
+	if !strings.Contains(plist, wantLaunchd) {
+		t.Fatalf("launchd plist = %q, want sorted escaped environment %q", plist, wantLaunchd)
+	}
+
+	wrapper := SchtasksScheduledCmdContent(ScheduledJob{Name: "updates", Command: command, Environment: environment})
+	if !strings.Contains(wrapper, `set "PATH=/custom&bin:/quotedpath"`) {
+		t.Fatalf("schtasks cmd = %q, want quotes stripped from PATH and & preserved", wrapper)
+	}
+	if !strings.Contains(wrapper, `set "Z_VAR=last"`) {
+		t.Fatalf("schtasks cmd = %q, want sorted Z_VAR assignment", wrapper)
+	}
+}
+
 func TestSystemdUnitName_PathTraversal(t *testing.T) {
 	name := "../../../evil"
 	unitName := systemdUnitName(name)
@@ -271,32 +424,95 @@ func TestSystemdUnitName_PathTraversal(t *testing.T) {
 	if strings.Contains(plistName, "/") || strings.Contains(plistName, "\\") {
 		t.Errorf("launchdPlistName(%q) = %q; want no path separator characters", name, plistName)
 	}
+
+	taskName := schtasksTaskName(name)
+	if strings.Contains(taskName, "/") || strings.Contains(taskName, "\\") {
+		t.Errorf("schtasksTaskName(%q) = %q; want no path separator characters", name, taskName)
+	}
+}
+
+func TestHomeDirUsesUserHomeDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("HOME is not the source of truth for os.UserHomeDir on Windows")
+	}
+
+	want := t.TempDir()
+	t.Setenv("HOME", want)
+
+	got, err := homeDir()
+	if err != nil {
+		t.Fatalf("homeDir() returned unexpected error: %v", err)
+	}
+	if got != want {
+		t.Fatalf("homeDir() = %q, want %q", got, want)
+	}
+}
+
+func TestHomeDirRejectsEmptyHome(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("HOME is not the source of truth for os.UserHomeDir on Windows")
+	}
+
+	t.Setenv("HOME", "")
+
+	got, err := homeDir()
+	if err == nil {
+		t.Fatalf("homeDir() = %q, nil; want error", got)
+	}
+	if got != "" {
+		t.Fatalf("homeDir() got home %q with error %v, want empty home", got, err)
+	}
+	if !strings.Contains(err.Error(), "home directory") {
+		t.Fatalf("homeDir() error = %q, want home directory context", err)
+	}
 }
 
 func TestSanitizeUnitName(t *testing.T) {
-	cases := []struct {
-		name string
-		want string
-	}{
-		{"normal", "normal"},
-		{"../../foo", "..-..-foo"},
-		{"foo/bar\\baz", "foo-bar-baz"},
-		{"C:\\windows\\path", "C:-windows-path"},
+	// A name that needs no sanitizing keeps its exact readable form.
+	for _, name := range []string{"normal", "web-server", "my_service", "svc01"} {
+		if got := systemdUnitName(name); got != "genv-"+name+".service" {
+			t.Errorf("systemdUnitName(%q) = %q", name, got)
+		}
+		if got := launchdPlistName(name); got != "genv."+name+".plist" {
+			t.Errorf("launchdPlistName(%q) = %q", name, got)
+		}
+		if got := schtasksTaskName(name); got != "genv-"+name {
+			t.Errorf("schtasksTaskName(%q) = %q", name, got)
+		}
 	}
 
-	for _, tc := range cases {
-		// systemd unit
-		gotSystemd := systemdUnitName(tc.name)
-		wantSystemd := "genv-" + tc.want + ".service"
-		if gotSystemd != wantSystemd {
-			t.Errorf("systemdUnitName(%q) = %q, want %q", tc.name, gotSystemd, wantSystemd)
+	// Names needing sanitization stay safe for a filename: no path separator
+	// survives, and no ".." sequence is produced.
+	for _, name := range []string{"../../foo", "foo/bar\\baz", `C:\\windows\\path`, "a b", "..", "", "/"} {
+		for _, got := range []string{systemdUnitName(name), launchdPlistName(name), schtasksTaskName(name)} {
+			if strings.ContainsAny(got, `/\\`) {
+				t.Errorf("name %q produced %q, want no path separator", name, got)
+			}
+			if strings.Contains(got, "..") {
+				t.Errorf("name %q produced %q, want no \"..\" sequence", name, got)
+			}
 		}
+	}
+}
 
-		// launchd plist
-		gotLaunchd := launchdPlistName(tc.name)
-		wantLaunchd := "genv." + tc.want + ".plist"
-		if gotLaunchd != wantLaunchd {
-			t.Errorf("launchdPlistName(%q) = %q, want %q", tc.name, gotLaunchd, wantLaunchd)
+// filepath.Base made "a/x" and "b/x" both "genv-x", so removing one service
+// deleted the other.
+func TestServiceNamesDoNotCollide(t *testing.T) {
+	names := []string{"a/x", "b/x", "a-x", "apps/web", "apps/db", "normal"}
+	for _, n := range names {
+		for _, m := range names {
+			if n == m {
+				continue
+			}
+			if systemdUnitName(n) == systemdUnitName(m) {
+				t.Errorf("systemdUnitName collision: %q and %q both %q", n, m, systemdUnitName(n))
+			}
+			if launchdPlistName(n) == launchdPlistName(m) {
+				t.Errorf("launchdPlistName collision: %q and %q both %q", n, m, launchdPlistName(n))
+			}
+			if schtasksTaskName(n) == schtasksTaskName(m) {
+				t.Errorf("schtasksTaskName collision: %q and %q both %q", n, m, schtasksTaskName(n))
+			}
 		}
 	}
 }

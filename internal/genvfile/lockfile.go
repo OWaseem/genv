@@ -14,10 +14,32 @@ import (
 // was chosen, what concrete package name was passed to it, and the version that
 // was installed. InstalledVersion is empty for entries written before M3.
 type LockedPackage struct {
-	ID               string `json:"id"`
-	Manager          string `json:"manager"`
-	PkgName          string `json:"pkgName"`
-	InstalledVersion string `json:"installedVersion,omitempty"`
+	ID               string           `json:"id"`
+	Manager          string           `json:"manager"`
+	PkgName          string           `json:"pkgName"`
+	InstalledVersion string           `json:"installedVersion,omitempty"`
+	External         *ExternalReceipt `json:"external,omitempty"`
+}
+
+// ExternalReceipt records the resolved release and files owned by genv.
+type ExternalReceipt struct {
+	SourceType     string                `json:"sourceType"`
+	ReleaseID      string                `json:"releaseId,omitempty"`
+	ReleaseTag     string                `json:"releaseTag,omitempty"`
+	ArtifactURL    string                `json:"artifactUrl"`
+	ArtifactSHA256 string                `json:"artifactSha256"`
+	Verification   string                `json:"verification"`
+	RecipeSHA256   string                `json:"recipeSha256"`
+	InstallType    string                `json:"installType"`
+	Owned          bool                  `json:"owned"`
+	Paths          []ExternalPathReceipt `json:"paths,omitempty"`
+	Uninstall      []string              `json:"uninstall,omitempty"`
+}
+
+// ExternalPathReceipt records one installed path and its post-install digest.
+type ExternalPathReceipt struct {
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
 }
 
 // LockedEnvVar records how one environment variable was last applied by genv.
@@ -51,23 +73,45 @@ type LockedShellConfig struct {
 
 // LockedService records how one service was last applied by genv.
 type LockedService struct {
-	Name    string   `json:"name"`
-	Start   []string `json:"start"`
-	Stop    []string `json:"stop,omitempty"`
-	Restart []string `json:"restart,omitempty"`
-	Status  []string `json:"status,omitempty"`
+	Name         string   `json:"name"`
+	Start        []string `json:"start,omitempty"`
+	Stop         []string `json:"stop,omitempty"`
+	Restart      []string `json:"restart,omitempty"`
+	Status       []string `json:"status,omitempty"`
+	BrewFormula  string   `json:"brew_formula,omitempty"`
+	LaunchdPlist string   `json:"launchdPlist,omitempty"`
+	LaunchdLabel string   `json:"launchdLabel,omitempty"`
+	SystemdUnit  string   `json:"systemdUnit,omitempty"`
+	SystemdName  string   `json:"systemdName,omitempty"`
+}
+
+// LockedFile records a single applied file entry from the spec files block.
+// ContentHash is a versioned digest ("sha256:<hex>") of the link source or
+// rendered template at last successful apply. Empty on pre-hash locks and for
+// dirs / merge-dir records.
+type LockedFile struct {
+	Source      string `json:"source"`
+	Target      string `json:"target"`
+	Mode        string `json:"mode,omitempty"`
+	ContentHash string `json:"contentHash,omitempty"`
 }
 
 // LockFile is the on-disk representation of the applied state tracked by genv.
 // The Env field is added in M8 (schemaVersion "2") and is absent in v1 lock files.
 // The Shell field is added in M9 (schemaVersion "3") and is absent in v1/v2 lock files.
 // The Services field is added in M10 (schemaVersion "4") and is absent in v1/v2/v3 lock files.
+// The Files field is added in M11 (schemaVersion "5") and is absent in v1-v4 lock files.
+// ContentHash on Files entries is additive (omitempty); older locks omit it.
 type LockFile struct {
 	SchemaVersion string             `json:"schemaVersion"`
+	Target        string             `json:"target,omitempty"`
+	GOOS          string             `json:"goos,omitempty"`
+	ActiveProfile string             `json:"activeProfile,omitempty"`
 	Packages      []LockedPackage    `json:"packages"`
 	Env           []LockedEnvVar     `json:"env,omitempty"`
 	Shell         *LockedShellConfig `json:"shell,omitempty"`
 	Services      []LockedService    `json:"services,omitempty"`
+	Files         []LockedFile       `json:"files,omitempty"`
 }
 
 // ReadLock reads the lock file at path. If the file does not exist (first run),
@@ -101,13 +145,37 @@ func WriteLock(path string, lf *LockFile) error {
 		return fmt.Errorf("creating parent directory for lock file (%s): %w", dir, err)
 	}
 
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
-		return fmt.Errorf("writing %s: %w", tmp, err)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return fmt.Errorf("writing %s: %w", path, err)
 	}
-	if err := os.Rename(tmp, path); err != nil {
-		_ = os.Remove(tmp)
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("writing %s: %w", tmpName, err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("writing %s: %w", tmpName, err)
+	}
+	// Sync while the write handle is still open — on Windows,
+	// FlushFileBuffers denies read-only handles, so this cannot be done via
+	// a reopen.
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("syncing %s: %w", tmpName, err)
+	}
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpName)
+		return fmt.Errorf("writing %s: %w", tmpName, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		_ = os.Remove(tmpName)
 		return fmt.Errorf("saving %s: %w", path, err)
 	}
+	syncDir(dir)
 	return nil
 }

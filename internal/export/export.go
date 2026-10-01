@@ -1,0 +1,772 @@
+package export
+
+import (
+	"encoding/json"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/ks1686/genv/internal/genvfile"
+	"github.com/ks1686/genv/internal/schema"
+	"github.com/ks1686/genv/internal/verify"
+)
+
+// Options controls filesystem behavior for BuildWithOptions.
+type Options struct {
+	// BaseDir resolves relative file assets. Empty means the current directory.
+	BaseDir string
+	// Verify, when set, queries live managers for each exported package and
+	// appends error-class report items for packages that cannot be proved.
+	Verify func(packages []schema.Package) []verify.Result
+}
+
+// Build materializes targetID into outDir as genv.json plus report artifacts.
+func Build(f *schema.GenvFile, targetID string, outDir string) (Report, error) {
+	return BuildWithOptions(f, targetID, outDir, Options{})
+}
+
+// BuildWithOptions materializes targetID into outDir as genv.json plus
+// report.json and report.md. The snapshot is schemaVersion 8 with exactly one
+// target bucket.
+func BuildWithOptions(f *schema.GenvFile, targetID string, outDir string, opts Options) (Report, error) {
+	if targetID == "" {
+		return nil, fmt.Errorf("export target: target id is required")
+	}
+	if outDir == "" {
+		return nil, fmt.Errorf("export target %q: output directory is required", targetID)
+	}
+	effective, err := schema.MergeTarget(f, targetID)
+	if err != nil {
+		return nil, err
+	}
+
+	report := buildReport(effective.Packages, effective.Files, effective.Services, effective.Hooks, targetID)
+	if opts.Verify != nil {
+		report = append(report, verifyReportItems(opts.Verify(effective.Packages))...)
+	}
+	bundle, envReport := bundleFromFlat(effective)
+	report = append(report, envReport...)
+	if err := rewriteAndCopyFileAssets(bundle.Files, opts.BaseDir, outDir); err != nil {
+		return report.sorted(), err
+	}
+	if err := rewriteAndCopyServiceAssets(bundle.Services, opts.BaseDir, outDir); err != nil {
+		return report.sorted(), err
+	}
+	if err := rewriteAndCopyExternalKeyAssets(bundle.Packages, opts.BaseDir, outDir); err != nil {
+		return report.sorted(), err
+	}
+	if err := rewriteAndCopyHookAssets(bundle.Hooks, opts.BaseDir, outDir); err != nil {
+		return report.sorted(), err
+	}
+
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return report.sorted(), fmt.Errorf("creating export directory %s: %w", outDir, err)
+	}
+	if err := writeSnapshot(filepath.Join(outDir, "genv.json"), f.SchemaVersion, targetID, bundle, f.Adapters); err != nil {
+		return report.sorted(), err
+	}
+	if err := writeReport(filepath.Join(outDir, "report.json"), report); err != nil {
+		return report.sorted(), err
+	}
+	if err := writeReportMarkdown(filepath.Join(outDir, "report.md"), report); err != nil {
+		return report.sorted(), err
+	}
+	return report.sorted(), nil
+}
+
+type snapshotDocument struct {
+	SchemaVersion string                          `json:"schemaVersion"`
+	Adapters      map[string]schema.AdapterDef    `json:"adapters,omitempty"`
+	Targets       map[string]*schema.TargetBundle `json:"targets"`
+}
+
+func writeSnapshot(path, schemaVersion, targetID string, bundle *schema.TargetBundle, adapters map[string]schema.AdapterDef) error {
+	if schemaVersion != schema.Version9 {
+		schemaVersion = schema.Version8
+	}
+	doc := snapshotDocument{
+		SchemaVersion: schemaVersion,
+		Adapters:      adapters,
+		Targets: map[string]*schema.TargetBundle{
+			targetID: bundle,
+		},
+	}
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return fmt.Errorf("serializing export snapshot: %w", err)
+	}
+	data = append(data, '\n')
+	if _, valErrs, parseErr := schema.ParseAndValidate(data); parseErr != nil {
+		return fmt.Errorf("%w: exported snapshot: %w", genvfile.ErrInvalidFile, parseErr)
+	} else if len(valErrs) > 0 {
+		msgs := make([]string, len(valErrs))
+		for i, valErr := range valErrs {
+			msgs[i] = valErr.Error()
+		}
+		return fmt.Errorf("%w: exported snapshot validation errors:\n  %s", genvfile.ErrInvalidFile, strings.Join(msgs, "\n  "))
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return fmt.Errorf("writing %s: %w", tmp, err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("saving %s: %w", path, err)
+	}
+	return nil
+}
+
+func rewriteAndCopyExternalKeyAssets(packages []schema.Package, baseDir, outDir string) error {
+	keyIndex := 0
+	for i := range packages {
+		if packages[i].External == nil {
+			continue
+		}
+		for j := range packages[i].External.Verify {
+			keyFile := packages[i].External.Verify[j].PublicKeyFile
+			if keyFile == "" || isExternalSourcePath(keyFile) {
+				continue
+			}
+			rel, err := copyAsset(baseDir, outDir, keyFile, "external-key", keyIndex)
+			if err != nil {
+				return err
+			}
+			packages[i].External.Verify[j].PublicKeyFile = rel
+			keyIndex++
+		}
+	}
+	return nil
+}
+
+// hookPhases lists every lifecycle hook phase, in the order the bundle stores
+// them, paired with a pointer to the phase's slice.
+func hookPhases(hooks *schema.HooksConfig) []struct {
+	name  string
+	hooks *[]schema.Hook
+} {
+	if hooks == nil {
+		return nil
+	}
+	return []struct {
+		name  string
+		hooks *[]schema.Hook
+	}{
+		{"preApply", &hooks.PreApply},
+		{"postApply", &hooks.PostApply},
+		{"preAdd", &hooks.PreAdd},
+		{"postAdd", &hooks.PostAdd},
+		{"preRemove", &hooks.PreRemove},
+		{"postRemove", &hooks.PostRemove},
+		{"preUpgrade", &hooks.PreUpgrade},
+		{"postUpgrade", &hooks.PostUpgrade},
+	}
+}
+
+// rewriteAndCopyHookAssets bundles hook scripts declared with `file`. Without
+// this an exported or pulled spec lost its hooks: apply expands a relative
+// hook file against the working directory (or the scheduler's cwd), so a
+// snapshot applied elsewhere looked for a script that was never copied.
+func rewriteAndCopyHookAssets(hooks *schema.HooksConfig, baseDir, outDir string) error {
+	for _, phase := range hookPhases(hooks) {
+		for i := range *phase.hooks {
+			file := (*phase.hooks)[i].File
+			if file == "" || isExternalSourcePath(file) {
+				continue
+			}
+			rel, err := copyAsset(baseDir, outDir, file, "hook", i)
+			if err != nil {
+				return err
+			}
+			(*phase.hooks)[i].File = rel
+		}
+	}
+	return nil
+}
+
+func bundleFromFlat(f *schema.GenvFile) (*schema.TargetBundle, Report) {
+	var report Report
+	bundle := &schema.TargetBundle{
+		Packages: copyPackages(f.Packages),
+		Files:    copyFilesConfig(f.Files),
+		Hooks:    copyHooksConfig(f.Hooks),
+	}
+	if len(f.Env) > 0 {
+		bundle.Env = make(map[string]*schema.EnvVar, len(f.Env))
+		for name, envVar := range f.Env {
+			if envVar.Sensitive {
+				report = append(report, ReportItem{
+					Class:   ClassWarning,
+					Code:    "sensitive-env-omitted",
+					Message: fmt.Sprintf("env.%s is marked sensitive and was omitted from the export snapshot", name),
+				})
+				continue
+			}
+			v := envVar
+			bundle.Env[name] = &v
+		}
+		if len(bundle.Env) == 0 {
+			bundle.Env = nil
+		}
+	}
+	bundle.Shell = copyShellToTarget(f.Shell)
+	if len(f.Services) > 0 {
+		bundle.Services = make(map[string]*schema.Service, len(f.Services))
+		for name, svc := range f.Services {
+			v := copyService(svc)
+			v.Host = nil
+			bundle.Services[name] = &v
+		}
+	}
+	return normalizeBundle(bundle), report
+}
+
+func normalizeBundle(bundle *schema.TargetBundle) *schema.TargetBundle {
+	if len(bundle.Packages) == 0 {
+		bundle.Packages = nil
+	}
+	if bundle.Shell != nil && len(bundle.Shell.Aliases) == 0 && len(bundle.Shell.Functions) == 0 && len(bundle.Shell.Source) == 0 {
+		bundle.Shell = nil
+	}
+	if len(bundle.Services) == 0 {
+		bundle.Services = nil
+	}
+	if bundle.Files != nil && len(bundle.Files.Links) == 0 && len(bundle.Files.Templates) == 0 && len(bundle.Files.Dirs) == 0 {
+		bundle.Files = nil
+	}
+	if bundle.Hooks != nil &&
+		len(bundle.Hooks.PreApply) == 0 &&
+		len(bundle.Hooks.PostApply) == 0 &&
+		len(bundle.Hooks.PreAdd) == 0 &&
+		len(bundle.Hooks.PostAdd) == 0 &&
+		len(bundle.Hooks.PreRemove) == 0 &&
+		len(bundle.Hooks.PostRemove) == 0 &&
+		len(bundle.Hooks.PreUpgrade) == 0 &&
+		len(bundle.Hooks.PostUpgrade) == 0 {
+		bundle.Hooks = nil
+	}
+	return bundle
+}
+
+func buildReport(packages []schema.Package, files *schema.FilesConfig, services map[string]schema.Service, hooks *schema.HooksConfig, targetID string) Report {
+	var report Report
+	allowed := managerAllowlist(targetID)
+	for _, pkg := range packages {
+		if packageUsableOnTarget(pkg, allowed, targetID) {
+			continue
+		}
+		report = append(report, ReportItem{
+			Class:     ClassError,
+			Code:      "manager-not-supported",
+			Message:   fmt.Sprintf("package %q has no managers usable on target %q", pkg.ID, targetID),
+			PackageID: pkg.ID,
+		})
+	}
+	if files != nil {
+		for i, link := range files.Links {
+			if isExternalSourcePath(link.Source) {
+				report = append(report, unbundlableSourceItem(fmt.Sprintf("files.links[%d].source", i), link.Source))
+			}
+		}
+		for i, tpl := range files.Templates {
+			if isExternalSourcePath(tpl.Source) {
+				report = append(report, unbundlableSourceItem(fmt.Sprintf("files.templates[%d].source", i), tpl.Source))
+			}
+		}
+	}
+	for _, phase := range hookPhases(hooks) {
+		for i, h := range *phase.hooks {
+			if h.File != "" && isExternalSourcePath(h.File) {
+				report = append(report, unbundlableSourceItem(fmt.Sprintf("hooks.%s[%d].file", phase.name, i), h.File))
+			}
+		}
+	}
+	for name, svc := range services {
+		if svc.DeclaresLaunchd() && isExternalSourcePath(svc.Launchd.Plist) {
+			report = append(report, unbundlableSourceItem("services."+name+".launchd.plist", svc.Launchd.Plist))
+		}
+		if svc.DeclaresSystemd() && isExternalSourcePath(svc.Systemd.Unit) {
+			report = append(report, unbundlableSourceItem("services."+name+".systemd.unit", svc.Systemd.Unit))
+		}
+	}
+	return report
+}
+
+func verifyReportItems(results []verify.Result) Report {
+	var report Report
+	for _, r := range results {
+		if r.OK() {
+			continue
+		}
+		msg := r.Message
+		if msg == "" {
+			msg = fmt.Sprintf("package %q: %s", r.PackageID, r.Code)
+		}
+		report = append(report, ReportItem{
+			Class:     ClassError,
+			Code:      r.Code,
+			Message:   msg,
+			PackageID: r.PackageID,
+		})
+	}
+	return report
+}
+
+// unbundlableSourceItem reports a source genv cannot copy into the bundle.
+// It is the same finding as before for absolute paths, widened to cover
+// home-relative and $VAR sources, which apply expands before reading and
+// which therefore never name a file under the spec directory.
+func unbundlableSourceItem(field, source string) ReportItem {
+	return ReportItem{
+		Class:   ClassError,
+		Code:    "absolute-source",
+		Message: fmt.Sprintf("%s cannot be bundled: %s", field, source),
+	}
+}
+
+func managerConstraints(pkg schema.Package) map[string]bool {
+	out := make(map[string]bool)
+	if pkg.Prefer != "" {
+		out[pkg.Prefer] = true
+	}
+	for mgr := range pkg.Managers {
+		out[mgr] = true
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func intersects(a, b map[string]bool) bool {
+	for k := range a {
+		if b[k] {
+			return true
+		}
+	}
+	return false
+}
+
+func managerAllowlist(targetID string) map[string]bool {
+	switch targetID {
+	case "macos":
+		return set("brew", "mas", "linuxbrew", universalManagers)
+	case "arch", "wsl-arch":
+		return set("pacman", "paru", "yay", "snap", "brew", "linuxbrew", universalManagers)
+	case "ubuntu":
+		return set("apt", "snap", "brew", "linuxbrew", universalManagers)
+	case "windows":
+		return set("winget", "scoop", "choco", universalManagers)
+	case "linux":
+		return set("pacman", "paru", "yay", "apt", "dnf", "apk", "snap", "brew", "linuxbrew", universalManagers)
+	default:
+		return set(universalManagers)
+	}
+}
+
+var universalManagers = []string{
+	"bun", "npm", "pnpm", "yarn", "deno", "volta",
+	"uv", "pipx", "pip-user", "poetry", "conda", "mamba", "pixi",
+	"cargo", "go", "rustup", "gem", "composer", "dotnet-tool",
+	"ghcup", "stack", "opam", "juliaup", "sdkman", "asdf", "mise",
+	"krew", "helm", "vscode",
+}
+
+func set(values ...any) map[string]bool {
+	out := make(map[string]bool)
+	for _, value := range values {
+		switch v := value.(type) {
+		case string:
+			out[v] = true
+		case []string:
+			for _, s := range v {
+				out[s] = true
+			}
+		}
+	}
+	return out
+}
+
+func rewriteAndCopyFileAssets(files *schema.FilesConfig, baseDir, outDir string) error {
+	if files == nil {
+		return nil
+	}
+	for i := range files.Links {
+		source := files.Links[i].Source
+		if source == "" || isExternalSourcePath(source) {
+			continue
+		}
+		rel, err := copyAsset(baseDir, outDir, source, "link", i)
+		if err != nil {
+			return err
+		}
+		files.Links[i].Source = rel
+	}
+	for i := range files.Templates {
+		source := files.Templates[i].Source
+		if source == "" || isExternalSourcePath(source) {
+			continue
+		}
+		rel, err := copyAsset(baseDir, outDir, source, "template", i)
+		if err != nil {
+			return err
+		}
+		files.Templates[i].Source = rel
+	}
+	return nil
+}
+
+func rewriteAndCopyServiceAssets(services map[string]*schema.Service, baseDir, outDir string) error {
+	if len(services) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(services))
+	for name := range services {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for i, name := range names {
+		svc := services[name]
+		if svc == nil {
+			continue
+		}
+		if svc.DeclaresLaunchd() && svc.Launchd.Plist != "" && !isExternalSourcePath(svc.Launchd.Plist) {
+			rel, err := copyAsset(baseDir, outDir, svc.Launchd.Plist, "launchd", i)
+			if err != nil {
+				return err
+			}
+			copied := *svc.Launchd
+			copied.Plist = rel
+			svc.Launchd = &copied
+		}
+		if svc.DeclaresSystemd() && svc.Systemd.Unit != "" && !isExternalSourcePath(svc.Systemd.Unit) {
+			rel, err := copyAsset(baseDir, outDir, svc.Systemd.Unit, "systemd", i)
+			if err != nil {
+				return err
+			}
+			copied := *svc.Systemd
+			copied.Unit = rel
+			svc.Systemd = &copied
+		}
+	}
+	return nil
+}
+
+func isAbsolutePath(path string) bool {
+	// Host-independent: filepath.IsAbs follows GOOS and would treat
+	// incomplete UNC (\\server) or "1:\\Users" as absolute on Windows.
+	if strings.HasPrefix(path, "/") {
+		return true
+	}
+	if len(path) >= 3 && isASCIIAlpha(path[0]) && path[1] == ':' && (path[2] == '\\' || path[2] == '/') {
+		return true
+	}
+	if strings.HasPrefix(path, `\\`) {
+		parts := strings.FieldsFunc(path[2:], func(r rune) bool { return r == '\\' || r == '/' })
+		return len(parts) >= 2 && parts[0] != "" && parts[1] != ""
+	}
+	return false
+}
+
+// isExternalSourcePath reports whether a source names a file genv cannot copy
+// into the bundle. Absolute paths obviously qualify. So do home-relative
+// paths: apply expands "~" before reading, so "~/dotfiles/zshrc" is a real file
+// outside the spec directory rather than the relative name it looks like, and
+// joining it under baseDir used to fail the copy outright. Sources containing
+// a $VAR reference are expanded the same way at apply time.
+func isExternalSourcePath(path string) bool {
+	if isAbsolutePath(path) {
+		return true
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+		return true
+	}
+	return strings.Contains(path, "$")
+}
+
+func isASCIIAlpha(b byte) bool {
+	return (b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')
+}
+
+func copyAsset(baseDir, outDir, source, kind string, index int) (string, error) {
+	sourcePath := source
+	if baseDir != "" {
+		sourcePath = filepath.Join(baseDir, source)
+	}
+	// Renaming the destination does not help if the read already left the spec
+	// directory: "../.ssh/id_ed25519" would still be copied in. Containment is
+	// checked on the path that is actually opened, matching the rule
+	// internal/files.resolveSource and internal/pull already apply.
+	if baseDir != "" {
+		if err := requireWithinBase(baseDir, sourcePath); err != nil {
+			return "", fmt.Errorf("copying export asset %s: %w", source, err)
+		}
+	}
+	destRel := assetDestination(source, kind, index)
+	destPath := filepath.Join(outDir, filepath.FromSlash(destRel))
+	if err := copyPath(sourcePath, destPath); err != nil {
+		return "", fmt.Errorf("copying export asset %s to %s: %w", sourcePath, destPath, err)
+	}
+	return destRel, nil
+}
+
+// requireWithinBase refuses a source that resolves outside baseDir.
+func requireWithinBase(baseDir, sourcePath string) error {
+	base := filepath.Clean(baseDir)
+	rel, err := filepath.Rel(base, sourcePath)
+	if err != nil {
+		return fmt.Errorf("source %s escapes the spec directory %s", sourcePath, base)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("source %s escapes the spec directory %s", sourcePath, base)
+	}
+	return nil
+}
+
+func assetDestination(source, kind string, index int) string {
+	clean := filepath.ToSlash(filepath.Clean(source))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, "../") {
+		base := filepath.Base(clean)
+		if base == "." || base == string(filepath.Separator) || base == "" {
+			base = "asset"
+		}
+		clean = fmt.Sprintf("external/%s-%d-%s", kind, index, base)
+	}
+	return filepath.ToSlash(filepath.Join("files", filepath.FromSlash(clean)))
+}
+
+// copyPath copies a file or directory tree. It uses Lstat so a symlink is
+// refused rather than followed: pull and apply already refuse symlinked
+// assets, and following one would quietly pull in a file outside the spec
+// directory.
+func copyPath(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("symlinks are not allowed")
+	}
+	if info.IsDir() {
+		return copyDir(src, dst)
+	}
+	return copyFile(src, dst, info.Mode().Perm())
+}
+
+func copyDir(src, dst string) error {
+	return filepath.WalkDir(src, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&os.ModeSymlink != 0 {
+			rel, relErr := filepath.Rel(src, path)
+			if relErr != nil {
+				return relErr
+			}
+			return fmt.Errorf("symlinks are not allowed: %s", filepath.ToSlash(rel))
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(dst, rel)
+		if d.IsDir() {
+			return os.MkdirAll(target, 0o755)
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return copyFile(path, target, info.Mode().Perm())
+	})
+}
+
+func copyFile(src, dst string, mode os.FileMode) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+func copyPackages(in []schema.Package) []schema.Package {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]schema.Package, len(in))
+	for i, pkg := range in {
+		out[i] = pkg
+		out[i].Host = nil
+		out[i].Managers = copyStringMap(pkg.Managers)
+		out[i].External = copyExternalRecipe(pkg.External)
+	}
+	return out
+}
+
+func copyExternalRecipe(in *schema.ExternalRecipe) *schema.ExternalRecipe {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	out.Detect.Command = copyStrings(in.Detect.Command)
+	out.Platforms = append([]schema.ExternalPlatform(nil), in.Platforms...)
+	for i := range out.Platforms {
+		out.Platforms[i].OS = copyStrings(in.Platforms[i].OS)
+		out.Platforms[i].Arch = copyStrings(in.Platforms[i].Arch)
+		out.Platforms[i].Libc = copyStrings(in.Platforms[i].Libc)
+		out.Platforms[i].Install.Args = copyStrings(in.Platforms[i].Install.Args)
+		out.Platforms[i].Install.Uninstall = copyStrings(in.Platforms[i].Install.Uninstall)
+		out.Platforms[i].Install.Files = append([]schema.ExternalInstallFile(nil), in.Platforms[i].Install.Files...)
+		out.Platforms[i].Install.Env = copyStringMap(in.Platforms[i].Install.Env)
+	}
+	out.Verify = append([]schema.ExternalVerification(nil), in.Verify...)
+	return &out
+}
+
+func copyStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+func copyShellToTarget(in *schema.ShellConfig) *schema.TargetShellConfig {
+	if in == nil {
+		return nil
+	}
+	out := &schema.TargetShellConfig{
+		Source: copyStrings(in.Source),
+	}
+	if len(in.Aliases) > 0 {
+		out.Aliases = make(map[string]*schema.ShellAlias, len(in.Aliases))
+		for name, alias := range in.Aliases {
+			v := alias
+			out.Aliases[name] = &v
+		}
+	}
+	if len(in.Functions) > 0 {
+		out.Functions = make(map[string]*schema.ShellFunction, len(in.Functions))
+		for name, fn := range in.Functions {
+			v := fn
+			out.Functions[name] = &v
+		}
+	}
+	return out
+}
+
+func copyFilesConfig(in *schema.FilesConfig) *schema.FilesConfig {
+	if in == nil {
+		return nil
+	}
+	return &schema.FilesConfig{
+		Links:     copyFileLinks(in.Links),
+		Templates: copyFileTemplates(in.Templates),
+		Dirs:      copyFileDirs(in.Dirs),
+	}
+}
+
+func copyFileLinks(in []schema.FileLink) []schema.FileLink {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]schema.FileLink, len(in))
+	for i, v := range in {
+		out[i] = v
+		out[i].Host = nil
+	}
+	return out
+}
+
+func copyFileTemplates(in []schema.FileTemplate) []schema.FileTemplate {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]schema.FileTemplate, len(in))
+	for i, v := range in {
+		out[i] = v
+		out[i].Host = nil
+	}
+	return out
+}
+
+func copyFileDirs(in []schema.FileDir) []schema.FileDir {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]schema.FileDir, len(in))
+	for i, v := range in {
+		out[i] = v
+		out[i].Host = nil
+	}
+	return out
+}
+
+func copyHooksConfig(in *schema.HooksConfig) *schema.HooksConfig {
+	if in == nil {
+		return nil
+	}
+	return &schema.HooksConfig{
+		PreApply:    copyHooks(in.PreApply),
+		PostApply:   copyHooks(in.PostApply),
+		PreAdd:      copyHooks(in.PreAdd),
+		PostAdd:     copyHooks(in.PostAdd),
+		PreRemove:   copyHooks(in.PreRemove),
+		PostRemove:  copyHooks(in.PostRemove),
+		PreUpgrade:  copyHooks(in.PreUpgrade),
+		PostUpgrade: copyHooks(in.PostUpgrade),
+	}
+}
+
+func copyHooks(in []schema.Hook) []schema.Hook {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]schema.Hook, len(in))
+	for i, v := range in {
+		out[i] = v
+		out[i].Host = nil
+	}
+	return out
+}
+
+func copyService(in schema.Service) schema.Service {
+	out := in
+	out.Start = copyStrings(in.Start)
+	out.Stop = copyStrings(in.Stop)
+	out.Restart = copyStrings(in.Restart)
+	out.Status = copyStrings(in.Status)
+	if in.Launchd != nil {
+		v := *in.Launchd
+		out.Launchd = &v
+	}
+	if in.Systemd != nil {
+		v := *in.Systemd
+		out.Systemd = &v
+	}
+	return out
+}
+
+func copyStrings(in []string) []string {
+	if len(in) == 0 {
+		return nil
+	}
+	return append([]string(nil), in...)
+}
