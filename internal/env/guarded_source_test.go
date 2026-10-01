@@ -12,8 +12,7 @@ import (
 // any host that has not applied since the fragments were rendered, every shell
 // start printed "No such file or directory" until someone ran `genv apply`.
 func TestInjectSourceLine_EmitsGuardedHomeRelativeSource(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setTestHomeDir(t)
 	frag := filepath.Join(home, ".config", "genv", "env.sh")
 	rc := filepath.Join(home, ".bashrc")
 	if err := os.WriteFile(rc, nil, 0o644); err != nil {
@@ -47,8 +46,7 @@ func TestInjectSourceLine_EmitsGuardedHomeRelativeSource(t *testing.T) {
 // A fragment outside home (a custom --state-dir) cannot be written as
 // $HOME-relative, but it must still be guarded.
 func TestInjectSourceLine_GuardsFragmentOutsideHome(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setTestHomeDir(t)
 	frag := filepath.Join(t.TempDir(), "elsewhere", "env.sh")
 	rc := filepath.Join(home, ".bashrc")
 
@@ -70,8 +68,7 @@ func TestInjectSourceLine_GuardsFragmentOutsideHome(t *testing.T) {
 // stayed permanently dirty. An existing genv block must be *replaced* with the
 // host-correct rendering, not duplicated.
 func TestInjectSourceLine_ReplacesStaleBlockFromSharedTemplate(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setTestHomeDir(t)
 	rc := filepath.Join(home, ".zshrc")
 	// A shared template already carrying another host's rendering.
 	stale := "\n# genv env\n. '/Users/someone-else/.config/genv/env.sh'\n"
@@ -98,8 +95,7 @@ func TestInjectSourceLine_ReplacesStaleBlockFromSharedTemplate(t *testing.T) {
 
 // Repeated applies must stay idempotent.
 func TestInjectSourceLine_IdempotentAcrossApplies(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setTestHomeDir(t)
 	frag := filepath.Join(home, ".config", "genv", "env.sh")
 	rc := filepath.Join(home, ".bashrc")
 
@@ -117,8 +113,7 @@ func TestInjectSourceLine_IdempotentAcrossApplies(t *testing.T) {
 // Unrelated rc content must survive: the replacement is scoped to genv's own
 // block, not the whole file.
 func TestInjectSourceLine_PreservesSurroundingContent(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
+	home := setTestHomeDir(t)
 	rc := filepath.Join(home, ".bashrc")
 	before := "export FOO=1\n# genv env\n. '/old/host/env.sh'\nexport BAR=2\n"
 	if err := os.WriteFile(rc, []byte(before), 0o644); err != nil {
@@ -136,6 +131,18 @@ func TestInjectSourceLine_PreservesSurroundingContent(t *testing.T) {
 	if strings.Contains(got, "/old/host/env.sh") {
 		t.Errorf("stale source line was not replaced:\n%s", got)
 	}
+}
+
+// setTestHomeDir points both HOME and USERPROFILE at a fresh directory.
+// os.UserHomeDir reads USERPROFILE on Windows and HOME elsewhere, so setting
+// only HOME silently left these tests exercising the real user's home there —
+// and the fragment correctly came out absolute instead of $HOME-relative.
+func setTestHomeDir(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	return home
 }
 
 func readFileString(t *testing.T, path string) string {
