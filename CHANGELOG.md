@@ -4,6 +4,74 @@ All notable changes to this project will be documented in this file.
 
 ## Unreleased
 
+## v4.5.4 - 2026-09-30
+
+Correctness fixes for #213–#217. No new schema surface, so this is a patch.
+
+Deliberately excludes #212 (a declarative Windows Task Scheduler backend for
+`services`), which is a feature rather than a fix and cannot be verified
+outside Windows. It is tracked separately.
+
+### Fixed
+
+- `scan` proposed essentially every installed package on pacman — 767 of 771
+  proposals on the reporter's host, mostly libraries like `glibc` and
+  `glib2` — while `paru` and `yay` already listed only explicit packages.
+  `pacman` now scans `pacman -Qqe`; `--all` / `--deps` still returns the full
+  `-Qq` inventory (#214).
+- `scan` proposed Ruby's own default gems. The filter was matching the wrong
+  thing: RubyGems only prints the `default:` marker when a gem has a second,
+  non-default version installed, so on RubyGems 4.0.20 `abbrev (0.1.2)` is a
+  default gem with no marker while `bundler (default: 4.0.20, 4.0.18)` has
+  one. Inferring "is default" from that marker missed every default gem with a
+  single version. genv now asks RubyGems via
+  `Gem::Specification.default_stubs`. On a Ruby 4.0.20 host this cuts gem
+  proposals from 83 to 19 (#216).
+  *Known limitation:* the residual 19 (`csv`, `base64`, `bigdecimal`,
+  `benchmark`, `abbrev`) are no longer reported as default gems by RubyGems 4,
+  which also removed `bundled_gem?`, and they share a gem home with user
+  installs. Nothing in RubyGems distinguishes them, so genv cannot either.
+- `scan` could not parse npm's global package list and silently proposed zero
+  npm packages. `npm ls -g --json` returns an object; genv accepted that shape
+  only when a `dependencies` key was present, so an object without one fell
+  through to an array unmarshal and failed with `cannot unmarshal object into
+  Go value of type []adapter.jsListPackage` — a parse error for what is a
+  valid empty listing (#215).
+- `scan` reported success when a manager's inventory could not be read,
+  printing one line to stderr and continuing, so a partial inventory read as a
+  complete one. Unreadable managers are now named in the JSON payload and in
+  the envelope, and a hard failure exits non-zero. A per-manager timeout stays
+  a warning: winget's first-run source sync stalls for minutes on Windows and
+  must not fail every scan (#215).
+- A lock entry with no `InstalledVersion` — what a failed install leaves
+  behind — was reported as `ok` and then believed forever, because
+  `packageDrifted` compares a recorded version and had nothing to compare. The
+  package was never re-queued and the entry was written back into `Unchanged`
+  on every later apply, so the state could not recover even once the package
+  became installable. `genv status` now reports such entries as `unknown`, and
+  apply re-queues one whose manager reports the package absent. A manager that
+  could not be inventoried leaves its entries alone, and a package that is
+  installed but unversioned stays put (#213).
+- Generated `env.sh` / `shell.sh` fragments were sourced by absolute,
+  host-specific path with no existence guard. Because the fragments are
+  rendered output rather than tracked files, that path is legitimately absent
+  on every fresh clone and on any host that has not applied since the last
+  render, so each shell start printed `No such file or directory` until
+  someone ran `genv apply`. The POSIX source line is now
+  `if [ -r "$HOME/.config/genv/env.sh" ]; then . "$HOME/.config/genv/env.sh"; fi`
+  — guarded, and `$HOME`-relative so one committed rc template is correct on
+  every host. The PowerShell profile line gets the same treatment with
+  `Test-Path` and `$env:USERPROFILE`. An existing genv block is replaced rather
+  than appended to: recognition was exact-path matching, so a committed
+  template carrying macOS's `/Users/...` never matched on a Linux host and
+  every non-macOS host accumulated a second block and stayed permanently
+  dirty (#217).
+- Apply reconciles the env and shell fragments on the "already up to date" path
+  too. It previously returned before touching them, so a deleted `env.sh` was
+  never rewritten even though `status` reported the variable as applied, and a
+  stale rc line was never corrected. This is the same root cause as #213: the
+  lock being trusted over reality.
+
 ## v4.5.3 - 2026-09-30
 
 Correctness follow-up to v4.5.2, which was tagged with a red Windows CI job.

@@ -229,9 +229,9 @@ Managed links are compared by resolved path, so a relative link pointing at the 
 | ------- | ------- |
 | `add` / `remove` (`rm`) | Track + install / untrack + uninstall |
 | `adopt` / `disown` | Track without install / untrack without uninstall |
-| `scan` | Bulk-adopt user-facing installs (`--dry-run`, `--yes`; `--all` / `--deps` for full trees) |
+| `scan` | Bulk-adopt user-facing installs (`--dry-run`, `--yes`; `--all` / `--deps` for full trees). Exits non-zero if a manager's inventory could not be read |
 | `list` (`ls`) | Show lock-tracked packages |
-| `status` | Spec ↔ lock drift (`--files` includes content `drifted`, `--offline`, `--verify`, `--target`) |
+| `status` | Spec ↔ lock drift (`--files` includes content `drifted`, `--offline`, `--verify`, `--target`); a lock entry with no recorded version is `unknown`, not `ok` |
 | `apply` | Reconcile (`--dry-run`, `--yes`, `--json`, `--force`, `--backup`, `--strict`, `--quiet`, `--skip-packages`, `--timeout <d>`, `--no-hooks`, `--hook-timeout <d>`, `--target`, `--force-new-lock`, `--state-dir`, `--source-root <dir>`) |
 | `validate` | Validate spec + genv-managed agent executables |
 | `upgrade` | Upgrade tracked packages plus OS vendor updates (`--all`, `--only` / leftover IDs, `--skip`, `--only-manager`, `--skip-manager`, `--target`; `--json` wet-run requires `--yes`) |
